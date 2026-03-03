@@ -11,8 +11,8 @@ class SQLiteCatalog
 
     private function __construct()
     {
-        // Store SQLite database in the persistent data volume
-        $dbPath = '/var/bbs/catalog.sqlite';
+        // Store SQLite database in the persistent data volume (inside cache dir which is writable by www-data)
+        $dbPath = '/var/bbs/cache/catalog.sqlite';
         $this->pdo = new PDO("sqlite:{$dbPath}");
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         
