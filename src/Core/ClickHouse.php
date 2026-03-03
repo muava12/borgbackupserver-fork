@@ -24,11 +24,44 @@ class ClickHouse
         return self::$instance;
     }
 
+    private ?bool $availabilityCache = null;
+
+    /**
+     * Check if ClickHouse is reachable, cached for the request lifecycle.
+     */
+    public function isAvailable(): bool
+    {
+        if ($this->availabilityCache !== null) {
+            return $this->availabilityCache;
+        }
+
+        try {
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $this->baseUrl . '/ping',
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 3,
+                CURLOPT_CONNECTTIMEOUT => 2,
+            ]);
+            $response = curl_exec($ch);
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            $this->availabilityCache = ($code === 200);
+        } catch (\Exception $e) {
+            $this->availabilityCache = false;
+        }
+        
+        return $this->availabilityCache;
+    }
+
     /**
      * Execute a query (DDL, INSERT, ALTER DELETE, etc.)
      */
     public function exec(string $sql): string
     {
+        if (!$this->isAvailable()) {
+            return SQLiteCatalog::getInstance()->exec($sql);
+        }
         return $this->request($sql);
     }
 
@@ -37,6 +70,10 @@ class ClickHouse
      */
     public function fetchAll(string $sql, array $params = []): array
     {
+        if (!$this->isAvailable()) {
+            return SQLiteCatalog::getInstance()->fetchAll($sql, $params);
+        }
+
         $sql = $this->bindParams($sql, $params);
         $response = $this->request($sql . ' FORMAT JSONEachRow');
         if (trim($response) === '') return [];
@@ -55,6 +92,10 @@ class ClickHouse
      */
     public function fetchOne(string $sql, array $params = []): ?array
     {
+        if (!$this->isAvailable()) {
+            return SQLiteCatalog::getInstance()->fetchOne($sql, $params);
+        }
+
         $rows = $this->fetchAll($sql . ' LIMIT 1', $params);
         return $rows[0] ?? null;
     }
@@ -64,6 +105,11 @@ class ClickHouse
      */
     public function insertTsv(string $table, string $tsvFilePath, array $columns): void
     {
+        if (!$this->isAvailable()) {
+            SQLiteCatalog::getInstance()->insertTsv($table, $tsvFilePath, $columns);
+            return;
+        }
+
         $cols = implode(', ', $columns);
         $sql = "INSERT INTO {$table} ({$cols}) FORMAT TabSeparated";
 
@@ -92,28 +138,6 @@ class ClickHouse
         }
         if ($code !== 200) {
             throw new \RuntimeException("ClickHouse TSV insert failed ({$code}): {$response}");
-        }
-    }
-
-    /**
-     * Check if ClickHouse is reachable.
-     */
-    public function isAvailable(): bool
-    {
-        try {
-            $ch = curl_init();
-            curl_setopt_array($ch, [
-                CURLOPT_URL => $this->baseUrl . '/ping',
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 3,
-                CURLOPT_CONNECTTIMEOUT => 2,
-            ]);
-            $response = curl_exec($ch);
-            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-            return $code === 200;
-        } catch (\Exception $e) {
-            return false;
         }
     }
 
