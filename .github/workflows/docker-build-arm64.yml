@@ -8,6 +8,7 @@ on:
 env:
   IMAGE_NAME: marcpope/borgbackupserver
   GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/borgbackupserver
+  NTFY_TOPIC: https://ntfy.sh/deploy-on-github-xasr6KBz47PjswPf53A78Fib
 
 jobs:
   build-arm64:
@@ -17,6 +18,17 @@ jobs:
       packages: write
 
     steps:
+      - name: Notify build started
+        run: |
+          curl -s -d "🔨 ARM64 Docker build started
+          Repo: ${{ github.repository }}
+          Ref: ${{ github.ref_name }}
+          Trigger: ${{ github.event_name }}" \
+            -H "Title: Build Started" \
+            -H "Tags: hammer,docker" \
+            -H "Priority: default" \
+            "${{ env.NTFY_TOPIC }}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -76,3 +88,26 @@ jobs:
           platforms: linux/arm64
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,scope=arm64,mode=max
+
+      - name: Notify build success
+        if: success()
+        run: |
+          curl -s -d "✅ ARM64 Docker build succeeded!
+          Version: ${{ steps.version.outputs.version }}
+          Tags: ${{ steps.tags.outputs.tags }}" \
+            -H "Title: Build Succeeded" \
+            -H "Tags: white_check_mark,docker" \
+            -H "Priority: default" \
+            "${{ env.NTFY_TOPIC }}"
+
+      - name: Notify build failure
+        if: failure()
+        run: |
+          curl -s -d "❌ ARM64 Docker build failed!
+          Repo: ${{ github.repository }}
+          Ref: ${{ github.ref_name }}
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -H "Title: Build Failed" \
+            -H "Tags: x,docker" \
+            -H "Priority: high" \
+            "${{ env.NTFY_TOPIC }}"
