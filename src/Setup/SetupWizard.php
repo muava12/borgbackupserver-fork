@@ -186,9 +186,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->exec($schema);
 
                 // 4. Create admin user (update password if user already exists)
+                $tz = getenv('TZ') ?: 'America/New_York';
+                if (!in_array($tz, timezone_identifiers_list())) {
+                    $tz = 'America/New_York';
+                }
                 $passwordHash = password_hash($setup['admin_password'], PASSWORD_BCRYPT, ['cost' => 12]);
-                $stmt = $pdo->prepare("INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, 'admin') ON DUPLICATE KEY UPDATE password_hash = VALUES(password_hash), email = VALUES(email)");
-                $stmt->execute([$setup['admin_username'], $setup['admin_email'], $passwordHash]);
+                $stmt = $pdo->prepare("INSERT INTO users (username, email, password_hash, role, timezone) VALUES (?, ?, ?, 'admin', ?) ON DUPLICATE KEY UPDATE password_hash = VALUES(password_hash), email = VALUES(email), timezone = VALUES(timezone)");
+                $stmt->execute([$setup['admin_username'], $setup['admin_email'], $passwordHash, $tz]);
 
                 // 5. Set storage_path and server_host in settings
                 $stmt = $pdo->prepare("INSERT INTO settings (`key`, `value`) VALUES ('storage_path', ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)");
