@@ -31,17 +31,33 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -rf /tmp/rclone*
 
 # Install ClickHouse (catalog engine)
+# Official aarch64 binaries use CPU instructions (SVE2) unavailable on many
+# ARM boards (Raspberry Pi, Armbian), causing "Illegal instruction" crashes.
+# On ARM64, use Altinity Stable Builds which are compiled for broader CPU compat.
 RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then \
     curl -fsSL -A 'Mozilla/5.0' 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | \
-        gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg && \
+    gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=${ARCH}] https://packages.clickhouse.com/deb stable main" \
-        > /etc/apt/sources.list.d/clickhouse.list && \
+    > /etc/apt/sources.list.d/clickhouse.list; \
+    elif [ "$ARCH" = "arm64" ]; then \
+    echo ">>> Installing ClickHouse from Altinity Stable Builds (ARM64-compatible)"; \
+    curl -fsSL 'https://builds.altinity.cloud/apt-repo/pubkey.gpg' | \
+    gpg --dearmor -o /usr/share/keyrings/altinity-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/altinity-archive-keyring.gpg] https://builds.altinity.cloud/apt-repo stable main" \
+    > /etc/apt/sources.list.d/altinity.list; \
+    fi && \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server clickhouse-client && \
     rm -rf /var/lib/apt/lists/*
 
 # Disable ClickHouse system log tables (heavy idle disk I/O)
-COPY config/clickhouse-server-override.xml /etc/clickhouse-server/config.d/bbs-override.xml
+COPY config/clickhouse-server-override.xml /tmp/clickhouse-bbs-override.xml
+RUN if command -v clickhouse-server >/dev/null 2>&1; then \
+    mkdir -p /etc/clickhouse-server/config.d && \
+    cp /tmp/clickhouse-bbs-override.xml /etc/clickhouse-server/config.d/bbs-override.xml; \
+    fi && \
+    rm -f /tmp/clickhouse-bbs-override.xml
 
 # Install Apprise (notification tool supporting 100+ services)
 RUN pip3 install --break-system-packages --no-cache-dir apprise && \
@@ -64,12 +80,12 @@ RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf
 RUN echo '<VirtualHost *:80>\n\
     DocumentRoot /var/www/bbs/public\n\
     <Directory /var/www/bbs/public>\n\
-        AllowOverride All\n\
-        Require all granted\n\
+    AllowOverride All\n\
+    Require all granted\n\
     </Directory>\n\
     ErrorLog ${APACHE_LOG_DIR}/error.log\n\
     CustomLog ${APACHE_LOG_DIR}/access.log combined\n\
-</VirtualHost>' > /etc/apache2/sites-available/000-default.conf
+    </VirtualHost>' > /etc/apache2/sites-available/000-default.conf
 
 # Configure SSH - disable password auth, only allow key-based
 RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \
