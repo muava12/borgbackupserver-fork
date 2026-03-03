@@ -30,13 +30,12 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod 755 /usr/bin/rclone && \
     rm -rf /tmp/rclone*
 
-# Install ClickHouse (catalog engine)
-# amd64: install from official apt repo
-# arm64: install v26.2.3.2 from GitHub Release .deb (official repo builds
-#        may crash on older ARM CPUs like Cortex-A53/ARMv8.0)
-ARG CLICKHOUSE_ARM64_VERSION=26.2.3.2
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "amd64" ]; then \
+# Install ClickHouse (catalog engine) — amd64 only
+# No ClickHouse build works reliably on ARM64 boards with older CPUs
+# (Cortex-A53/ARMv8.0). Both official and Altinity binaries use CPU
+# instructions unavailable on these devices. On ARM64, catalog features
+# are gracefully disabled; all core features (backup/restore) still work.
+RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
     curl -fsSL -A 'Mozilla/5.0' 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | \
     gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=amd64] https://packages.clickhouse.com/deb stable main" \
@@ -44,16 +43,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server clickhouse-client && \
     rm -rf /var/lib/apt/lists/*; \
-    elif [ "$ARCH" = "arm64" ]; then \
-    echo ">>> Installing ClickHouse ${CLICKHOUSE_ARM64_VERSION} from GitHub Release (arm64)..." && \
-    CH_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_ARM64_VERSION}-stable" && \
-    curl -fsSL -o /tmp/ch-common.deb "${CH_URL}/clickhouse-common-static_${CLICKHOUSE_ARM64_VERSION}_arm64.deb" && \
-    curl -fsSL -o /tmp/ch-server.deb "${CH_URL}/clickhouse-server_${CLICKHOUSE_ARM64_VERSION}_arm64.deb" && \
-    curl -fsSL -o /tmp/ch-client.deb "${CH_URL}/clickhouse-client_${CLICKHOUSE_ARM64_VERSION}_arm64.deb" && \
-    DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/ch-common.deb /tmp/ch-server.deb /tmp/ch-client.deb && \
-    rm -f /tmp/ch-common.deb /tmp/ch-server.deb /tmp/ch-client.deb; \
     else \
-    echo ">>> Skipping ClickHouse (unsupported arch: ${ARCH})"; \
+    echo ">>> Skipping ClickHouse (not supported on $(dpkg --print-architecture))"; \
     fi
 
 # Disable ClickHouse system log tables (heavy idle disk I/O)
