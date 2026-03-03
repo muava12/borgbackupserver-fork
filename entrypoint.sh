@@ -77,10 +77,10 @@ CHXML
             clickhouse-client --query "DROP TABLE IF EXISTS system.$tbl" 2>/dev/null || true
         done
     else
-        echo "  Warning: ClickHouse failed to start"
+        echo "  Notice: ClickHouse failed to start — catalog features will use SQLite fallback"
     fi
 else
-    echo "  Warning: ClickHouse not installed — catalog features will not work"
+    echo "  Notice: ClickHouse not installed — catalog features will use SQLite fallback"
 fi
 
 # Create database and user if needed
