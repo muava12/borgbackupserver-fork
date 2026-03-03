@@ -30,26 +30,22 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod 755 /usr/bin/rclone && \
     rm -rf /tmp/rclone*
 
-# Install ClickHouse (catalog engine)
-# Official aarch64 binaries use CPU instructions (SVE2) unavailable on many
-# ARM boards (Raspberry Pi, Armbian), causing "Illegal instruction" crashes.
-# On ARM64, use Altinity Stable Builds which are compiled for broader CPU compat.
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "amd64" ]; then \
+# Install ClickHouse (catalog engine) — amd64 only
+# No ClickHouse build works reliably on ARM64 boards with older CPUs
+# (Cortex-A53/ARMv8.0). Both official and Altinity binaries use CPU
+# instructions unavailable on these devices. On ARM64, catalog features
+# are gracefully disabled; all core features (backup/restore) still work.
+RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
     curl -fsSL -A 'Mozilla/5.0' 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | \
     gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=${ARCH}] https://packages.clickhouse.com/deb stable main" \
-    > /etc/apt/sources.list.d/clickhouse.list; \
-    elif [ "$ARCH" = "arm64" ]; then \
-    echo ">>> Installing ClickHouse from Altinity Stable Builds (ARM64-compatible)"; \
-    curl -fsSL 'https://builds.altinity.cloud/apt-repo/pubkey.gpg' | \
-    gpg --dearmor -o /usr/share/keyrings/altinity-archive-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/altinity-archive-keyring.gpg] https://builds.altinity.cloud/apt-repo stable main" \
-    > /etc/apt/sources.list.d/altinity.list; \
-    fi && \
+    echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=amd64] https://packages.clickhouse.com/deb stable main" \
+    > /etc/apt/sources.list.d/clickhouse.list && \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server clickhouse-client && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    else \
+    echo ">>> Skipping ClickHouse (not supported on $(dpkg --print-architecture))"; \
+    fi
 
 # Disable ClickHouse system log tables (heavy idle disk I/O)
 COPY config/clickhouse-server-override.xml /tmp/clickhouse-bbs-override.xml
