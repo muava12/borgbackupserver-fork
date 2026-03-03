@@ -138,6 +138,49 @@
         }
     });
 
+    // Manual path input fallback (when ClickHouse is unavailable)
+    function showManualPathInput(parentEl) {
+        parentEl.innerHTML = '';
+        const wrapper = document.createElement('div');
+        wrapper.className = 'p-3';
+        wrapper.innerHTML =
+            '<div class="alert alert-info d-flex align-items-start gap-2 mb-3" style="font-size:0.85em;">' +
+                '<i class="bi bi-info-circle-fill mt-1"></i>' +
+                '<div>File catalog is not available. You can manually enter file or directory paths to restore.<br>' +
+                '<small class="text-muted">Tip: Use <code>/</code> to restore everything, or enter specific paths like <code>/home/user/documents/</code></small></div>' +
+            '</div>' +
+            '<div class="input-group mb-2">' +
+                '<span class="input-group-text"><i class="bi bi-folder2-open"></i></span>' +
+                '<input type="text" class="form-control font-monospace" id="manual-path-input" placeholder="/path/to/file/or/directory/" autocomplete="off">' +
+                '<button class="btn btn-primary" type="button" id="manual-path-add"><i class="bi bi-plus-lg"></i> Add</button>' +
+            '</div>' +
+            '<div class="d-flex gap-2 mb-2">' +
+                '<button class="btn btn-sm btn-outline-secondary" type="button" id="manual-add-root"><i class="bi bi-house"></i> Add Root (/)</button>' +
+            '</div>';
+        parentEl.appendChild(wrapper);
+
+        var addInput = document.getElementById('manual-path-input');
+        var addBtn = document.getElementById('manual-path-add');
+        var addRootBtn = document.getElementById('manual-add-root');
+
+        function addManualPath() {
+            var path = addInput.value.trim();
+            if (!path) return;
+            if (!path.startsWith('/')) path = '/' + path;
+            togglePath(path, true);
+            addInput.value = '';
+            addInput.focus();
+        }
+
+        addBtn.addEventListener('click', addManualPath);
+        addInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); addManualPath(); }
+        });
+        addRootBtn.addEventListener('click', function() {
+            togglePath('/', true);
+        });
+    }
+
     // Tree loading
     function loadTreeNode(parentEl, path) {
         const archiveId = archiveSelect.value;
@@ -152,6 +195,14 @@
             .then(r => r.json())
             .then(data => {
                 spinner.remove();
+
+                // ClickHouse unavailable — show manual path input
+                if (data.catalog_available === false) {
+                    if (path === '/') {
+                        showManualPathInput(browsePanel.querySelector('.restore-panel-body') || parentEl);
+                    }
+                    return;
+                }
 
                 if (data.dirs.length === 0 && data.files.length === 0) {
                     if (path === '/') {
@@ -236,8 +287,8 @@
             .catch(() => {
                 spinner.remove();
                 if (path === '/') {
-                    browsePanel.querySelector('.restore-panel-body').innerHTML =
-                        '<div class="p-3 text-muted text-center">Failed to load file catalog.</div>';
+                    // Show manual fallback on error too (network issue, ClickHouse down, etc.)
+                    showManualPathInput(browsePanel.querySelector('.restore-panel-body') || parentEl);
                 }
             });
     }

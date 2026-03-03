@@ -615,6 +615,10 @@ class ClientController extends Controller
         }
 
         $ch = \BBS\Core\ClickHouse::getInstance();
+        if (!$ch->isAvailable()) {
+            $this->json(['files' => [], 'total' => 0, 'page' => 1, 'pages' => 1, 'catalog_available' => false]);
+            return;
+        }
         $search = trim($_GET['search'] ?? '');
         $page = max(1, (int) ($_GET['page'] ?? 1));
         $perPage = 100;
@@ -666,6 +670,10 @@ class ClientController extends Controller
         }
 
         $ch = \BBS\Core\ClickHouse::getInstance();
+        if (!$ch->isAvailable()) {
+            $this->json(['dirs' => [], 'files' => [], 'path' => $_GET['path'] ?? '/', 'catalog_available' => false]);
+            return;
+        }
         $prefix = $_GET['path'] ?? '/';
         // Ensure prefix ends with /
         if ($prefix !== '/' && !str_ends_with($prefix, '/')) {
@@ -729,6 +737,10 @@ class ClientController extends Controller
         }
 
         $ch = \BBS\Core\ClickHouse::getInstance();
+        if (!$ch->isAvailable()) {
+            $this->json(['files' => [], 'total' => 0, 'page' => 1, 'pages' => 1, 'catalog_available' => false]);
+            return;
+        }
         $page = max(1, (int) ($_GET['page'] ?? 1));
         $perPage = 20;
 
@@ -939,16 +951,18 @@ class ClientController extends Controller
                     $patterns[] = $dumpDir . '/' . $db . $ext;
                 }
                 $ch = \BBS\Core\ClickHouse::getInstance();
-                $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $patterns));
-                $rows = $ch->fetchAll("
-                    SELECT path, formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
-                    FROM file_catalog
-                    WHERE agent_id = {$id} AND archive_id = {$archive_id} AND path IN ({$pathList})
-                ");
-                foreach ($rows as $row) {
-                    $basename = basename($row['path']);
-                    $dbName = preg_replace('/\\.sql(\\.gz)?$/', '', $basename);
-                    $mtimes[$dbName] = $row['mtime'] ? \BBS\Core\TimeHelper::format($row['mtime'], 'M j, Y g:i A') : null;
+                if ($ch->isAvailable()) {
+                    $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $patterns));
+                    $rows = $ch->fetchAll("
+                        SELECT path, formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
+                        FROM file_catalog
+                        WHERE agent_id = {$id} AND archive_id = {$archive_id} AND path IN ({$pathList})
+                    ");
+                    foreach ($rows as $row) {
+                        $basename = basename($row['path']);
+                        $dbName = preg_replace('/\\.sql(\\.gz)?$/', '', $basename);
+                        $mtimes[$dbName] = $row['mtime'] ? \BBS\Core\TimeHelper::format($row['mtime'], 'M j, Y g:i A') : null;
+                    }
                 }
             }
         }
