@@ -2700,7 +2700,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
             </div>
             <?php endif; ?>
             <!-- Files mode: Archive + Search -->
-            <div class="restore-files-controls <?= $dbPluginEnabled ? 'col-md-4' : ($clickhouseAvailable ? 'col-md-5' : 'col-md-9') ?>" id="files-archive-col">
+            <div class="restore-files-controls <?= $dbPluginEnabled ? 'col-md-4' : (isset($catalogAvailable) && $catalogAvailable ? 'col-md-5' : 'col-md-9') ?>" id="files-archive-col">
                 <label class="form-label fw-semibold mb-1 small">Archive</label>
                 <div class="input-group input-group-sm">
                 <span class="input-group-text"><i class="bi bi-calendar-event"></i></span>
@@ -2723,7 +2723,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                 </select>
                 </div>
             </div>
-            <?php if ($clickhouseAvailable): ?>
+            <?php if (isset($catalogAvailable) && $catalogAvailable): ?>
             <div class="restore-files-controls col-md-5" id="files-search-col">
                 <label class="form-label fw-semibold mb-1 small">Search</label>
                 <div class="input-group input-group-sm">
@@ -2754,7 +2754,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     <div class="row gx-3">
         <!-- LEFT: Browse / Search / History -->
         <div class="col-lg-7">
-            <?php if ($clickhouseAvailable): ?>
+            <?php if (isset($catalogAvailable) && $catalogAvailable): ?>
             <!-- Browse Panel -->
             <div id="browse-panel">
                 <div class="restore-panel-header">
