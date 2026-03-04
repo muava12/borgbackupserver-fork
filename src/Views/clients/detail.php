@@ -2917,7 +2917,9 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     <?php endif; ?>
 
     <script>window.RESTORE_AGENT_ID = <?= $agent['id'] ?>;</script>
-    <script>window.CLICKHOUSE_AVAILABLE = <?= $clickhouseAvailable ? 'true' : 'false' ?>;</script>
+    <?php if (isset($catalogAvailable)): ?>
+    <script>window.CATALOG_AVAILABLE = <?= $catalogAvailable ? 'true' : 'false' ?>;</script>
+    <?php endif; ?>
     <script>window.DB_PLUGIN_ENABLED = <?= $dbPluginEnabled ? 'true' : 'false' ?>;</script>
     <script>window.DB_CONFIG_AVAILABLE = <?= !empty($allDbConfigs) ? 'true' : 'false' ?>;</script>
     <script>window.DB_CONFIG_USERS = <?= json_encode(array_merge(

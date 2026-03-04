@@ -727,6 +727,7 @@ class AgentApiController extends Controller
 
         $agentId = (int) $agent['id'];
         $ch = \BBS\Core\ClickHouse::getInstance();
+    $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
 
         // Build TSV and upload to ClickHouse
         $escape = fn(string $s) => str_replace(["\t", "\n", "\\"], ["\\t", "\\n", "\\\\"], $s);
@@ -748,10 +749,10 @@ class AgentApiController extends Controller
 
             if ($batchSize > 0) {
                 try {
-                    $ch->insertTsv('file_catalog', $tsvFile, [
-                        'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'
-                    ]);
-                } finally {
+                $catalogDb->insertTsv('file_catalog', $tsvFile, [
+                    'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'
+                ]);
+            } finally {
                     @unlink($tsvFile);
                 }
             } else {
@@ -765,10 +766,10 @@ class AgentApiController extends Controller
             $archiveRow = $this->db->fetchOne("SELECT backup_job_id FROM archives WHERE id = ?", [$archiveId]);
             $logJobId = $archiveRow['backup_job_id'] ?? null;
 
-            $totalRow = $ch->fetchOne(
-                "SELECT count() as cnt FROM file_catalog WHERE agent_id = ? AND archive_id = ?",
-                [$agentId, $archiveId]
-            );
+            $totalRow = $catalogDb->fetchOne(
+            "SELECT count() as cnt FROM file_catalog WHERE agent_id = ? AND archive_id = ?",
+            [$agentId, $archiveId]
+        );
             $totalIndexed = (int) ($totalRow['cnt'] ?? 0);
 
             // Build catalog_dirs index from ClickHouse data
@@ -789,21 +790,26 @@ class AgentApiController extends Controller
      * Build catalog_dirs index from file_catalog data in ClickHouse.
      */
     private function buildDirsFromCatalog(int $agentId, int $archiveId): void
-    {
-        $ch = \BBS\Core\ClickHouse::getInstance();
+{
+    $ch = \BBS\Core\ClickHouse::getInstance();
+    $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
 
         // Remove old dir entries for this archive
-        try {
-            $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
-        } catch (\Exception $e) { /* ignore */ }
+    try {
+        if ($catalogDb instanceof \BBS\Core\ClickHouse) {
+            $catalogDb->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
+        } else {
+            $catalogDb->exec("DELETE FROM catalog_dirs WHERE agent_id = {$agentId} AND archive_id = {$archiveId}");
+        }
+    } catch (\Exception $e) { /* ignore */ }
 
         // Get dir stats grouped by parent_dir from ClickHouse
-        $dirRows = $ch->fetchAll("
-            SELECT parent_dir, count() as file_count, sum(file_size) as total_size
-            FROM file_catalog
-            WHERE agent_id = ? AND archive_id = ? AND status != 'D'
-            GROUP BY parent_dir
-        ", [$agentId, $archiveId]);
+        $dirRows = $catalogDb->fetchAll("
+        SELECT parent_dir, count() as file_count, sum(file_size) as total_size
+        FROM file_catalog
+        WHERE agent_id = ? AND archive_id = ? AND status != 'D'
+        GROUP BY parent_dir
+    ", [$agentId, $archiveId]);
 
         $allDirs = [];
         foreach ($dirRows as $d) {
@@ -841,10 +847,10 @@ class AgentApiController extends Controller
         fclose($fh);
 
         try {
-            $ch->insertTsv('catalog_dirs', $dirsTsv, [
-                'agent_id', 'archive_id', 'dir_path', 'parent_dir', 'name', 'file_count', 'total_size'
-            ]);
-        } catch (\Exception $e) { /* ignore */ }
+        $catalogDb->insertTsv('catalog_dirs', $dirsTsv, [
+            'agent_id', 'archive_id', 'dir_path', 'parent_dir', 'name', 'file_count', 'total_size'
+        ]);
+    } catch (\Exception $e) { /* ignore */ }
         @unlink($dirsTsv);
     }
 

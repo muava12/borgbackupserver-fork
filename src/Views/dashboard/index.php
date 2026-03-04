@@ -943,11 +943,21 @@ setInterval(function() {
                     repoTable.innerHTML = html;
                 }
                 if (typeof catalogPieChart !== 'undefined' && catalogPieChart && ch.top_repos) {
-                    const top5Disk = ch.top_repos.reduce((s, r) => s + Number(r.disk_bytes), 0);
-                    const otherDisk = Math.max(Number(ch.disk_bytes) - top5Disk, 0);
+                    const isSqlite = ch.backend === 'sqlite';
+                    const prop = isSqlite ? 'rows' : 'disk_bytes';
+                    const totalProp = isSqlite ? 'total_rows' : 'disk_bytes';
+
+                    const top5 = ch.top_repos.reduce((s, r) => s + Number(r[prop] || 0), 0);
+                    const other = Math.max(Number(ch[totalProp] || 0) - top5, 0);
+
                     const labels = ch.top_repos.map(r => r.name);
-                    const data = ch.top_repos.map(r => Number(r.disk_bytes));
-                    if (otherDisk > 0) { labels.push('Other'); data.push(otherDisk); }
+                    const data = ch.top_repos.map(r => Number(r[prop] || 0));
+
+                    if (other > 0) { 
+                        labels.push('Other'); 
+                        data.push(other); 
+                    }
+
                     catalogPieChart.data.labels = labels;
                     catalogPieChart.data.datasets[0].data = data;
                     catalogPieChart.data.datasets[0].backgroundColor = pieColors.slice(0, data.length);

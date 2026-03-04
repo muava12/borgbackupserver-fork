@@ -320,11 +320,18 @@ class ClientController extends Controller
             ORDER BY r.name ASC, ar.created_at DESC
         ", [$id]);
 
-        // Check if ClickHouse is available (needed for file catalog browsing)
-        $clickhouseAvailable = false;
+        // Check if a catalog backend is available (needed for file catalog browsing)
+        $catalogAvailable = false;
         try {
             $ch = \BBS\Core\ClickHouse::getInstance();
-            $clickhouseAvailable = $ch->isAvailable();
+            if ($ch->isAvailable()) {
+                $catalogAvailable = true;
+            } else {
+                // Fallback to SQLite check
+                $sqlite = \BBS\Core\SQLiteCatalog::getInstance();
+                $cnt = $sqlite->fetchOne("SELECT COUNT(*) as cnt FROM file_catalog WHERE agent_id = ?", [$id]);
+                $catalogAvailable = !empty($cnt) && (int)$cnt['cnt'] > 0;
+            }
         } catch (\Exception $e) {}
 
         // Summary stats for header
@@ -464,7 +471,7 @@ class ClientController extends Controller
             'globalS3Configured' => $globalS3Configured,
             'remoteSshConfigs' => (new \BBS\Services\RemoteSshService())->getAll(),
             'storageLocations' => $this->db->fetchAll("SELECT * FROM storage_locations ORDER BY is_default DESC, label"),
-            'clickhouseAvailable' => $clickhouseAvailable,
+            'catalogAvailable' => $catalogAvailable,
         ]);
     }
 
@@ -622,42 +629,56 @@ class ClientController extends Controller
             $this->json(['error' => 'Client not found'], 404);
         }
 
-        $ch = \BBS\Core\ClickHouse::getInstance();
-        $search = trim($_GET['search'] ?? '');
-        $page = max(1, (int) ($_GET['page'] ?? 1));
-        $perPage = 100;
-        $offset = ($page - 1) * $perPage;
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
 
-        $where = 'agent_id = ? AND archive_id = ?';
-        $params = [$id, $archive_id];
+            if (!$catalogDb) {
+                $this->json(['catalog_available' => false]);
+                return;
+            }
 
-        if ($search !== '') {
-            $where .= ' AND (file_name LIKE ? OR path LIKE ?)';
-            $params[] = "%{$search}%";
-            $params[] = "%{$search}%";
+            $search = trim($_GET['search'] ?? '');
+            $page = max(1, (int) ($_GET['page'] ?? 1));
+            $perPage = 100;
+            $offset = ($page - 1) * $perPage;
+
+            $where = 'agent_id = ? AND archive_id = ?';
+            $params = [$id, $archive_id];
+
+            if ($search !== '') {
+                $where .= ' AND (file_name LIKE ? OR path LIKE ?)';
+                $params[] = "%{$search}%";
+                $params[] = "%{$search}%";
+            }
+
+            $totalRow = $catalogDb->fetchOne(
+                "SELECT count() as cnt FROM file_catalog WHERE {$where}",
+                $params
+            );
+            $total = (int) ($totalRow['cnt'] ?? 0);
+
+            // Fetch limited page
+            $files = $catalogDb->fetchAll("
+                SELECT path as file_path, file_name, file_size, status,
+                       " . ($catalogDb instanceof \BBS\Core\ClickHouse ? "formatDateTime(mtime, '%Y-%m-%d %H:%i:%S')" : "strftime('%Y-%m-%d %H:%M:%S', mtime)") . " as mtime
+                 FROM file_catalog
+                 WHERE {$where}
+                 ORDER BY path
+                 LIMIT {$perPage} OFFSET {$offset}",
+                $params
+            );
+
+            $this->json([
+                'catalog_available' => true,
+                'files' => $files,
+                'total' => $total,
+                'page' => $page,
+                'pages' => max(1, ceil($total / $perPage)),
+            ]);
+        } catch (\Exception $e) {
+            $this->json(['catalog_available' => false]);
         }
-
-        $total = $ch->fetchOne(
-            "SELECT count() as cnt FROM file_catalog WHERE {$where}",
-            $params
-        );
-
-        $files = $ch->fetchAll(
-            "SELECT path as file_path, file_name, file_size, status,
-                    formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
-             FROM file_catalog
-             WHERE {$where}
-             ORDER BY path
-             LIMIT {$perPage} OFFSET {$offset}",
-            $params
-        );
-
-        $this->json([
-            'files' => $files,
-            'total' => (int) ($total['cnt'] ?? 0),
-            'page' => $page,
-            'pages' => max(1, ceil(($total['cnt'] ?? 0) / $perPage)),
-        ]);
     }
 
     /**
@@ -673,48 +694,60 @@ class ClientController extends Controller
             $this->json(['error' => 'Client not found'], 404);
         }
 
-        $ch = \BBS\Core\ClickHouse::getInstance();
-        $prefix = $_GET['path'] ?? '/';
-        // Ensure prefix ends with /
-        if ($prefix !== '/' && !str_ends_with($prefix, '/')) {
-            $prefix .= '/';
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
+
+            if (!$catalogDb) {
+                $this->json(['catalog_available' => false]);
+                return;
+            }
+
+            $prefix = $_GET['path'] ?? '/';
+            // Ensure prefix ends with /
+            if ($prefix !== '/' && !str_ends_with($prefix, '/')) {
+                $prefix .= '/';
+            }
+
+            // parent_dir for this level: strip trailing slash (root stays as '/')
+            $parentDir = $prefix === '/' ? '/' : rtrim($prefix, '/');
+
+            // Get subdirectories from catalog_dirs (exact match, instant via ORDER BY)
+            $dirRows = $catalogDb->fetchAll("
+                SELECT name, dir_path, file_count, total_size
+                FROM catalog_dirs
+                WHERE agent_id = ? AND archive_id = ? AND parent_dir = ?
+                ORDER BY name
+            ", [$id, $archive_id, $parentDir]);
+
+            $directories = [];
+            foreach ($dirRows as $d) {
+                $directories[] = [
+                    'name' => $d['name'],
+                    'path' => $d['dir_path'] . '/',
+                    'file_count' => (int) $d['file_count'],
+                    'total_size' => (int) $d['total_size'],
+                ];
+            }
+
+            // Get files directly at this level (exact parent_dir match)
+            $fileRows = $catalogDb->fetchAll("
+                SELECT path as file_path, file_name, file_size, status,
+                       " . ($catalogDb instanceof \BBS\Core\ClickHouse ? "formatDateTime(mtime, '%Y-%m-%d %H:%i:%S')" : "strftime('%Y-%m-%d %H:%M:%S', mtime)") . " as mtime
+                FROM file_catalog
+                WHERE agent_id = ? AND archive_id = ? AND parent_dir = ? AND status != 'D'
+                ORDER BY file_name
+            ", [$id, $archive_id, $parentDir]);
+
+            $this->json([
+                'catalog_available' => true,
+                'dirs' => $directories,
+                'files' => $fileRows,
+                'path' => $prefix,
+            ]);
+        } catch (\Exception $e) {
+            $this->json(['catalog_available' => false]);
         }
-
-        // parent_dir for this level: strip trailing slash (root stays as '/')
-        $parentDir = $prefix === '/' ? '/' : rtrim($prefix, '/');
-
-        // Get subdirectories from catalog_dirs (exact match, instant via ORDER BY)
-        $dirs = $ch->fetchAll("
-            SELECT name, dir_path, file_count, total_size
-            FROM catalog_dirs
-            WHERE agent_id = ? AND archive_id = ? AND parent_dir = ?
-            ORDER BY name
-        ", [$id, $archive_id, $parentDir]);
-
-        $directories = [];
-        foreach ($dirs as $d) {
-            $directories[] = [
-                'name' => $d['name'],
-                'path' => $d['dir_path'] . '/',
-                'file_count' => (int) $d['file_count'],
-                'total_size' => (int) $d['total_size'],
-            ];
-        }
-
-        // Get files directly at this level (exact parent_dir match)
-        $files = $ch->fetchAll("
-            SELECT path as file_path, file_name, file_size, status,
-                   formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
-            FROM file_catalog
-            WHERE agent_id = ? AND archive_id = ? AND parent_dir = ? AND status != 'D'
-            ORDER BY file_name
-        ", [$id, $archive_id, $parentDir]);
-
-        $this->json([
-            'dirs' => $directories,
-            'files' => $files,
-            'path' => $prefix,
-        ]);
     }
 
     /**
@@ -736,97 +769,109 @@ class ClientController extends Controller
             return;
         }
 
-        $ch = \BBS\Core\ClickHouse::getInstance();
-        $page = max(1, (int) ($_GET['page'] ?? 1));
-        $perPage = 20;
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
 
-        // Find distinct file paths matching the search
-        $countRow = $ch->fetchOne(
-            "SELECT uniqExact(path) as cnt
-             FROM file_catalog
-             WHERE agent_id = ? AND (file_name LIKE ? OR path LIKE ?)",
-            [$id, "%{$search}%", "%{$search}%"]
-        );
-        $total = (int) ($countRow['cnt'] ?? 0);
-        $pages = max(1, ceil($total / $perPage));
-        $offset = ($page - 1) * $perPage;
-
-        // Get the matching paths (paginated by unique path)
-        $pathRows = $ch->fetchAll(
-            "SELECT DISTINCT path, file_name
-             FROM file_catalog
-             WHERE agent_id = ? AND (file_name LIKE ? OR path LIKE ?)
-             ORDER BY path
-             LIMIT {$perPage} OFFSET {$offset}",
-            [$id, "%{$search}%", "%{$search}%"]
-        );
-
-        if (empty($pathRows)) {
-            $this->json(['files' => [], 'total' => $total, 'page' => $page, 'pages' => $pages]);
-            return;
-        }
-
-        // Get all versions for these paths from ClickHouse
-        $paths = array_column($pathRows, 'path');
-        $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $paths));
-
-        $versions = $ch->fetchAll(
-            "SELECT path, archive_id, file_size, status,
-                    formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
-             FROM file_catalog
-             WHERE agent_id = {$id} AND path IN ({$pathList})
-             ORDER BY path, archive_id DESC"
-        );
-
-        // Get archive metadata from MySQL
-        $archiveIds = array_unique(array_column($versions, 'archive_id'));
-        $archiveMap = [];
-        if (!empty($archiveIds)) {
-            $placeholders = implode(',', array_fill(0, count($archiveIds), '?'));
-            $archiveRows = $this->db->fetchAll("
-                SELECT ar.id, ar.archive_name, ar.created_at as archive_date,
-                       r.name as repo_name
-                FROM archives ar
-                JOIN repositories r ON r.id = ar.repository_id
-                WHERE ar.id IN ({$placeholders})
-            ", $archiveIds);
-            foreach ($archiveRows as $ar) {
-                $archiveMap[$ar['id']] = $ar;
+            if (!$catalogDb) {
+                $this->json(['catalog_available' => false]);
+                return;
             }
-        }
 
-        // Merge archive metadata into versions
-        $versionMap = [];
-        foreach ($versions as $v) {
-            $ar = $archiveMap[$v['archive_id']] ?? null;
-            $versionMap[$v['path']][] = [
-                'path' => $v['path'],
-                'archive_id' => (int) $v['archive_id'],
-                'file_size' => $v['file_size'],
-                'status' => $v['status'],
-                'mtime' => $v['mtime'],
-                'archive_name' => $ar['archive_name'] ?? null,
-                'archive_date' => $ar['archive_date'] ?? null,
-                'repo_name' => $ar['repo_name'] ?? null,
-            ];
-        }
+            $page = max(1, (int) ($_GET['page'] ?? 1));
+            $perPage = 20;
 
-        // Build response
-        $files = [];
-        foreach ($pathRows as $pr) {
-            $files[] = [
-                'path' => $pr['path'],
-                'file_name' => $pr['file_name'],
-                'versions' => $versionMap[$pr['path']] ?? [],
-            ];
-        }
+            // Find distinct file paths matching the search
+            $countRow = $catalogDb->fetchOne(
+                "SELECT count(DISTINCT path) as cnt
+                 FROM file_catalog
+                 WHERE agent_id = ? AND (file_name LIKE ? OR path LIKE ?)",
+                [$id, "%{$search}%", "%{$search}%"]
+            );
+            $total = (int) ($countRow['cnt'] ?? 0);
+            $pages = max(1, ceil($total / $perPage));
+            $offset = ($page - 1) * $perPage;
 
-        $this->json([
-            'files' => $files,
-            'total' => $total,
-            'page' => $page,
-            'pages' => $pages,
-        ]);
+            // Get the matching paths (paginated by unique path)
+            $pathRows = $catalogDb->fetchAll(
+                "SELECT DISTINCT path, file_name
+                 FROM file_catalog
+                 WHERE agent_id = ? AND (file_name LIKE ? OR path LIKE ?)
+                 ORDER BY path
+                 LIMIT {$perPage} OFFSET {$offset}",
+                [$id, "%{$search}%", "%{$search}%"]
+            );
+
+            if (empty($pathRows)) {
+                $this->json(['files' => [], 'total' => $total, 'page' => $page, 'pages' => $pages]);
+                return;
+            }
+
+            // Get all versions for these paths
+            $paths = array_column($pathRows, 'path');
+            $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $paths));
+
+            $versions = $catalogDb->fetchAll(
+                "SELECT path, archive_id, file_size, status,
+                        " . ($catalogDb instanceof \BBS\Core\ClickHouse ? "formatDateTime(mtime, '%Y-%m-%d %H:%i:%S')" : "strftime('%Y-%m-%d %H:%M:%S', mtime)") . " as mtime
+                 FROM file_catalog
+                 WHERE agent_id = {$id} AND path IN ({$pathList})
+                 ORDER BY path, archive_id DESC"
+            );
+
+            // Get archive metadata from MySQL
+            $archiveIds = array_unique(array_column($versions, 'archive_id'));
+            $archiveMap = [];
+            if (!empty($archiveIds)) {
+                $placeholders = implode(',', array_fill(0, count($archiveIds), '?'));
+                $archiveRows = $this->db->fetchAll("
+                    SELECT ar.id, ar.archive_name, ar.created_at as archive_date,
+                           r.name as repo_name
+                    FROM archives ar
+                    JOIN repositories r ON r.id = ar.repository_id
+                    WHERE ar.id IN ({$placeholders})
+                ", $archiveIds);
+                foreach ($archiveRows as $ar) {
+                    $archiveMap[$ar['id']] = $ar;
+                }
+            }
+
+            // Merge archive metadata into versions
+            $versionMap = [];
+            foreach ($versions as $v) {
+                $ar = $archiveMap[$v['archive_id']] ?? null;
+                $versionMap[$v['path']][] = [
+                    'path' => $v['path'],
+                    'archive_id' => (int) $v['archive_id'],
+                    'file_size' => $v['file_size'],
+                    'status' => $v['status'],
+                    'mtime' => $v['mtime'],
+                    'archive_name' => $ar['archive_name'] ?? null,
+                    'archive_date' => $ar['archive_date'] ?? null,
+                    'repo_name' => $ar['repo_name'] ?? null,
+                ];
+            }
+
+            // Build response
+            $files = [];
+            foreach ($pathRows as $pr) {
+                $files[] = [
+                    'path' => $pr['path'],
+                    'file_name' => $pr['file_name'],
+                    'versions' => $versionMap[$pr['path']] ?? [],
+                ];
+            }
+
+            $this->json([
+                'catalog_available' => true,
+                'files' => $files,
+                'total' => $total,
+                'page' => $page,
+                'pages' => $pages,
+            ]);
+        } catch (\Exception $e) {
+            $this->json(['catalog_available' => false]);
+        }
     }
 
     /**
@@ -949,16 +994,19 @@ class ClientController extends Controller
                     $patterns[] = $dumpDir . '/' . $db . $ext;
                 }
                 $ch = \BBS\Core\ClickHouse::getInstance();
-                $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $patterns));
-                $rows = $ch->fetchAll("
-                    SELECT path, formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
-                    FROM file_catalog
-                    WHERE agent_id = {$id} AND archive_id = {$archive_id} AND path IN ({$pathList})
-                ");
-                foreach ($rows as $row) {
-                    $basename = basename($row['path']);
-                    $dbName = preg_replace('/\\.sql(\\.gz)?$/', '', $basename);
-                    $mtimes[$dbName] = $row['mtime'] ? \BBS\Core\TimeHelper::format($row['mtime'], 'M j, Y g:i A') : null;
+                $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
+                if ($catalogDb) {
+                    $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $patterns));
+                    $rows = $catalogDb->fetchAll("
+                        SELECT path, " . ($catalogDb instanceof \BBS\Core\ClickHouse ? "formatDateTime(mtime, '%Y-%m-%d %H:%i:%S')" : "strftime('%Y-%m-%d %H:%M:%S', mtime)") . " as mtime
+                        FROM file_catalog
+                        WHERE agent_id = {$id} AND archive_id = {$archive_id} AND path IN ({$pathList})
+                    ");
+                    foreach ($rows as $row) {
+                        $basename = basename($row['path']);
+                        $dbName = preg_replace('/\\.sql(\\.gz)?$/', '', $basename);
+                        $mtimes[$dbName] = $row['mtime'] ? \BBS\Core\TimeHelper::format($row['mtime'], 'M j, Y g:i A') : null;
+                    }
                 }
             }
         }
@@ -1452,12 +1500,18 @@ class ClientController extends Controller
             SshKeyManager::deleteStorage($clientDir);
         }
 
-        // Drop catalog data from ClickHouse (instant partition drop)
+        // Drop catalog data from ClickHouse or SQLite
         try {
             $ch = \BBS\Core\ClickHouse::getInstance();
-            $ch->exec("ALTER TABLE file_catalog DROP PARTITION " . (int) $id);
-            $ch->exec("ALTER TABLE catalog_dirs DROP PARTITION " . (int) $id);
-        } catch (\Exception $e) { /* ignore */ }
+            $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
+            if ($ch->isAvailable()) {
+                $ch->exec("ALTER TABLE file_catalog DROP PARTITION " . (int) $id);
+                $ch->exec("ALTER TABLE catalog_dirs DROP PARTITION " . (int) $id);
+            } elseif ($catalogDb) {
+                $catalogDb->exec("DELETE FROM file_catalog WHERE agent_id = " . (int) $id);
+                $catalogDb->exec("DELETE FROM catalog_dirs WHERE agent_id = " . (int) $id);
+            }
+        } catch (\Exception $e) {} /* ignore */
 
         $this->db->delete('agents', 'id = ?', [$id]);
         $this->flash('success', "Client \"{$agent['name']}\" deleted.");

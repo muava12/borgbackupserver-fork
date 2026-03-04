@@ -1,8 +1,8 @@
-(function() {
+(function () {
     const agentId = window.RESTORE_AGENT_ID;
     if (!agentId) return;
 
-    const clickhouseAvailable = !!window.CLICKHOUSE_AVAILABLE;
+    const catalogAvailable = !!window.CATALOG_AVAILABLE;
 
     // DOM refs
     const archiveSelect = document.getElementById('archive-select');
@@ -51,10 +51,10 @@
         return size.toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
     }
 
-    function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
     function statusBadge(s) {
-        const map = { A: ['success','New'], M: ['warning','Mod'], U: ['secondary','Unch'], E: ['danger','Err'] };
+        const map = { A: ['success', 'New'], M: ['warning', 'Mod'], U: ['secondary', 'Unch'], E: ['danger', 'Err'] };
         const [color, label] = map[s] || ['secondary', s];
         return '<span class="badge bg-' + color + '" style="font-size:0.65em;">' + label + '</span>';
     }
@@ -63,7 +63,7 @@
         if (!d) return '';
         const dt = new Date(d);
         return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) +
-               ' ' + dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+            ' ' + dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     }
 
     // Path selection helpers
@@ -145,7 +145,7 @@
     }
 
     // Remove from selection
-    selectedList.addEventListener('click', function(e) {
+    selectedList.addEventListener('click', function (e) {
         const entireBtn = e.target.closest('[data-remove-entire]');
         if (entireBtn) {
             entireArchiveSelected = false;
@@ -176,17 +176,17 @@
         wrapper.className = 'p-3';
         wrapper.innerHTML =
             '<div class="alert alert-info d-flex align-items-start gap-2 mb-3" style="font-size:0.85em;">' +
-                '<i class="bi bi-info-circle-fill mt-1"></i>' +
-                '<div>File catalog is not available. You can manually enter file or directory paths to restore.<br>' +
-                '<small class="text-muted">Tip: Use <code>/</code> to restore everything, or enter specific paths like <code>/home/user/documents/</code></small></div>' +
+            '<i class="bi bi-info-circle-fill mt-1"></i>' +
+            '<div>File catalog is not available. You can manually enter file or directory paths to restore.<br>' +
+            '<small class="text-muted">Tip: Use <code>/</code> to restore everything, or enter specific paths like <code>/home/user/documents/</code></small></div>' +
             '</div>' +
             '<div class="input-group mb-2">' +
-                '<span class="input-group-text"><i class="bi bi-folder2-open"></i></span>' +
-                '<input type="text" class="form-control font-monospace" id="manual-path-input" placeholder="/path/to/file/or/directory/" autocomplete="off">' +
-                '<button class="btn btn-primary" type="button" id="manual-path-add"><i class="bi bi-plus-lg"></i> Add</button>' +
+            '<span class="input-group-text"><i class="bi bi-folder2-open"></i></span>' +
+            '<input type="text" class="form-control font-monospace" id="manual-path-input" placeholder="/path/to/file/or/directory/" autocomplete="off">' +
+            '<button class="btn btn-primary" type="button" id="manual-path-add"><i class="bi bi-plus-lg"></i> Add</button>' +
             '</div>' +
             '<div class="d-flex gap-2 mb-2">' +
-                '<button class="btn btn-sm btn-outline-secondary" type="button" id="manual-add-root"><i class="bi bi-house"></i> Add Root (/)</button>' +
+            '<button class="btn btn-sm btn-outline-secondary" type="button" id="manual-add-root"><i class="bi bi-house"></i> Add Root (/)</button>' +
             '</div>';
         parentEl.appendChild(wrapper);
 
@@ -204,10 +204,10 @@
         }
 
         addBtn.addEventListener('click', addManualPath);
-        addInput.addEventListener('keypress', function(e) {
+        addInput.addEventListener('keypress', function (e) {
             if (e.key === 'Enter') { e.preventDefault(); addManualPath(); }
         });
-        addRootBtn.addEventListener('click', function() {
+        addRootBtn.addEventListener('click', function () {
             togglePath('/', true);
         });
     }
@@ -264,7 +264,7 @@
 
                     let loaded = false;
 
-                    item.querySelector('.tree-toggle, .tree-label').addEventListener('click', function(e) {
+                    item.querySelector('.tree-toggle, .tree-label').addEventListener('click', function (e) {
                         e.stopPropagation();
                         const isOpen = children.classList.contains('open');
                         if (isOpen) {
@@ -280,7 +280,7 @@
                         }
                     });
 
-                    item.querySelector('.tree-cb').addEventListener('change', function(e) {
+                    item.querySelector('.tree-cb').addEventListener('change', function (e) {
                         e.stopPropagation();
                         togglePath(d.path, this.checked);
                         if (this.checked) {
@@ -302,14 +302,14 @@
                         '<span class="tree-icon"><i class="bi bi-file-earmark"></i></span>' +
                         '<span class="tree-label">' + esc(f.file_name) + '</span>' +
                         '<span class="tree-meta">' +
-                            statusBadge(f.status) +
-                            '<span class="tree-size">' + formatSize(f.file_size) + '</span>' +
-                            (f.mtime ? '<span class="tree-mtime">' + formatDate(f.mtime) + '</span>' : '') +
+                        statusBadge(f.status) +
+                        '<span class="tree-size">' + formatSize(f.file_size) + '</span>' +
+                        (f.mtime ? '<span class="tree-mtime">' + formatDate(f.mtime) + '</span>' : '') +
                         '</span>';
 
                     parentEl.appendChild(item);
 
-                    item.querySelector('.tree-cb').addEventListener('change', function(e) {
+                    item.querySelector('.tree-cb').addEventListener('change', function (e) {
                         e.stopPropagation();
                         togglePath(f.file_path, this.checked);
                     });
@@ -351,7 +351,7 @@
 
     // Search mode switching
     if (searchModeMenu) {
-        searchModeMenu.addEventListener('click', function(e) {
+        searchModeMenu.addEventListener('click', function (e) {
             const item = e.target.closest('[data-mode]');
             if (item) {
                 searchMode = item.dataset.mode;
@@ -369,14 +369,14 @@
     }
 
     // Archive selection
-    archiveSelect.addEventListener('change', function() {
+    archiveSelect.addEventListener('change', function () {
         selectedPaths.clear();
         selectedVersions.clear();
         entireArchiveSelected = false;
         if (manualEntireArchive) manualEntireArchive.checked = false;
         updateSelectionUI();
 
-        if (clickhouseAvailable) {
+        if (catalogAvailable) {
             if (searchMode !== 'all') {
                 searchInput.disabled = !this.value;
                 searchBtn.disabled = !this.value;
@@ -511,7 +511,7 @@
     // Delegate: search result checkboxes
     const searchResultsBody = document.getElementById('search-results-body');
     if (searchResultsBody) {
-        searchResultsBody.addEventListener('change', function(e) {
+        searchResultsBody.addEventListener('change', function (e) {
             if (e.target.classList.contains('search-cb')) {
                 togglePath(e.target.dataset.path, e.target.checked);
             }
@@ -527,7 +527,7 @@
     // Delegate: history result radios
     const historyResultsBody = document.getElementById('history-results-body');
     if (historyResultsBody) {
-        historyResultsBody.addEventListener('change', function(e) {
+        historyResultsBody.addEventListener('change', function (e) {
             if (e.target.classList.contains('version-radio')) {
                 toggleVersion(e.target.dataset.path, parseInt(e.target.dataset.archive), e.target.checked);
             }
@@ -542,7 +542,7 @@
 
     // Manual path mode handlers (when ClickHouse unavailable)
     if (manualPathAddBtn) {
-        manualPathAddBtn.addEventListener('click', function() {
+        manualPathAddBtn.addEventListener('click', function () {
             const raw = manualPathInput.value.trim();
             if (!raw) return;
             // Strip leading slash — borg paths don't use leading slashes
@@ -556,7 +556,7 @@
         });
     }
     if (manualPathInput) {
-        manualPathInput.addEventListener('keypress', function(e) {
+        manualPathInput.addEventListener('keypress', function (e) {
             if (e.key === 'Enter') {
                 e.preventDefault();
                 manualPathAddBtn.click();
@@ -564,7 +564,7 @@
         });
     }
     if (manualEntireArchive) {
-        manualEntireArchive.addEventListener('change', function() {
+        manualEntireArchive.addEventListener('change', function () {
             entireArchiveSelected = this.checked;
             updateSelectionUI();
         });
@@ -630,7 +630,7 @@
         }
     }
 
-    restoreBtn.addEventListener('click', function() {
+    restoreBtn.addEventListener('click', function () {
         const count = (currentMode === 'search-all' && selectedVersions.size > 0) ? selectedVersions.size : selectedPaths.size;
         if (count === 0 && !entireArchiveSelected) return;
 
@@ -656,18 +656,18 @@
         const msg = entireArchiveSelected
             ? 'Restore the entire archive to the client?\n\nThis may overwrite existing files.'
             : 'Restore ' + count + ' path(s) to the client?\n\nThis may overwrite existing files.';
-        confirmAction(msg, function() {
+        confirmAction(msg, function () {
             fillFormAndSubmit('restore-form', 'restore-archive-id', 'restore-files-container', 'restore-dest-field');
         }, { danger: true });
     });
 
-    downloadBtn.addEventListener('click', function() {
+    downloadBtn.addEventListener('click', function () {
         const count = (currentMode === 'search-all' && selectedVersions.size > 0) ? selectedVersions.size : selectedPaths.size;
         if (count === 0 && !entireArchiveSelected) return;
         const msg = entireArchiveSelected
             ? 'Download the entire archive as a .tar.gz?'
             : 'Download ' + count + ' path(s) as a .tar.gz archive?';
-        confirmAction(msg, function() {
+        confirmAction(msg, function () {
             fillFormAndSubmit('download-form', 'download-archive-id', 'download-files-container', null);
         });
     });
@@ -732,7 +732,7 @@
 
         // Mode toggle
         if (modeToggle) {
-            modeToggle.addEventListener('click', function(e) {
+            modeToggle.addEventListener('click', function (e) {
                 const btn = e.target.closest('[data-restore-mode]');
                 if (!btn) return;
                 dbRestoreMode = btn.dataset.restoreMode;
@@ -748,20 +748,20 @@
                 if (dbRestoreMode === 'database') {
                     filesSection.style.display = 'none';
                     dbSection.style.display = '';
-                    filesControls.forEach(function(el) { el.style.display = 'none'; });
-                    dbControls.forEach(function(el) { el.style.display = ''; });
+                    filesControls.forEach(function (el) { el.style.display = 'none'; });
+                    dbControls.forEach(function (el) { el.style.display = ''; });
                 } else {
                     filesSection.style.display = '';
                     dbSection.style.display = 'none';
-                    filesControls.forEach(function(el) { el.style.display = ''; });
-                    dbControls.forEach(function(el) { el.style.display = 'none'; });
+                    filesControls.forEach(function (el) { el.style.display = ''; });
+                    dbControls.forEach(function (el) { el.style.display = 'none'; });
                 }
             });
         }
 
         // Archive selection for DB mode
         if (dbArchiveSelect) {
-            dbArchiveSelect.addEventListener('change', function() {
+            dbArchiveSelect.addEventListener('change', function () {
                 const archiveId = this.value;
                 dbTableBody.innerHTML = '';
                 dbTable.style.display = 'none';
@@ -796,32 +796,32 @@
                         dbTable.style.display = '';
                         var mtimes = data.mtimes || {};
                         var fallbackDate = data.backed_up_at || '';
-                        data.databases.forEach(function(dbName) {
+                        data.databases.forEach(function (dbName) {
                             const tr = document.createElement('tr');
                             const escapedName = esc(dbName);
                             tr.innerHTML =
                                 '<td>' +
-                                    '<select class="form-select form-select-sm db-mode-select" name="dbmode_' + escapedName + '" data-db="' + escapedName + '">' +
-                                        '<option value="none">None</option>' +
-                                        '<option value="replace">Replace</option>' +
-                                        (dbPerDatabase ? '<option value="rename">Copy</option>' : '') +
-                                    '</select>' +
+                                '<select class="form-select form-select-sm db-mode-select" name="dbmode_' + escapedName + '" data-db="' + escapedName + '">' +
+                                '<option value="none">None</option>' +
+                                '<option value="replace">Replace</option>' +
+                                (dbPerDatabase ? '<option value="rename">Copy</option>' : '') +
+                                '</select>' +
                                 '</td>' +
                                 '<td>' +
-                                    '<span class="font-monospace">' + escapedName + '</span>' +
-                                    '<div class="db-copy-input mt-1" style="display:none;">' +
-                                        '<div class="input-group input-group-sm">' +
-                                            '<span class="input-group-text"><i class="bi bi-arrow-right"></i></span>' +
-                                            '<input type="text" class="form-control form-control-sm font-monospace" data-rename-for="' + escapedName + '" value="' + escapedName + '_copy" placeholder="New database name">' +
-                                        '</div>' +
-                                    '</div>' +
+                                '<span class="font-monospace">' + escapedName + '</span>' +
+                                '<div class="db-copy-input mt-1" style="display:none;">' +
+                                '<div class="input-group input-group-sm">' +
+                                '<span class="input-group-text"><i class="bi bi-arrow-right"></i></span>' +
+                                '<input type="text" class="form-control form-control-sm font-monospace" data-rename-for="' + escapedName + '" value="' + escapedName + '_copy" placeholder="New database name">' +
+                                '</div>' +
+                                '</div>' +
                                 '</td>' +
                                 '<td class="text-end text-muted small">' + esc(mtimes[dbName] || fallbackDate) + '</td>';
                             dbTableBody.appendChild(tr);
                         });
 
                         // Show/hide copy name input and update selection when mode changes
-                        dbTableBody.addEventListener('change', function(e) {
+                        dbTableBody.addEventListener('change', function (e) {
                             if (e.target.classList.contains('db-mode-select')) {
                                 const row = e.target.closest('tr');
                                 const copyDiv = row.querySelector('.db-copy-input');
@@ -832,7 +832,7 @@
                             }
                         });
                     })
-                    .catch(function() {
+                    .catch(function () {
                         dbLoading.style.display = 'none';
                         dbNoData.style.display = '';
                         dbNoData.innerHTML = '<i class="bi bi-exclamation-triangle d-block mb-2" style="font-size:2rem;opacity:0.3;"></i>Failed to load database info';
@@ -842,7 +842,7 @@
 
         function getSelectedDbs() {
             var selected = [];
-            dbTableBody.querySelectorAll('.db-mode-select').forEach(function(sel) {
+            dbTableBody.querySelectorAll('.db-mode-select').forEach(function (sel) {
                 if (sel.value !== 'none') selected.push(sel);
             });
             return selected;
@@ -855,12 +855,12 @@
         }
 
         // Submit DB restore
-        dbRestoreBtn.addEventListener('click', function() {
+        dbRestoreBtn.addEventListener('click', function () {
             const selected = getSelectedDbs();
             if (selected.length === 0) return;
 
             const lines = [];
-            selected.forEach(function(sel) {
+            selected.forEach(function (sel) {
                 const dbName = sel.dataset.db;
                 const mode = sel.value;
                 if (mode === 'rename') {
@@ -871,44 +871,44 @@
                     lines.push('Replace ' + dbName);
                 }
             });
-            confirmAction('Perform the following on the client?\n\n' + lines.join('\n') + '\n\nThis may overwrite existing data.', function() {
+            confirmAction('Perform the following on the client?\n\n' + lines.join('\n') + '\n\nThis may overwrite existing data.', function () {
                 const form = document.getElementById('db-restore-form');
-            const fieldsContainer = document.getElementById('db-restore-fields');
-            fieldsContainer.innerHTML = '';
-            document.getElementById('db-restore-archive-id').value = dbArchiveSelect.value;
-            const configIdField = document.getElementById('db-restore-config-id');
-            if (configIdField && dbConfigId) {
-                const { id } = parseConfigValue();
-                configIdField.value = id;
-            }
-            // Update form action based on selected connection type
-            updateConnectionInfo();
-
-            selected.forEach(function(sel, i) {
-                const dbName = sel.dataset.db;
-                const mode = sel.value;
-
-                const nameInput = document.createElement('input');
-                nameInput.type = 'hidden';
-                nameInput.name = 'databases[' + i + '][name]';
-                nameInput.value = dbName;
-                fieldsContainer.appendChild(nameInput);
-
-                const modeInput = document.createElement('input');
-                modeInput.type = 'hidden';
-                modeInput.name = 'databases[' + i + '][mode]';
-                modeInput.value = mode;
-                fieldsContainer.appendChild(modeInput);
-
-                if (mode === 'rename') {
-                    const renameField = dbTableBody.querySelector('input[data-rename-for="' + CSS.escape(dbName) + '"]');
-                    const targetInput = document.createElement('input');
-                    targetInput.type = 'hidden';
-                    targetInput.name = 'databases[' + i + '][target_name]';
-                    targetInput.value = renameField ? renameField.value.trim() : dbName + '_copy';
-                    fieldsContainer.appendChild(targetInput);
+                const fieldsContainer = document.getElementById('db-restore-fields');
+                fieldsContainer.innerHTML = '';
+                document.getElementById('db-restore-archive-id').value = dbArchiveSelect.value;
+                const configIdField = document.getElementById('db-restore-config-id');
+                if (configIdField && dbConfigId) {
+                    const { id } = parseConfigValue();
+                    configIdField.value = id;
                 }
-            });
+                // Update form action based on selected connection type
+                updateConnectionInfo();
+
+                selected.forEach(function (sel, i) {
+                    const dbName = sel.dataset.db;
+                    const mode = sel.value;
+
+                    const nameInput = document.createElement('input');
+                    nameInput.type = 'hidden';
+                    nameInput.name = 'databases[' + i + '][name]';
+                    nameInput.value = dbName;
+                    fieldsContainer.appendChild(nameInput);
+
+                    const modeInput = document.createElement('input');
+                    modeInput.type = 'hidden';
+                    modeInput.name = 'databases[' + i + '][mode]';
+                    modeInput.value = mode;
+                    fieldsContainer.appendChild(modeInput);
+
+                    if (mode === 'rename') {
+                        const renameField = dbTableBody.querySelector('input[data-rename-for="' + CSS.escape(dbName) + '"]');
+                        const targetInput = document.createElement('input');
+                        targetInput.type = 'hidden';
+                        targetInput.name = 'databases[' + i + '][target_name]';
+                        targetInput.value = renameField ? renameField.value.trim() : dbName + '_copy';
+                        fieldsContainer.appendChild(targetInput);
+                    }
+                });
 
                 form.submit();
             }, { danger: true });

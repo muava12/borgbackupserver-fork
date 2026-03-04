@@ -41,6 +41,7 @@ class CatalogImporter
         }
 
         $ch = ClickHouse::getInstance();
+        $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
         $tsvFile = sys_get_temp_dir() . "/catalog_{$agentId}_{$archiveId}_" . getmypid() . '.tsv';
 
         $tsvFh = fopen($tsvFile, 'w');
@@ -109,7 +110,7 @@ class CatalogImporter
 
             $loadStart = microtime(true);
 
-            $ch->insertTsv('file_catalog', $tsvFile, [
+            $catalogDb->insertTsv('file_catalog', $tsvFile, [
                 'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'
             ]);
 
@@ -118,7 +119,7 @@ class CatalogImporter
             $updateStatus("Building directory index...");
 
             // Build catalog_dirs table for fast directory browsing
-            $this->buildDirIndex($ch, $agentId, $archiveId, $dirStats, $log);
+            $this->buildDirIndex($catalogDb, $agentId, $archiveId, $dirStats, $log);
 
             // Update cached catalog total for dashboard
             self::updateCachedTotal($db);
@@ -135,11 +136,15 @@ class CatalogImporter
      * Build the catalog_dirs index table from collected directory stats.
      * Uses TSV upload to ClickHouse for speed.
      */
-    private function buildDirIndex(ClickHouse $ch, int $agentId, int $archiveId, array $dirStats, callable $log): void
+    private function buildDirIndex($catalogDb, int $agentId, int $archiveId, array $dirStats, callable $log): void
     {
         // Remove old dir entries for this archive
         try {
-            $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
+            if ($catalogDb instanceof \BBS\Core\ClickHouse) {
+                $catalogDb->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
+            } else {
+                $catalogDb->exec("DELETE FROM catalog_dirs WHERE agent_id = {$agentId} AND archive_id = {$archiveId}");
+            }
         } catch (\Exception $e) { /* ignore */ }
 
         if (empty($dirStats)) return;
@@ -179,7 +184,7 @@ class CatalogImporter
         fclose($fh);
 
         try {
-            $ch->insertTsv('catalog_dirs', $dirsTsv, [
+            $catalogDb->insertTsv('catalog_dirs', $dirsTsv, [
                 'agent_id', 'archive_id', 'dir_path', 'parent_dir', 'name', 'file_count', 'total_size'
             ]);
             $log("Catalog dirs index: " . number_format(count($allDirs)) . " directories indexed");
@@ -197,7 +202,8 @@ class CatalogImporter
     {
         try {
             $ch = ClickHouse::getInstance();
-            $row = $ch->fetchOne("SELECT count() as cnt FROM file_catalog");
+            $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
+            $row = $catalogDb->fetchOne("SELECT count() as cnt FROM file_catalog");
             $total = (int) ($row['cnt'] ?? 0);
             $db->getPdo()->exec(
                 "INSERT INTO settings (`key`, `value`) VALUES ('catalog_total_files', '{$total}')
