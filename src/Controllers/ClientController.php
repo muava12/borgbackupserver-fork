@@ -298,7 +298,7 @@ class ClientController extends Controller
         ", [$id]);
 
         $recentJobs = $this->db->fetchAll("
-            SELECT bj.*, r.name as repo_name
+            SELECT bj.id, bj.status, bj.task_type, bj.started_at, bj.queued_at, bj.duration_seconds, bj.files_total, SUBSTRING(bj.error_log, 1, 255) as error_log, r.name as repo_name
             FROM backup_jobs bj
             LEFT JOIN repositories r ON r.id = bj.repository_id
             WHERE bj.agent_id = ?
