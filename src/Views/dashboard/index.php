@@ -173,6 +173,8 @@ $compactNum = function(int $n): string {
     return number_format($n);
 };
 $chStats = $clickhouseStats ?? null;
+$chBackend = $chStats['backend'] ?? 'clickhouse';
+$isSqliteBackend = ($chBackend === 'sqlite');
 $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
 ?>
 <!-- Row 3: Storage Pool + MySQL Health (left) | ClickHouse Catalog (right) -->
@@ -323,7 +325,11 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
     <div class="col-lg-8">
         <div class="card border-0 shadow-sm h-100">
             <div class="card-header bg-body fw-semibold">
-                <img src="/images/clickhouse.svg" alt="" style="height:1em;vertical-align:-.1em;" class="me-1"> ClickHouse Catalog
+                <?php if ($isSqliteBackend): ?>
+                    <i class="bi bi-archive me-1"></i> Backup Catalog
+                <?php else: ?>
+                    <img src="/images/clickhouse.svg" alt="" style="height:1em;vertical-align:-.1em;" class="me-1"> Backup Catalog
+                <?php endif; ?>
             </div>
             <div class="card-body py-3">
                 <div class="d-flex h-100">
@@ -346,9 +352,10 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                             </div>
                         </div>
                         <?php if ($chStats): ?>
-                        <!-- ClickHouse Stats Grid -->
+                        <!-- Catalog Stats Grid -->
                         <div class="border-top pt-2 mt-1">
                             <div class="row g-1 text-center" style="font-size:.7rem;">
+                                <?php if (!$isSqliteBackend): ?>
                                 <div class="col-3">
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-disk"><?= \BBS\Services\ServerStats::formatBytes($chStats['disk_bytes']) ?></div>
                                     <div class="text-muted">Disk Usage</div>
@@ -357,11 +364,12 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-compression"><?= $chStats['compression_ratio'] ?>x</div>
                                     <div class="text-muted">Compress</div>
                                 </div>
-                                <div class="col-3">
+                                <?php endif; ?>
+                                <div class="<?= $isSqliteBackend ? 'col-6' : 'col-3' ?>">
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-agents"><?= $chStats['agent_count'] ?></div>
                                     <div class="text-muted">Agents</div>
                                 </div>
-                                <div class="col-3">
+                                <div class="<?= $isSqliteBackend ? 'col-6' : 'col-3' ?>">
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-avg-archive"><?= $compactNum($chStats['avg_per_archive']) ?></div>
                                     <div class="text-muted">Avg/Archive</div>
                                 </div>
@@ -381,7 +389,9 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                                         <td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:<?= $pieColors[$i % 5] ?>;margin-right:4px;"></span><span class="fw-semibold"><?= htmlspecialchars($repo['name']) ?></span></td>
                                         <td class="border-0 py-0 text-end text-muted"><?= $compactNum($repo['rows']) ?> rows</td>
                                         <td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell"><?= $repo['archives'] ?> archives</td>
+                                        <?php if (!$isSqliteBackend): ?>
                                         <td class="border-0 py-0 text-end text-muted"><?= \BBS\Services\ServerStats::formatBytes($repo['disk_bytes']) ?></td>
+                                        <?php endif; ?>
                                     </tr>
                                     <?php endforeach; ?>
                                 </tbody>
@@ -393,13 +403,26 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                     <!-- Right: Pie Chart -->
                     <?php if ($chStats && !empty($chStats['top_repos'])): ?>
                     <?php
-                        $top5Disk = array_sum(array_column($chStats['top_repos'], 'disk_bytes'));
-                        $otherDisk = max($chStats['disk_bytes'] - $top5Disk, 0);
-                        $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
-                        $pieData = array_map(fn($r) => $r['disk_bytes'], $chStats['top_repos']);
-                        if ($otherDisk > 0) {
-                            $pieLabels[] = 'Other';
-                            $pieData[] = $otherDisk;
+                        if ($isSqliteBackend) {
+                            // SQLite: use row counts for pie chart
+                            $top5Rows = array_sum(array_column($chStats['top_repos'], 'rows'));
+                            $otherRows = max($chStats['total_rows'] - $top5Rows, 0);
+                            $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
+                            $pieData = array_map(fn($r) => $r['rows'], $chStats['top_repos']);
+                            if ($otherRows > 0) {
+                                $pieLabels[] = 'Other';
+                                $pieData[] = $otherRows;
+                            }
+                        } else {
+                            // ClickHouse: use disk bytes for pie chart
+                            $top5Disk = array_sum(array_column($chStats['top_repos'], 'disk_bytes'));
+                            $otherDisk = max($chStats['disk_bytes'] - $top5Disk, 0);
+                            $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
+                            $pieData = array_map(fn($r) => $r['disk_bytes'], $chStats['top_repos']);
+                            if ($otherDisk > 0) {
+                                $pieLabels[] = 'Other';
+                                $pieData[] = $otherDisk;
+                            }
                         }
                     ?>
                     <div class="d-none d-md-flex flex-column align-items-center justify-content-center border-start ms-3 ps-3" style="flex:0 0 33%;max-width:33%;" id="ch-pie-wrap">
@@ -703,7 +726,12 @@ if (pieCanvas) {
                         label: function(ctx) {
                             const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
                             const pct = total > 0 ? (ctx.raw / total * 100).toFixed(1) : 0;
+                            <?php if ($isSqliteBackend): ?>
+                            const fmtNum = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
+                            return ctx.label + ': ' + fmtNum(ctx.raw) + ' rows (' + pct + '%)';
+                            <?php else: ?>
                             return ctx.label + ': ' + fmtBytes(ctx.raw) + ' (' + pct + '%)';
+                            <?php endif; ?>
                         }
                     }
                 }

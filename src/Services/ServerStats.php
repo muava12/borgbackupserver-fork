@@ -353,102 +353,186 @@ class ServerStats
     }
 
     /**
-     * Get ClickHouse catalog statistics for the dashboard.
-     * Returns null if ClickHouse is unavailable.
+     * Get catalog statistics for the dashboard.
+     * Works with both ClickHouse (full stats) and SQLite fallback (basic stats).
+     * Returns null only if no catalog data exists at all.
      */
     public static function getClickHouseStats(): ?array
     {
         try {
             $ch = \BBS\Core\ClickHouse::getInstance();
-            if (!$ch->isAvailable()) return null;
+            $useClickHouse = $ch->isAvailable();
 
-            // Aggregate stats from file_catalog
-            $totals = $ch->fetchOne("
-                SELECT count() AS total_rows,
-                       uniqExact(agent_id) AS agent_count,
-                       uniqExact(archive_id) AS archive_count
-                FROM file_catalog
-            ");
-            if (!$totals) return null;
-
-            $totalRows = (int) ($totals['total_rows'] ?? 0);
-            $agentCount = (int) ($totals['agent_count'] ?? 0);
-            $archiveCount = (int) ($totals['archive_count'] ?? 0);
-            $avgPerArchive = $archiveCount > 0 ? round($totalRows / $archiveCount) : 0;
-
-            // Disk usage from system.parts (active parts only)
-            $diskRow = $ch->fetchOne("
-                SELECT sum(bytes_on_disk) AS disk_bytes,
-                       sum(data_uncompressed_bytes) AS raw_bytes
-                FROM system.parts
-                WHERE database = 'bbs' AND table = 'file_catalog' AND active = 1
-            ");
-            $diskBytes = (int) ($diskRow['disk_bytes'] ?? 0);
-            $rawBytes = (int) ($diskRow['raw_bytes'] ?? 0);
-            $compressionRatio = $diskBytes > 0 ? round($rawBytes / $diskBytes, 0) : 0;
-
-            // Per-agent stats: rows, disk, archives — join agent names from MySQL
-            $perAgent = $ch->fetchAll("
-                SELECT partition AS agent_id,
-                       sum(rows) AS rows,
-                       sum(bytes_on_disk) AS disk_bytes
-                FROM system.parts
-                WHERE database = 'bbs' AND table = 'file_catalog' AND active = 1
-                GROUP BY partition
-                ORDER BY rows DESC
-            ");
-
-            // Get archive counts per agent from ClickHouse
-            $archivesPerAgent = $ch->fetchAll("
-                SELECT agent_id, uniqExact(archive_id) AS archives
-                FROM file_catalog
-                GROUP BY agent_id
-            ");
-            $archiveMap = [];
-            foreach ($archivesPerAgent as $a) {
-                $archiveMap[(int) $a['agent_id']] = (int) $a['archives'];
+            if ($useClickHouse) {
+                // ClickHouse path: full stats including disk usage
+                return self::getClickHouseStatsNative($ch);
+            } else {
+                // SQLite fallback: basic stats without disk/compression info
+                return self::getClickHouseStatsSqlite();
             }
-
-            // Get agent names from MySQL
-            $db = \BBS\Core\Database::getInstance();
-            $agentIds = array_map(fn($r) => (int) $r['agent_id'], $perAgent);
-            $agentNames = [];
-            if (!empty($agentIds)) {
-                $placeholders = implode(',', array_fill(0, count($agentIds), '?'));
-                $rows = $db->fetchAll(
-                    "SELECT id, name FROM agents WHERE id IN ({$placeholders})",
-                    $agentIds
-                );
-                foreach ($rows as $r) {
-                    $agentNames[(int) $r['id']] = $r['name'];
-                }
-            }
-
-            // Build top repos list (max 5)
-            $topRepos = [];
-            foreach (array_slice($perAgent, 0, 5) as $agent) {
-                $aid = (int) $agent['agent_id'];
-                $topRepos[] = [
-                    'name' => $agentNames[$aid] ?? "Agent #{$aid}",
-                    'rows' => (int) $agent['rows'],
-                    'archives' => $archiveMap[$aid] ?? 0,
-                    'disk_bytes' => (int) $agent['disk_bytes'],
-                ];
-            }
-
-            return [
-                'total_rows' => $totalRows,
-                'agent_count' => $agentCount,
-                'archive_count' => $archiveCount,
-                'avg_per_archive' => $avgPerArchive,
-                'disk_bytes' => $diskBytes,
-                'raw_bytes' => $rawBytes,
-                'compression_ratio' => $compressionRatio,
-                'top_repos' => $topRepos,
-            ];
         } catch (\Exception $e) {
             return null;
         }
+    }
+
+    /**
+     * Full ClickHouse stats with disk usage and compression from system.parts.
+     */
+    private static function getClickHouseStatsNative(\BBS\Core\ClickHouse $ch): ?array
+    {
+        $totals = $ch->fetchOne("
+            SELECT count() AS total_rows,
+                   uniqExact(agent_id) AS agent_count,
+                   uniqExact(archive_id) AS archive_count
+            FROM file_catalog
+        ");
+        if (!$totals) return null;
+
+        $totalRows = (int) ($totals['total_rows'] ?? 0);
+        $agentCount = (int) ($totals['agent_count'] ?? 0);
+        $archiveCount = (int) ($totals['archive_count'] ?? 0);
+        $avgPerArchive = $archiveCount > 0 ? round($totalRows / $archiveCount) : 0;
+
+        // Disk usage from system.parts (active parts only)
+        $diskRow = $ch->fetchOne("
+            SELECT sum(bytes_on_disk) AS disk_bytes,
+                   sum(data_uncompressed_bytes) AS raw_bytes
+            FROM system.parts
+            WHERE database = 'bbs' AND table = 'file_catalog' AND active = 1
+        ");
+        $diskBytes = (int) ($diskRow['disk_bytes'] ?? 0);
+        $rawBytes = (int) ($diskRow['raw_bytes'] ?? 0);
+        $compressionRatio = $diskBytes > 0 ? round($rawBytes / $diskBytes, 0) : 0;
+
+        // Per-agent stats from system.parts
+        $perAgent = $ch->fetchAll("
+            SELECT partition AS agent_id,
+                   sum(rows) AS rows,
+                   sum(bytes_on_disk) AS disk_bytes
+            FROM system.parts
+            WHERE database = 'bbs' AND table = 'file_catalog' AND active = 1
+            GROUP BY partition
+            ORDER BY rows DESC
+        ");
+
+        // Get archive counts per agent
+        $archivesPerAgent = $ch->fetchAll("
+            SELECT agent_id, uniqExact(archive_id) AS archives
+            FROM file_catalog
+            GROUP BY agent_id
+        ");
+        $archiveMap = [];
+        foreach ($archivesPerAgent as $a) {
+            $archiveMap[(int) $a['agent_id']] = (int) $a['archives'];
+        }
+
+        $topRepos = self::buildTopRepos($perAgent, $archiveMap);
+
+        return [
+            'backend' => 'clickhouse',
+            'total_rows' => $totalRows,
+            'agent_count' => $agentCount,
+            'archive_count' => $archiveCount,
+            'avg_per_archive' => $avgPerArchive,
+            'disk_bytes' => $diskBytes,
+            'raw_bytes' => $rawBytes,
+            'compression_ratio' => $compressionRatio,
+            'top_repos' => $topRepos,
+        ];
+    }
+
+    /**
+     * SQLite fallback stats — no disk usage or compression info available.
+     */
+    private static function getClickHouseStatsSqlite(): ?array
+    {
+        $sqlite = \BBS\Core\SQLiteCatalog::getInstance();
+
+        $totals = $sqlite->fetchOne("
+            SELECT COUNT(*) AS total_rows,
+                   COUNT(DISTINCT agent_id) AS agent_count,
+                   COUNT(DISTINCT archive_id) AS archive_count
+            FROM file_catalog
+        ");
+        if (!$totals || (int) ($totals['total_rows'] ?? 0) === 0) return null;
+
+        $totalRows = (int) $totals['total_rows'];
+        $agentCount = (int) $totals['agent_count'];
+        $archiveCount = (int) $totals['archive_count'];
+        $avgPerArchive = $archiveCount > 0 ? round($totalRows / $archiveCount) : 0;
+
+        // Per-agent stats from SQLite (no disk_bytes available)
+        $perAgent = $sqlite->fetchAll("
+            SELECT agent_id,
+                   COUNT(*) AS rows
+            FROM file_catalog
+            GROUP BY agent_id
+            ORDER BY rows DESC
+        ");
+
+        // Archive counts per agent
+        $archivesPerAgent = $sqlite->fetchAll("
+            SELECT agent_id, COUNT(DISTINCT archive_id) AS archives
+            FROM file_catalog
+            GROUP BY agent_id
+        ");
+        $archiveMap = [];
+        foreach ($archivesPerAgent as $a) {
+            $archiveMap[(int) $a['agent_id']] = (int) $a['archives'];
+        }
+
+        // Add disk_bytes = 0 for compatibility with buildTopRepos
+        foreach ($perAgent as &$pa) {
+            $pa['disk_bytes'] = 0;
+        }
+        unset($pa);
+
+        $topRepos = self::buildTopRepos($perAgent, $archiveMap);
+
+        return [
+            'backend' => 'sqlite',
+            'total_rows' => $totalRows,
+            'agent_count' => $agentCount,
+            'archive_count' => $archiveCount,
+            'avg_per_archive' => $avgPerArchive,
+            'disk_bytes' => 0,
+            'raw_bytes' => 0,
+            'compression_ratio' => 0,
+            'top_repos' => $topRepos,
+        ];
+    }
+
+    /**
+     * Build top repos list (max 5) from per-agent data.
+     */
+    private static function buildTopRepos(array $perAgent, array $archiveMap): array
+    {
+        $db = \BBS\Core\Database::getInstance();
+        $agentIds = array_map(fn($r) => (int) $r['agent_id'], $perAgent);
+        $agentNames = [];
+        if (!empty($agentIds)) {
+            $placeholders = implode(',', array_fill(0, count($agentIds), '?'));
+            $rows = $db->fetchAll(
+                "SELECT id, name FROM agents WHERE id IN ({$placeholders})",
+                $agentIds
+            );
+            foreach ($rows as $r) {
+                $agentNames[(int) $r['id']] = $r['name'];
+            }
+        }
+
+        $topRepos = [];
+        foreach (array_slice($perAgent, 0, 5) as $agent) {
+            $aid = (int) $agent['agent_id'];
+            $topRepos[] = [
+                'name' => $agentNames[$aid] ?? "Agent #{$aid}",
+                'rows' => (int) $agent['rows'],
+                'archives' => $archiveMap[$aid] ?? 0,
+                'disk_bytes' => (int) ($agent['disk_bytes'] ?? 0),
+            ];
+        }
+
+        return $topRepos;
     }
 
     /**
