@@ -31,6 +31,16 @@ class UpdateService
         return file_exists('/.dockerenv');
     }
 
+    public function getIncludePrereleases(): bool
+    {
+        return $this->getSetting('include_prereleases', '0') === '1';
+    }
+
+    public function setIncludePrereleases(bool $value): void
+    {
+        $this->setSetting('include_prereleases', $value ? '1' : '0');
+    }
+
     public function getLatestRelease(): array
     {
         return [
@@ -74,7 +84,6 @@ class UpdateService
             ],
         ]);
 
-        // Use /releases (not /releases/latest) to include pre-releases
         $url = 'https://api.github.com/repos/marcpope/borgbackupserver/releases';
         $json = @file_get_contents($url, false, $ctx);
 
@@ -95,8 +104,27 @@ class UpdateService
             ];
         }
 
-        // First entry is the most recent release (including pre-releases)
-        $release = $releases[0];
+        // Filter by prerelease preference
+        $includePrereleases = $this->getSetting('include_prereleases', '0') === '1';
+        $release = null;
+        foreach ($releases as $r) {
+            if (!empty($r['draft'])) continue;
+            if (!$includePrereleases && !empty($r['prerelease'])) continue;
+            $release = $r;
+            break;
+        }
+
+        if (!$release) {
+            $this->setSetting('last_update_check', date('Y-m-d H:i:s'));
+            return [
+                'version' => $this->getCurrentVersion(),
+                'current' => $this->getCurrentVersion(),
+                'update_available' => false,
+                'notes' => '',
+                'url' => '',
+                'message' => 'No stable releases published yet.',
+            ];
+        }
         if (empty($release['tag_name'])) {
             return ['error' => 'Invalid response from GitHub'];
         }

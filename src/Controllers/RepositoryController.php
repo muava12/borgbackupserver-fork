@@ -75,12 +75,12 @@ class RepositoryController extends Controller
         $host = $serverHost['value'] ?? '';
 
         // Determine if this storage location differs from the SSH user's home directory.
-        // SSH home dir is always based on settings.storage_path, so compare actual paths
-        // rather than location IDs (the user may have changed which location is "default").
-        $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-        $sshHomePath = rtrim($storageSetting['value'] ?? '/var/bbs/home', '/');
+        // Compare the location path against the parent of the agent's actual ssh_home_dir
+        // (stored at provisioning time) rather than settings.storage_path which can change.
         $locationPath = rtrim($location['path'], '/');
-        $isNonDefault = $locationPath !== $sshHomePath;
+        $sshHomeDir = $agent['ssh_home_dir'] ?? null;
+        $sshHomePath = $sshHomeDir ? rtrim(dirname($sshHomeDir), '/') : null;
+        $isNonDefault = !$sshHomePath || $locationPath !== $sshHomePath;
 
         if ($isNonDefault) {
             // Non-default storage location: use absolute path so borg finds the repo
@@ -132,39 +132,21 @@ class RepositoryController extends Controller
             }
         }
 
-        // Build and run borg init using proc_open for clean env handling
-        $env = $_ENV;
+        // Update .storage-paths BEFORE borg init so SSH access works even if init fails
+        if (!empty($agent['ssh_unix_user'])) {
+            $this->updateAgentStoragePaths($agentId, $agent);
+        }
+
+        // Run borg init via bbs-ssh-helper (runs as root, works on NFS and other
+        // filesystems where www-data may lack write access despite POSIX permissions)
+        $initCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-init', $localPath, $encryption];
         if ($encryption !== 'none' && !empty($passphrase)) {
-            $env['BORG_PASSPHRASE'] = $passphrase;
+            $initCmd[] = $passphrase;
         }
-        $env['BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK'] = 'yes';
-        $env['BORG_RELOCATED_REPO_ACCESS_IS_OK'] = 'yes';
-        $env['BORG_BASE_DIR'] = '/tmp/bbs-borg-www-data';
-        $env['HOME'] = '/tmp/bbs-borg-www-data';
+        exec(implode(' ', array_map('escapeshellarg', $initCmd)) . ' 2>&1', $initOutput, $initRet);
 
-        $initCmd = ['borg', 'init', '--encryption=' . $encryption, $localPath];
-
-        $proc = proc_open($initCmd, [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ], $pipes, null, $env);
-
-        $output = [];
-        $retval = -1;
-        if (is_resource($proc)) {
-            fclose($pipes[0]);
-            $stdout = stream_get_contents($pipes[1]);
-            $stderr = stream_get_contents($pipes[2]);
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-            $retval = proc_close($proc);
-            if (!empty($stdout)) $output[] = $stdout;
-            if (!empty($stderr)) $output[] = $stderr;
-        }
-
-        if ($retval !== 0) {
-            $errorMsg = implode("\n", $output);
+        if ($initRet !== 0) {
+            $errorMsg = implode("\n", $initOutput);
             $this->db->insert('server_log', [
                 'agent_id' => $agentId,
                 'level' => 'error',
@@ -174,7 +156,7 @@ class RepositoryController extends Controller
             $this->redirect("/clients/{$agentId}?tab=repos");
         }
 
-        // Fix ownership: borg init creates files as www-data, but the bbs-user needs to own them for SSH access
+        // Fix ownership: borg init creates files as root, but the bbs-user needs to own them for SSH access
         if (!empty($agent['ssh_unix_user'])) {
             $fixCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'fix-repo-perms', $localPath, $agent['ssh_unix_user']];
             exec(implode(' ', array_map('escapeshellarg', $fixCmd)) . ' 2>&1', $fixOutput, $fixRet);
@@ -192,11 +174,6 @@ class RepositoryController extends Controller
             'level' => 'info',
             'message' => "Repository \"{$name}\" initialized ({$encryption}) at {$localPath}",
         ]);
-
-        // Update .storage-paths for non-default storage locations
-        if ($isNonDefault && !empty($agent['ssh_unix_user'])) {
-            $this->updateAgentStoragePaths($agentId, $agent);
-        }
 
         $this->flash('success', "Repository \"{$name}\" created and initialized.");
         $this->redirect("/clients/{$agentId}?tab=repos");
@@ -411,31 +388,38 @@ class RepositoryController extends Controller
 
     /**
      * Update .storage-paths file for an agent (used by bbs-ssh-gate to allow borg access
-     * to non-default storage locations). Gathers all unique non-default storage location
-     * agent directories and writes them via bbs-ssh-helper.
+     * to storage locations outside the agent's SSH home directory). Gathers all unique
+     * storage location agent directories and writes them via bbs-ssh-helper.
      */
     private function updateAgentStoragePaths(int $agentId, array $agent): void
     {
-        $defaultLoc = $this->db->fetchOne("SELECT id FROM storage_locations WHERE is_default = 1");
-        $defaultId = $defaultLoc['id'] ?? 0;
+        // Get agent's home directory from stored ssh_home_dir
+        $homeDir = $agent['ssh_home_dir'] ?? null;
+        if (!$homeDir) {
+            return; // No SSH provisioned — can't update storage paths
+        }
 
-        // Find all non-default storage locations that have repos for this agent
+        // The parent of the home dir (e.g., /var/bbs/home from /var/bbs/home/3)
+        // bbs-ssh-gate already allows access to $homeDir, so any storage location
+        // under the same parent is already accessible. We only need to add paths
+        // for locations on different base paths.
+        $homeParent = rtrim(dirname($homeDir), '/');
+
+        // Find all storage locations that have local repos for this agent
         $locations = $this->db->fetchAll(
             "SELECT DISTINCT sl.path FROM repositories r
              JOIN storage_locations sl ON sl.id = r.storage_location_id
-             WHERE r.agent_id = ? AND r.storage_type = 'local' AND r.storage_location_id != ?",
-            [$agentId, $defaultId]
+             WHERE r.agent_id = ? AND r.storage_type = 'local'",
+            [$agentId]
         );
 
-        // Build the agent-specific paths (e.g., /mnt/storage2/3/)
+        // Build agent-specific paths for locations outside the home dir's parent
         $paths = [];
         foreach ($locations as $loc) {
-            $paths[] = rtrim($loc['path'], '/') . '/' . $agentId;
+            $locPath = rtrim($loc['path'], '/');
+            if ($locPath === $homeParent) continue; // Already allowed via home dir
+            $paths[] = $locPath . '/' . $agentId;
         }
-
-        // Get agent's home directory (storage_path already includes /home, e.g. /var/bbs/home)
-        $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-        $homeDir = rtrim($storageSetting['value'] ?? '/var/bbs/home', '/') . '/' . $agentId;
 
         // Call bbs-ssh-helper to write the paths file
         $cmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'update-storage-paths', $homeDir];
@@ -1202,10 +1186,10 @@ class RepositoryController extends Controller
         $host = $serverHost['value'] ?? '';
 
         // Determine if this is a non-default storage location (same logic as storeLocal)
-        $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-        $sshHomePath = rtrim($storageSetting['value'] ?? '/var/bbs/home', '/');
         $locationPath = rtrim($location['path'], '/');
-        $isNonDefault = $locationPath !== $sshHomePath;
+        $sshHomeDir = $agent['ssh_home_dir'] ?? null;
+        $sshHomePath = $sshHomeDir ? rtrim(dirname($sshHomeDir), '/') : null;
+        $isNonDefault = !$sshHomePath || $locationPath !== $sshHomePath;
 
         if ($isNonDefault) {
             $localPath = $locationPath . '/' . $agentId . '/' . $name;
@@ -1247,8 +1231,8 @@ class RepositoryController extends Controller
             }
         }
 
-        // Update .storage-paths for non-default storage locations
-        if ($isNonDefault && !empty($agent['ssh_unix_user'])) {
+        // Update .storage-paths so bbs-ssh-gate allows borg access to this location
+        if (!empty($agent['ssh_unix_user'])) {
             $this->updateAgentStoragePaths($agentId, $agent);
         }
 
