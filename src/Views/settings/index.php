@@ -46,6 +46,11 @@ $updateAvailable = $updateService->isUpdateAvailable();
             <?php endif; ?>
         </a>
     </li>
+    <li class="nav-item d-sm-none">
+        <a class="nav-link" href="/storage-locations">
+            <i class="bi bi-hdd-stack me-1"></i><span class="tab-label">Storage</span>
+        </a>
+    </li>
 </ul>
 <div class="client-tab-content border rounded-bottom p-4 mb-4 shadow-sm">
 
@@ -62,10 +67,22 @@ $updateAvailable = $updateService->isUpdateAvailable();
                     <i class="bi bi-server me-1"></i> Server
                 </div>
                 <div class="card-body">
+                    <?php $mmOn = ($settings['maintenance_mode'] ?? '0') === '1'; ?>
+                    <div class="rounded p-3 mb-3 d-flex align-items-center justify-content-between <?= $mmOn ? 'bg-warning bg-opacity-10 border border-warning' : 'bg-body-tertiary' ?>">
+                        <div>
+                            <div class="form-check form-switch mb-0">
+                                <input class="form-check-input" type="checkbox" role="switch" name="maintenance_mode" id="maintenance_mode" value="1" <?= $mmOn ? 'checked' : '' ?>>
+                                <label class="form-check-label fw-semibold" for="maintenance_mode">Maintenance Mode</label>
+                            </div>
+                            <div class="form-text mb-0">Pauses all new backup jobs. Existing running jobs will complete.</div>
+                        </div>
+                        <?php if ($mmOn): ?>
+                        <span class="badge bg-warning text-dark"><i class="bi bi-exclamation-triangle-fill me-1"></i>Active</span>
+                        <?php endif; ?>
+                    </div>
                     <div class="mb-3">
                         <label class="form-label fw-semibold">Max Concurrent Jobs</label>
                         <input type="number" class="form-control" name="max_queue" value="<?= htmlspecialchars($settings['max_queue'] ?? '4') ?>" min="1" max="20">
-                        <div class="form-text">Maximum backup jobs running simultaneously.</div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label fw-semibold">Server Host / IP</label>
@@ -82,30 +99,6 @@ $updateAvailable = $updateService->isUpdateAvailable();
                                 <br>To enable SSL, first obtain a certificate: <code>sudo certbot --apache -d <?= htmlspecialchars($settings['server_host'] ?? 'your-hostname') ?></code>
                             <?php endif; ?>
                         </div>
-                    </div>
-                    <div class="mb-3">
-                        <div class="row g-3">
-                            <div class="col-7">
-                                <label class="form-label fw-semibold">Storage</label>
-                                <div class="d-flex align-items-center gap-2">
-                                    <input type="text" class="form-control" value="<?= htmlspecialchars($settings['storage_path'] ?? '') ?>" readonly>
-                                    <a href="/storage-locations" class="btn btn-sm btn-outline-primary text-nowrap">
-                                        <i class="bi bi-hdd-stack me-1"></i>Manage
-                                    </a>
-                                </div>
-                                <div class="form-text">Default storage path. <a href="/storage-locations">Manage all storage locations</a>.</div>
-                            </div>
-                            <div class="col-5">
-                                <label class="form-label fw-semibold">Alert at</label>
-                                <div class="input-group">
-                                    <input type="number" class="form-control text-center" name="storage_alert_threshold"
-                                           value="<?= htmlspecialchars($settings['storage_alert_threshold'] ?? '90') ?>" min="50" max="99">
-                                    <span class="input-group-text">%</span>
-                                </div>
-                                <div class="form-text">Send alert when storage exceeds this threshold.</div>
-                            </div>
-                        </div>
-                        <div class="form-text mt-2">Want to backup to a remote store? <a href="/storage-locations?section=remote">Configure Remote Storage</a></div>
                     </div>
                     <?php $sshPort = (int) ($settings['ssh_port'] ?? 22); if ($sshPort !== 22): ?>
                     <div class="mb-3">

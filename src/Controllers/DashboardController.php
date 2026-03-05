@@ -13,21 +13,28 @@ class DashboardController extends Controller
         $this->requireAuth();
 
         $data = $this->getDashboardData();
+        $data = array_merge($data, $this->getSlowStats());
         $data['pageTitle'] = 'Dashboard';
 
         $this->view('dashboard/index', $data);
     }
 
     /**
-     * GET /dashboard/json — AJAX endpoint for live refresh.
+     * GET /dashboard/json — AJAX endpoint for live refresh (fast, no ClickHouse).
      */
     public function apiJson(): void
     {
         $this->requireAuth();
-        $data = $this->getDashboardData();
-        header('Content-Type: application/json');
-        echo json_encode($data);
-        exit;
+        $this->json($this->getDashboardData());
+    }
+
+    /**
+     * GET /dashboard/stats-json — slow stats (ClickHouse, server health), polled every 60s.
+     */
+    public function apiStatsJson(): void
+    {
+        $this->requireAuth();
+        $this->json($this->getSlowStats());
     }
 
     /**
@@ -134,7 +141,7 @@ class DashboardController extends Controller
         $errorCount = $this->db->fetchOne($errorCountQuery, $jobParams)['cnt'];
 
         $recentJobs = $this->db->fetchAll("
-            SELECT bj.id, bj.status, bj.task_type, bj.completed_at, bj.duration_seconds, a.name as agent_name,
+            SELECT bj.*, SUBSTRING(bj.error_log, 1, 255) as error_log, a.name as agent_name,
                    r.name as repo_name, bp.name as plan_name
             FROM backup_jobs bj
             JOIN agents a ON a.id = bj.agent_id
@@ -146,7 +153,7 @@ class DashboardController extends Controller
         ", $jobParams);
 
         $activeJobs = $this->db->fetchAll("
-            SELECT bj.id, bj.status, bj.task_type, bj.files_total, bj.files_processed, bj.started_at, bj.queued_at, bj.duration_seconds, a.name as agent_name,
+            SELECT bj.*, SUBSTRING(bj.error_log, 1, 255) as error_log, a.name as agent_name,
                    r.name as repo_name, bp.name as plan_name
             FROM backup_jobs bj
             JOIN agents a ON a.id = bj.agent_id
@@ -219,8 +226,7 @@ class DashboardController extends Controller
             ];
         }
 
-        // Server stats (admin only)
-        $result = [
+        return [
             'isAdmin' => $isAdmin,
             'agentCount' => (int) $agentCount,
             'onlineCount' => (int) $onlineCount,
@@ -232,55 +238,68 @@ class DashboardController extends Controller
             'upcomingSchedules' => $upcomingSchedules,
             'chartData' => $chartData,
         ];
+    }
 
-        if ($isAdmin) {
-            $cache = Cache::getInstance();
-            $result['cpuLoad'] = $cache->remember('server_cpu', 10, fn() => ServerStats::getCpuLoad());
-            $result['memory'] = $cache->remember('server_mem', 10, fn() => ServerStats::getMemory());
-            $result['partitions'] = $cache->remember('server_parts', 30, fn() => ServerStats::getPartitions());
-            $result['mysqlStats'] = $cache->remember('mysql_stats', 8, fn() => ServerStats::getMysqlStats());
-            $result['clickhouseStats'] = $cache->remember('ch_stats', 30, fn() => ServerStats::getClickHouseStats());
-
-            // Storage disk usage
-            $result['storage'] = $cache->remember('storage_info', 30, function() {
-                $db = \BBS\Core\Database::getInstance();
-                $setting = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-                $path = $setting['value'] ?? '';
-                $repoStats = $db->fetchOne("SELECT COUNT(*) as repo_count, COALESCE(SUM(size_bytes), 0) as total_repo_bytes FROM repositories");
-                $archiveStats = $db->fetchOne("SELECT COUNT(*) as total_archives, COALESCE(SUM(original_size), 0) as total_original, COALESCE(SUM(deduplicated_size), 0) as total_dedup, COALESCE(SUM(file_count), 0) as total_files FROM archives");
-                $clientCount = $db->fetchOne("SELECT COUNT(*) as cnt FROM agents");
-
-                $info = [
-                    'path' => $path,
-                    'repo_count' => (int) ($repoStats['repo_count'] ?? 0),
-                    'total_repo_bytes' => (int) ($repoStats['total_repo_bytes'] ?? 0),
-                    'total_archives' => (int) ($archiveStats['total_archives'] ?? 0),
-                    'total_original' => (int) ($archiveStats['total_original'] ?? 0),
-                    'total_dedup' => (int) ($archiveStats['total_dedup'] ?? 0),
-                    'total_files' => (int) ($archiveStats['total_files'] ?? 0),
-                    'dedup_savings' => 0,
-                    'client_count' => (int) ($clientCount['cnt'] ?? 0),
-                    'disk_total' => null,
-                    'disk_used' => null,
-                    'disk_free' => null,
-                    'disk_percent' => null,
-                ];
-                if ($info['total_original'] > 0) {
-                    $info['dedup_savings'] = round((1 - $info['total_dedup'] / $info['total_original']) * 100, 1);
-                }
-                if (!empty($path)) {
-                    $diskUsage = \BBS\Services\ServerStats::getDiskUsage($path);
-                    if ($diskUsage) {
-                        $info['disk_total'] = $diskUsage['total'];
-                        $info['disk_used'] = $diskUsage['used'];
-                        $info['disk_free'] = $diskUsage['free'];
-                        $info['disk_percent'] = $diskUsage['percent'];
-                    }
-                }
-                return $info;
-            });
+    /**
+     * Slow stats: ClickHouse, server health, storage.
+     * Cached for 60s. When $cacheOnly is true, returns whatever is in cache (for page load).
+     */
+    private function getSlowStats(): array
+    {
+        if (!$this->isAdmin()) {
+            return [];
         }
 
-        return $result;
+        $cache = Cache::getInstance();
+
+        return [
+            'cpuLoad' => $cache->remember('server_cpu', 60, fn() => ServerStats::getCpuLoad()),
+            'memory' => $cache->remember('server_mem', 60, fn() => ServerStats::getMemory()),
+            'partitions' => $cache->remember('server_parts', 60, fn() => ServerStats::getPartitions()),
+            'mysqlStats' => $cache->remember('mysql_stats', 60, fn() => ServerStats::getMysqlStats()),
+            'clickhouseStats' => $cache->remember('ch_stats', 60, fn() => ServerStats::getClickHouseStats()),
+            'storage' => $cache->remember('storage_info', 60, $this->getStorageCallback()),
+        ];
+    }
+
+    private function getStorageCallback(): \Closure
+    {
+        return function() {
+            $db = \BBS\Core\Database::getInstance();
+            $setting = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
+            $path = $setting['value'] ?? '';
+            $repoStats = $db->fetchOne("SELECT COUNT(*) as repo_count, COALESCE(SUM(size_bytes), 0) as total_repo_bytes FROM repositories");
+            $archiveStats = $db->fetchOne("SELECT COUNT(*) as total_archives, COALESCE(SUM(original_size), 0) as total_original, COALESCE(SUM(deduplicated_size), 0) as total_dedup, COALESCE(SUM(file_count), 0) as total_files FROM archives");
+            $clientCount = $db->fetchOne("SELECT COUNT(*) as cnt FROM agents");
+
+            $info = [
+                'path' => $path,
+                'repo_count' => (int) ($repoStats['repo_count'] ?? 0),
+                'total_repo_bytes' => (int) ($repoStats['total_repo_bytes'] ?? 0),
+                'total_archives' => (int) ($archiveStats['total_archives'] ?? 0),
+                'total_original' => (int) ($archiveStats['total_original'] ?? 0),
+                'total_dedup' => (int) ($archiveStats['total_dedup'] ?? 0),
+                'total_files' => (int) ($archiveStats['total_files'] ?? 0),
+                'dedup_savings' => 0,
+                'client_count' => (int) ($clientCount['cnt'] ?? 0),
+                'disk_total' => null,
+                'disk_used' => null,
+                'disk_free' => null,
+                'disk_percent' => null,
+            ];
+            if ($info['total_original'] > 0) {
+                $info['dedup_savings'] = round((1 - $info['total_dedup'] / $info['total_original']) * 100, 1);
+            }
+            if (!empty($path)) {
+                $diskUsage = \BBS\Services\ServerStats::getDiskUsage($path);
+                if ($diskUsage) {
+                    $info['disk_total'] = $diskUsage['total'];
+                    $info['disk_used'] = $diskUsage['used'];
+                    $info['disk_free'] = $diskUsage['free'];
+                    $info['disk_percent'] = $diskUsage['percent'];
+                }
+            }
+            return $info;
+        };
     }
 }

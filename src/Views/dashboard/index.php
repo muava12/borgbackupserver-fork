@@ -173,8 +173,6 @@ $compactNum = function(int $n): string {
     return number_format($n);
 };
 $chStats = $clickhouseStats ?? null;
-$chBackend = $chStats['backend'] ?? 'clickhouse';
-$isSqliteBackend = ($chBackend === 'sqlite');
 $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
 ?>
 <!-- Row 3: Storage Pool + MySQL Health (left) | ClickHouse Catalog (right) -->
@@ -325,11 +323,7 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
     <div class="col-lg-8">
         <div class="card border-0 shadow-sm h-100">
             <div class="card-header bg-body fw-semibold">
-                <?php if ($isSqliteBackend): ?>
-                    <i class="bi bi-archive me-1"></i> Backup Catalog
-                <?php else: ?>
-                    <img src="/images/clickhouse.svg" alt="" style="height:1em;vertical-align:-.1em;" class="me-1"> Backup Catalog
-                <?php endif; ?>
+                <img src="/images/clickhouse.svg" alt="" style="height:1em;vertical-align:-.1em;" class="me-1"> ClickHouse Catalog
             </div>
             <div class="card-body py-3">
                 <div class="d-flex h-100">
@@ -352,10 +346,9 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                             </div>
                         </div>
                         <?php if ($chStats): ?>
-                        <!-- Catalog Stats Grid -->
-                        <div class="border-top pt-2 mt-1">
+                        <!-- ClickHouse Stats Grid -->
+                        <div class="border-top pt-2 mt-1" id="ch-stats-grid">
                             <div class="row g-1 text-center" style="font-size:.7rem;">
-                                <?php if (!$isSqliteBackend): ?>
                                 <div class="col-3">
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-disk"><?= \BBS\Services\ServerStats::formatBytes($chStats['disk_bytes']) ?></div>
                                     <div class="text-muted">Disk Usage</div>
@@ -364,12 +357,11 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-compression"><?= $chStats['compression_ratio'] ?>x</div>
                                     <div class="text-muted">Compress</div>
                                 </div>
-                                <?php endif; ?>
-                                <div class="<?= $isSqliteBackend ? 'col-6' : 'col-3' ?>">
+                                <div class="col-3">
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-agents"><?= $chStats['agent_count'] ?></div>
                                     <div class="text-muted">Agents</div>
                                 </div>
-                                <div class="<?= $isSqliteBackend ? 'col-6' : 'col-3' ?>">
+                                <div class="col-3">
                                     <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-avg-archive"><?= $compactNum($chStats['avg_per_archive']) ?></div>
                                     <div class="text-muted">Avg/Archive</div>
                                 </div>
@@ -377,7 +369,7 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                         </div>
                         <!-- Top Repositories Table -->
                         <?php if (!empty($chStats['top_repos'])): ?>
-                        <div class="border-top pt-2 mt-2">
+                        <div class="border-top pt-2 mt-2" id="ch-repos-section">
                             <div class="d-flex align-items-center mb-1">
                                 <i class="bi bi-trophy me-1 text-muted" style="font-size:.7rem;"></i>
                                 <span class="fw-semibold text-muted" style="font-size:.65rem;text-transform:uppercase;letter-spacing:.5px;">Top Repositories</span>
@@ -389,9 +381,7 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                                         <td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:<?= $pieColors[$i % 5] ?>;margin-right:4px;"></span><span class="fw-semibold"><?= htmlspecialchars($repo['name']) ?></span></td>
                                         <td class="border-0 py-0 text-end text-muted"><?= $compactNum($repo['rows']) ?> rows</td>
                                         <td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell"><?= $repo['archives'] ?> archives</td>
-                                        <?php if (!$isSqliteBackend): ?>
                                         <td class="border-0 py-0 text-end text-muted"><?= \BBS\Services\ServerStats::formatBytes($repo['disk_bytes']) ?></td>
-                                        <?php endif; ?>
                                     </tr>
                                     <?php endforeach; ?>
                                 </tbody>
@@ -403,26 +393,13 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                     <!-- Right: Pie Chart -->
                     <?php if ($chStats && !empty($chStats['top_repos'])): ?>
                     <?php
-                        if ($isSqliteBackend) {
-                            // SQLite: use row counts for pie chart
-                            $top5Rows = array_sum(array_column($chStats['top_repos'], 'rows'));
-                            $otherRows = max($chStats['total_rows'] - $top5Rows, 0);
-                            $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
-                            $pieData = array_map(fn($r) => $r['rows'], $chStats['top_repos']);
-                            if ($otherRows > 0) {
-                                $pieLabels[] = 'Other';
-                                $pieData[] = $otherRows;
-                            }
-                        } else {
-                            // ClickHouse: use disk bytes for pie chart
-                            $top5Disk = array_sum(array_column($chStats['top_repos'], 'disk_bytes'));
-                            $otherDisk = max($chStats['disk_bytes'] - $top5Disk, 0);
-                            $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
-                            $pieData = array_map(fn($r) => $r['disk_bytes'], $chStats['top_repos']);
-                            if ($otherDisk > 0) {
-                                $pieLabels[] = 'Other';
-                                $pieData[] = $otherDisk;
-                            }
+                        $top5Disk = array_sum(array_column($chStats['top_repos'], 'disk_bytes'));
+                        $otherDisk = max($chStats['disk_bytes'] - $top5Disk, 0);
+                        $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
+                        $pieData = array_map(fn($r) => $r['disk_bytes'], $chStats['top_repos']);
+                        if ($otherDisk > 0) {
+                            $pieLabels[] = 'Other';
+                            $pieData[] = $otherDisk;
                         }
                     ?>
                     <div class="d-none d-md-flex flex-column align-items-center justify-content-center border-start ms-3 ps-3" style="flex:0 0 33%;max-width:33%;" id="ch-pie-wrap">
@@ -726,12 +703,7 @@ if (pieCanvas) {
                         label: function(ctx) {
                             const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
                             const pct = total > 0 ? (ctx.raw / total * 100).toFixed(1) : 0;
-                            <?php if ($isSqliteBackend): ?>
-                            const fmtNum = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
-                            return ctx.label + ': ' + fmtNum(ctx.raw) + ' rows (' + pct + '%)';
-                            <?php else: ?>
                             return ctx.label + ': ' + fmtBytes(ctx.raw) + ' (' + pct + '%)';
-                            <?php endif; ?>
                         }
                     }
                 }
@@ -861,112 +833,16 @@ function renderLogs(logs) {
 
 const csrfToken = '<?= $this->csrfToken() ?>';
 
-// Auto-refresh every 8 seconds
+// Fast refresh every 8 seconds (queues, jobs, logs — no ClickHouse)
 setInterval(function() {
     fetch('/dashboard/json', { credentials: 'same-origin' })
         .then(r => r.json())
         .then(data => {
-            // Stat cards
             document.getElementById('stat-agents').textContent = data.agentCount;
             document.getElementById('stat-online').textContent = data.onlineCount;
             document.getElementById('stat-running').textContent = data.runningJobs;
             document.getElementById('stat-queued').textContent = data.queuedJobs;
             document.getElementById('stat-errors').textContent = data.errorCount;
-
-            <?php if ($isAdmin): ?>
-            if (data.cpuLoad) {
-                const p = data.cpuLoad.percent, arc = 212.06, circ = 282.74;
-                document.getElementById('cpu-pct').textContent = p + '%';
-                document.getElementById('cpu-detail').textContent = data.cpuLoad['1min'] + ' / ' + data.cpuLoad.cores + ' cores';
-                const cpuArc = document.getElementById('cpu-arc');
-                cpuArc.setAttribute('stroke-dasharray', (arc * p / 100) + ' ' + circ);
-                cpuArc.setAttribute('stroke', p > 80 ? '#dc3545' : (p > 50 ? '#ffc107' : '#198754'));
-            }
-            if (data.memory) {
-                const p = data.memory.percent, arc = 212.06, circ = 282.74;
-                document.getElementById('mem-pct').textContent = p + '%';
-                const memArc = document.getElementById('mem-arc');
-                memArc.setAttribute('stroke-dasharray', (arc * p / 100) + ' ' + circ);
-                memArc.setAttribute('stroke', p > 85 ? '#dc3545' : (p > 60 ? '#ffc107' : '#0dcaf0'));
-            }
-            if (data.mysqlStats) {
-                const ms = data.mysqlStats;
-                const fmt = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
-                const map = {
-                    'stat-catalog': ms.catalog_files, 'stat-archives': ms.archives,
-                    'stat-completed-jobs': ms.completed_jobs
-                };
-                for (const [id, val] of Object.entries(map)) {
-                    const el = document.getElementById(id);
-                    if (el) el.textContent = fmt(val);
-                }
-                // MySQL Health card
-                const qpsEl = document.getElementById('stat-qps');
-                if (qpsEl) qpsEl.textContent = ms.qps;
-                const connEl = document.getElementById('stat-connections');
-                if (connEl) connEl.textContent = ms.threads_connected;
-                const hitEl = document.getElementById('stat-hit-rate');
-                if (hitEl) hitEl.textContent = ms.hit_rate + '%';
-                const upEl = document.getElementById('stat-uptime');
-                if (upEl) {
-                    const u = Number(ms.uptime);
-                    const d = Math.floor(u / 86400), h = Math.floor((u % 86400) / 3600);
-                    upEl.textContent = d > 0 ? d + 'd ' + h + 'h' : h + 'h';
-                }
-                const bpEl = document.getElementById('stat-bp-usage');
-                if (bpEl) bpEl.textContent = ms.buffer_pool_used_pct + '%';
-                const slowEl = document.getElementById('stat-slow');
-                if (slowEl) slowEl.textContent = Number(ms.slow_queries).toLocaleString();
-            }
-            if (data.clickhouseStats) {
-                const ch = data.clickhouseStats;
-                const fmt = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
-                const fmtB = b => { b = Number(b); if (b >= 1099511627776) return (b/1099511627776).toFixed(1)+'TB'; if (b >= 1073741824) return (b/1073741824).toFixed(1)+'GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+'MB'; return (b/1024).toFixed(1)+'KB'; };
-                const chMap = {
-                    'stat-ch-disk': fmtB(ch.disk_bytes),
-                    'stat-ch-compression': ch.compression_ratio + 'x',
-                    'stat-ch-agents': ch.agent_count,
-                    'stat-ch-avg-archive': fmt(ch.avg_per_archive)
-                };
-                for (const [id, val] of Object.entries(chMap)) {
-                    const el = document.getElementById(id);
-                    if (el) el.textContent = val;
-                }
-                // Top repos table + pie chart
-                const repoTable = document.getElementById('ch-top-repos');
-                if (repoTable && ch.top_repos) {
-                    let html = '<tbody>';
-                    ch.top_repos.forEach((r, i) => {
-                        html += '<tr><td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:'+pieColors[i%5]+';margin-right:4px;"></span><span class="fw-semibold">'+esc(r.name)+'</span></td><td class="border-0 py-0 text-end text-muted">'+fmt(r.rows)+' rows</td><td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell">'+r.archives+' archives</td><td class="border-0 py-0 text-end text-muted">'+fmtB(r.disk_bytes)+'</td></tr>';
-                    });
-                    html += '</tbody>';
-                    repoTable.innerHTML = html;
-                }
-                if (typeof catalogPieChart !== 'undefined' && catalogPieChart && ch.top_repos) {
-                    const isSqlite = ch.backend === 'sqlite';
-                    const prop = isSqlite ? 'rows' : 'disk_bytes';
-                    const totalProp = isSqlite ? 'total_rows' : 'disk_bytes';
-
-                    const top5 = ch.top_repos.reduce((s, r) => s + Number(r[prop] || 0), 0);
-                    const other = Math.max(Number(ch[totalProp] || 0) - top5, 0);
-
-                    const labels = ch.top_repos.map(r => r.name);
-                    const data = ch.top_repos.map(r => Number(r[prop] || 0));
-
-                    if (other > 0) { 
-                        labels.push('Other'); 
-                        data.push(other); 
-                    }
-
-                    catalogPieChart.data.labels = labels;
-                    catalogPieChart.data.datasets[0].data = data;
-                    catalogPieChart.data.datasets[0].backgroundColor = pieColors.slice(0, data.length);
-                    catalogPieChart.update('none');
-                }
-            }
-            <?php endif; ?>
-
-            // Tables
             renderActiveJobs(data.activeJobs);
             renderUpcoming(data.upcomingSchedules, csrfToken);
             renderRecentJobs(data.recentJobs);
@@ -974,4 +850,97 @@ setInterval(function() {
         })
         .catch(() => {});
 }, 8000);
+
+<?php if ($isAdmin): ?>
+// Slow stats refresh every 60 seconds (ClickHouse, server health)
+function updateSlowStats(data) {
+    if (data.cpuLoad) {
+        const p = data.cpuLoad.percent, arc = 212.06, circ = 282.74;
+        document.getElementById('cpu-pct').textContent = p + '%';
+        document.getElementById('cpu-detail').textContent = data.cpuLoad['1min'] + ' / ' + data.cpuLoad.cores + ' cores';
+        const cpuArc = document.getElementById('cpu-arc');
+        cpuArc.setAttribute('stroke-dasharray', (arc * p / 100) + ' ' + circ);
+        cpuArc.setAttribute('stroke', p > 80 ? '#dc3545' : (p > 50 ? '#ffc107' : '#198754'));
+    }
+    if (data.memory) {
+        const p = data.memory.percent, arc = 212.06, circ = 282.74;
+        document.getElementById('mem-pct').textContent = p + '%';
+        const memArc = document.getElementById('mem-arc');
+        memArc.setAttribute('stroke-dasharray', (arc * p / 100) + ' ' + circ);
+        memArc.setAttribute('stroke', p > 85 ? '#dc3545' : (p > 60 ? '#ffc107' : '#0dcaf0'));
+    }
+    if (data.mysqlStats) {
+        const ms = data.mysqlStats;
+        const fmt = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
+        const map = {
+            'stat-catalog': ms.catalog_files, 'stat-archives': ms.archives,
+            'stat-completed-jobs': ms.completed_jobs
+        };
+        for (const [id, val] of Object.entries(map)) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = fmt(val);
+        }
+        const qpsEl = document.getElementById('stat-qps');
+        if (qpsEl) qpsEl.textContent = ms.qps;
+        const connEl = document.getElementById('stat-connections');
+        if (connEl) connEl.textContent = ms.threads_connected;
+        const hitEl = document.getElementById('stat-hit-rate');
+        if (hitEl) hitEl.textContent = ms.hit_rate + '%';
+        const upEl = document.getElementById('stat-uptime');
+        if (upEl) {
+            const u = Number(ms.uptime);
+            const d = Math.floor(u / 86400), h = Math.floor((u % 86400) / 3600);
+            upEl.textContent = d > 0 ? d + 'd ' + h + 'h' : h + 'h';
+        }
+        const bpEl = document.getElementById('stat-bp-usage');
+        if (bpEl) bpEl.textContent = ms.buffer_pool_used_pct + '%';
+        const slowEl = document.getElementById('stat-slow');
+        if (slowEl) slowEl.textContent = Number(ms.slow_queries).toLocaleString();
+    }
+    if (data.clickhouseStats) {
+        const ch = data.clickhouseStats;
+        const fmt = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
+        const fmtB = b => { b = Number(b); if (b >= 1099511627776) return (b/1099511627776).toFixed(1)+'TB'; if (b >= 1073741824) return (b/1073741824).toFixed(1)+'GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+'MB'; return (b/1024).toFixed(1)+'KB'; };
+        const chMap = {
+            'stat-ch-disk': fmtB(ch.disk_bytes),
+            'stat-ch-compression': ch.compression_ratio + 'x',
+            'stat-ch-agents': ch.agent_count,
+            'stat-ch-avg-archive': fmt(ch.avg_per_archive)
+        };
+        for (const [id, val] of Object.entries(chMap)) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = val;
+        }
+        const repoTable = document.getElementById('ch-top-repos');
+        if (repoTable && ch.top_repos) {
+            let html = '<tbody>';
+            ch.top_repos.forEach((r, i) => {
+                html += '<tr><td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:'+pieColors[i%5]+';margin-right:4px;"></span><span class="fw-semibold">'+esc(r.name)+'</span></td><td class="border-0 py-0 text-end text-muted">'+fmt(r.rows)+' rows</td><td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell">'+r.archives+' archives</td><td class="border-0 py-0 text-end text-muted">'+fmtB(r.disk_bytes)+'</td></tr>';
+            });
+            html += '</tbody>';
+            repoTable.innerHTML = html;
+        }
+        if (typeof catalogPieChart !== 'undefined' && catalogPieChart && ch.top_repos) {
+            const top5Disk = ch.top_repos.reduce((s, r) => s + Number(r.disk_bytes), 0);
+            const otherDisk = Math.max(Number(ch.disk_bytes) - top5Disk, 0);
+            const labels = ch.top_repos.map(r => r.name);
+            const vals = ch.top_repos.map(r => Number(r.disk_bytes));
+            if (otherDisk > 0) { labels.push('Other'); vals.push(otherDisk); }
+            catalogPieChart.data.labels = labels;
+            catalogPieChart.data.datasets[0].data = vals;
+            catalogPieChart.data.datasets[0].backgroundColor = pieColors.slice(0, vals.length);
+            catalogPieChart.update('none');
+        }
+    }
+}
+function fetchSlowStats() {
+    fetch('/dashboard/stats-json', { credentials: 'same-origin' })
+        .then(r => r.json())
+        .then(updateSlowStats)
+        .catch(() => {});
+}
+// Background refresh on load, then every 60s
+setTimeout(fetchSlowStats, 500);
+setInterval(fetchSlowStats, 60000);
+<?php endif; ?>
 </script>
