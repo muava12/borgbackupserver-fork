@@ -703,7 +703,12 @@ if (pieCanvas) {
                         label: function(ctx) {
                             const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
                             const pct = total > 0 ? (ctx.raw / total * 100).toFixed(1) : 0;
+                            <?php if ($isSqliteBackend): ?>
+                            const fmtNum = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
+                            return ctx.label + ': ' + fmtNum(ctx.raw) + ' rows (' + pct + '%)';
+                            <?php else: ?>
                             return ctx.label + ': ' + fmtBytes(ctx.raw) + ' (' + pct + '%)';
+                            <?php endif; ?>
                         }
                     }
                 }
@@ -899,33 +904,54 @@ function updateSlowStats(data) {
     }
     if (data.clickhouseStats) {
         const ch = data.clickhouseStats;
+        const isSqlite = ch.backend === 'sqlite';
         const fmt = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
         const fmtB = b => { b = Number(b); if (b >= 1099511627776) return (b/1099511627776).toFixed(1)+'TB'; if (b >= 1073741824) return (b/1073741824).toFixed(1)+'GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+'MB'; return (b/1024).toFixed(1)+'KB'; };
-        const chMap = {
-            'stat-ch-disk': fmtB(ch.disk_bytes),
-            'stat-ch-compression': ch.compression_ratio + 'x',
-            'stat-ch-agents': ch.agent_count,
-            'stat-ch-avg-archive': fmt(ch.avg_per_archive)
-        };
-        for (const [id, val] of Object.entries(chMap)) {
-            const el = document.getElementById(id);
-            if (el) el.textContent = val;
+        if (!isSqlite) {
+            const chMap = {
+                'stat-ch-disk': fmtB(ch.disk_bytes),
+                'stat-ch-compression': ch.compression_ratio + 'x',
+                'stat-ch-agents': ch.agent_count,
+                'stat-ch-avg-archive': fmt(ch.avg_per_archive)
+            };
+            for (const [id, val] of Object.entries(chMap)) {
+                const el = document.getElementById(id);
+                if (el) el.textContent = val;
+            }
+        } else {
+            const chMap = {
+                'stat-ch-agents': ch.agent_count,
+                'stat-ch-avg-archive': fmt(ch.avg_per_archive)
+            };
+            for (const [id, val] of Object.entries(chMap)) {
+                const el = document.getElementById(id);
+                if (el) el.textContent = val;
+            }
         }
         const repoTable = document.getElementById('ch-top-repos');
         if (repoTable && ch.top_repos) {
             let html = '<tbody>';
             ch.top_repos.forEach((r, i) => {
-                html += '<tr><td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:'+pieColors[i%5]+';margin-right:4px;"></span><span class="fw-semibold">'+esc(r.name)+'</span></td><td class="border-0 py-0 text-end text-muted">'+fmt(r.rows)+' rows</td><td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell">'+r.archives+' archives</td><td class="border-0 py-0 text-end text-muted">'+fmtB(r.disk_bytes)+'</td></tr>';
+                html += '<tr><td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:'+pieColors[i%5]+';margin-right:4px;"></span><span class="fw-semibold">'+esc(r.name)+'</span></td><td class="border-0 py-0 text-end text-muted">'+fmt(r.rows)+' rows</td><td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell">'+r.archives+' archives</td>';
+                if (!isSqlite) {
+                    html += '<td class="border-0 py-0 text-end text-muted">'+fmtB(r.disk_bytes)+'</td>';
+                }
+                html += '</tr>';
             });
             html += '</tbody>';
             repoTable.innerHTML = html;
         }
         if (typeof catalogPieChart !== 'undefined' && catalogPieChart && ch.top_repos) {
-            const top5Disk = ch.top_repos.reduce((s, r) => s + Number(r.disk_bytes), 0);
-            const otherDisk = Math.max(Number(ch.disk_bytes) - top5Disk, 0);
+            const prop = isSqlite ? 'rows' : 'disk_bytes';
+            const totalProp = isSqlite ? 'total_rows' : 'disk_bytes';
+
+            const top5 = ch.top_repos.reduce((s, r) => s + Number(r[prop] || 0), 0);
+            const other = Math.max(Number(ch[totalProp] || 0) - top5, 0);
+
             const labels = ch.top_repos.map(r => r.name);
-            const vals = ch.top_repos.map(r => Number(r.disk_bytes));
-            if (otherDisk > 0) { labels.push('Other'); vals.push(otherDisk); }
+            const vals = ch.top_repos.map(r => Number(r[prop] || 0));
+
+            if (other > 0) { labels.push('Other'); vals.push(other); }
             catalogPieChart.data.labels = labels;
             catalogPieChart.data.datasets[0].data = vals;
             catalogPieChart.data.datasets[0].backgroundColor = pieColors.slice(0, vals.length);
