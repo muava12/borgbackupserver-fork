@@ -59,7 +59,9 @@ jobs:
         id: tags
         run: |
           TAGS="${{ env.GHCR_IMAGE }}:${{ steps.version.outputs.version }}-arm64"
-          if [ "${{ steps.version.outputs.is_release }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_name }}" = "main" ]; then
+            TAGS="${TAGS},${{ env.GHCR_IMAGE }}:latest-arm64"
+          elif [ "${{ steps.version.outputs.is_release }}" = "true" ]; then
             TAGS="${TAGS},${{ env.GHCR_IMAGE }}:${{ github.ref_name }}-arm64"
             if [ "${{ github.event.release.prerelease }}" != "true" ]; then
               TAGS="${TAGS},${{ env.GHCR_IMAGE }}:latest-arm64"
