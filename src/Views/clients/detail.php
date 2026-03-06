@@ -2677,24 +2677,25 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                 <select class="form-select form-select-sm" id="db-archive-select">
                     <option value="">Choose a restore point...</option>
                     <?php
-                    $currentRepo = null;
+                    $currentGroup = null;
                     foreach ($archives as $ar):
                         if (empty($ar['databases_backed_up'])) continue;
                         $dbMeta = json_decode($ar['databases_backed_up'], true);
                         if (empty($dbMeta['databases'])) continue;
-                        if ($ar['repo_name'] !== $currentRepo):
-                            if ($currentRepo !== null) echo '</optgroup>';
-                            $currentRepo = $ar['repo_name'];
-                            echo '<optgroup label="' . htmlspecialchars($currentRepo) . '">';
+                        $groupName = $ar['repo_name'] . ' - ' . ($ar['plan_name'] ?? 'Manual/External');
+                        if ($groupName !== $currentGroup):
+                            if ($currentGroup !== null) echo '</optgroup>';
+                            $currentGroup = $groupName;
+                            echo '<optgroup label="' . htmlspecialchars($currentGroup) . '">';
                         endif;
                         $n = count($dbMeta['databases']);
                         $dbLabel = " ({$n} " . ($n === 1 ? 'database' : 'databases') . ')';
                     ?>
                         <option value="<?= $ar['id'] ?>">
-                            <?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?><?= $dbLabel ?>
+                            <?= htmlspecialchars($ar['archive_name']) ?> (<?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?>)<?= $dbLabel ?>
                         </option>
                     <?php endforeach; ?>
-                    <?php if ($currentRepo !== null) echo '</optgroup>'; ?>
+                    <?php if ($currentGroup !== null) echo '</optgroup>'; ?>
                 </select>
                 </div>
             </div>
@@ -2707,19 +2708,20 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                 <select class="form-select form-select-sm" id="archive-select">
                     <option value="">Choose a restore point...</option>
                     <?php
-                    $currentRepo = null;
+                    $currentGroup = null;
                     foreach ($archives as $ar):
-                        if ($ar['repo_name'] !== $currentRepo):
-                            if ($currentRepo !== null) echo '</optgroup>';
-                            $currentRepo = $ar['repo_name'];
-                            echo '<optgroup label="' . htmlspecialchars($currentRepo) . '">';
+                        $groupName = $ar['repo_name'] . ' - ' . ($ar['plan_name'] ?? 'Manual/External');
+                        if ($groupName !== $currentGroup):
+                            if ($currentGroup !== null) echo '</optgroup>';
+                            $currentGroup = $groupName;
+                            echo '<optgroup label="' . htmlspecialchars($currentGroup) . '">';
                         endif;
                     ?>
                         <option value="<?= $ar['id'] ?>">
-                            <?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?>
+                            <?= htmlspecialchars($ar['archive_name']) ?> (<?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?>)
                         </option>
                     <?php endforeach; ?>
-                    <?php if ($currentRepo !== null) echo '</optgroup>'; ?>
+                    <?php if ($currentGroup !== null) echo '</optgroup>'; ?>
                 </select>
                 </div>
             </div>

@@ -313,11 +313,13 @@ class ClientController extends Controller
 
         // Archives for restore tab
         $archives = $this->db->fetchAll("
-            SELECT ar.*, r.name as repo_name
+            SELECT ar.*, r.name as repo_name, bp.name as plan_name
             FROM archives ar
             JOIN repositories r ON r.id = ar.repository_id
+            LEFT JOIN backup_jobs bj ON bj.id = ar.backup_job_id
+            LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
             WHERE r.agent_id = ?
-            ORDER BY r.name ASC, ar.created_at DESC
+            ORDER BY r.name ASC, bp.name ASC, ar.created_at DESC
         ", [$id]);
 
         // Check if a catalog backend is available (needed for file catalog browsing)
