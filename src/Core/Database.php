@@ -28,6 +28,8 @@ class Database
                 PDO::MYSQL_ATTR_LOCAL_INFILE => true,
             ]
         );
+        // Ensure MySQL timezone matches PHP timezone (UTC) so CURRENT_TIMESTAMP and NOW() insert UTC times
+        $this->pdo->exec("SET time_zone = '+00:00'");
     }
 
     public static function getInstance(): self
