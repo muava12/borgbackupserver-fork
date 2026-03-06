@@ -140,6 +140,8 @@ class UpdateService
         $this->setSetting('latest_release_url', $htmlUrl);
         $this->setSetting('last_update_check', date('Y-m-d H:i:s'));
 
+        $this->sendTelemetryPing();
+
         return [
             'version' => $version,
             'notes' => $notes,
@@ -340,6 +342,56 @@ class UpdateService
         $start = strtotime($startedAt);
         $end = $endAt ? strtotime($endAt) : time();
         return max(0, $end - $start);
+    }
+
+    /**
+     * Send anonymous telemetry ping (version + OS) once per version.
+     */
+    private function sendTelemetryPing(): void
+    {
+        try {
+            if ($this->getSetting('telemetry_opt_out', '0') === '1') {
+                return;
+            }
+
+            $currentVersion = $this->getCurrentVersion();
+            if ($this->getSetting('telemetry_last_version') === $currentVersion) {
+                return;
+            }
+
+            $os = php_uname('s') . ' ' . php_uname('r');
+            if (file_exists('/etc/os-release')) {
+                $osRelease = parse_ini_file('/etc/os-release');
+                if (!empty($osRelease['PRETTY_NAME'])) {
+                    $os = $osRelease['PRETTY_NAME'];
+                }
+            }
+
+            $payload = json_encode([
+                'version' => $currentVersion,
+                'os' => $os,
+            ]);
+
+            // Set optimistically so we don't retry if endpoint is down
+            $this->setSetting('telemetry_last_version', $currentVersion);
+
+            // Fire-and-forget via non-blocking socket (won't hang if server is down)
+            $host = 'www.borgbackupserver.com';
+            $path = '/api/telemetry.php';
+            $fp = @fsockopen('ssl://' . $host, 443, $errno, $errstr, 2);
+            if ($fp) {
+                $header = "POST {$path} HTTP/1.1\r\n";
+                $header .= "Host: {$host}\r\n";
+                $header .= "Content-Type: application/json\r\n";
+                $header .= "User-Agent: BorgBackupServer/{$currentVersion}\r\n";
+                $header .= "Content-Length: " . strlen($payload) . "\r\n";
+                $header .= "Connection: close\r\n\r\n";
+                fwrite($fp, $header . $payload);
+                fclose($fp);
+            }
+        } catch (\Exception $e) {
+            // Silently ignore telemetry failures
+        }
     }
 
     private function getSetting(string $key, string $default = ''): string
