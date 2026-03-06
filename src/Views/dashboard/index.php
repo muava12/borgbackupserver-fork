@@ -393,13 +393,19 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
                     <!-- Right: Pie Chart -->
                     <?php if ($chStats && !empty($chStats['top_repos'])): ?>
                     <?php
-                        $top5Disk = array_sum(array_column($chStats['top_repos'], 'disk_bytes'));
-                        $otherDisk = max($chStats['disk_bytes'] - $top5Disk, 0);
+                        $isSqlite = isset($chStats['backend']) && $chStats['backend'] === 'sqlite';
+                        $prop = $isSqlite ? 'rows' : 'disk_bytes';
+                        $totalProp = $isSqlite ? 'total_rows' : 'disk_bytes';
+                        
+                        $top5Val = array_sum(array_column($chStats['top_repos'], $prop));
+                        // Some systems might not accurately estimate other disk bytes properly for some reason, ensure safe max
+                        $otherVal = max(($chStats[$totalProp] ?? 0) - $top5Val, 0);
+                        
                         $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
-                        $pieData = array_map(fn($r) => $r['disk_bytes'], $chStats['top_repos']);
-                        if ($otherDisk > 0) {
+                        $pieData = array_map(fn($r) => $r[$prop], $chStats['top_repos']);
+                        if ($otherVal > 0) {
                             $pieLabels[] = 'Other';
-                            $pieData[] = $otherDisk;
+                            $pieData[] = $otherVal;
                         }
                     ?>
                     <div class="d-none d-md-flex flex-column align-items-center justify-content-center border-start ms-3 ps-3" style="flex:0 0 33%;max-width:33%;" id="ch-pie-wrap">
