@@ -93,6 +93,7 @@ logger = logging.getLogger("bbs-agent")
 running = True
 task_running = False  # Set True while executing a task, enables heartbeat thread
 current_job_id = None  # Job ID of currently executing task (for stall check response)
+current_proc = None  # Track active borg subprocess for clean shutdown
 
 
 def _lockdown_key_windows(path):
@@ -2067,6 +2068,31 @@ def execute_task(config, task):
     # Clear stale cache locks left by crashed borg processes
     clear_stale_cache_locks()
 
+    # Auto break-lock before backup — safety net for unclean shutdowns
+    # (OOM kill, power failure, etc. where signal handler can't run)
+    if task_type == "backup" and command:
+        repo_url = None
+        for arg in command:
+            if "::" in arg:
+                repo_url = arg.split("::")[0]
+                break
+        if repo_url:
+            logger.info("Pre-backup break-lock: {}".format(repo_url))
+            api_request(config, "/api/agent/progress", method="POST", data={
+                "job_id": job_id,
+                "status_message": "Breaking stale locks...",
+            })
+            break_cmd = [command[0], "break-lock", repo_url]
+            try:
+                bl_result = subprocess.run(break_cmd, env=env, capture_output=True, timeout=30)
+                if bl_result.returncode == 0:
+                    logger.info("Break-lock completed (no stale lock or lock cleared)")
+                else:
+                    bl_stderr = bl_result.stderr.decode("utf-8", errors="replace").strip()
+                    logger.warning("Break-lock non-zero exit: {}".format(bl_stderr))
+            except Exception as e:
+                logger.warning("Break-lock failed (non-fatal): {}".format(e))
+
     # Execute borg command
     files_processed = 0
     original_size = 0
@@ -2128,6 +2154,7 @@ def execute_task(config, task):
             })
             return
 
+    global current_proc
     try:
         proc = subprocess.Popen(
             command,
@@ -2136,6 +2163,7 @@ def execute_task(config, task):
             env=env,
             cwd=cwd,
         )
+        current_proc = proc
 
         # Read stderr for JSON log output (borg writes progress to stderr)
         for raw_line in proc.stderr:
@@ -2267,6 +2295,7 @@ def execute_task(config, task):
         error_output = str(e)
         logger.error("Job #{} error: {}".format(job_id, e))
     finally:
+        current_proc = None
         # Close the catalog SSH pipe
         catalog_ssh_error = ""
         if catalog_ssh:
@@ -2377,9 +2406,21 @@ def clear_stale_cache_locks():
 
 
 def signal_handler(signum, frame):
-    global running
+    global running, current_proc
     logger.info("Shutdown signal received")
     running = False
+    # Gracefully terminate active borg subprocess so it can release locks
+    if current_proc and current_proc.poll() is None:
+        logger.info("Terminating active borg process (PID {})".format(current_proc.pid))
+        try:
+            current_proc.terminate()  # SIGTERM -> borg cleans up & releases lock
+            current_proc.wait(timeout=15)
+            logger.info("Borg process terminated cleanly")
+        except subprocess.TimeoutExpired:
+            logger.warning("Borg did not exit in 15s, sending SIGKILL")
+            current_proc.kill()
+        except Exception as e:
+            logger.warning("Error terminating borg: {}".format(e))
 
 
 def heartbeat_thread(config):
