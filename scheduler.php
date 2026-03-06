@@ -884,8 +884,8 @@ foreach ($serverJobs as $sj) {
             // Full rebuild: drop existing data for THIS REPO's archives only (not the whole agent)
             if (!empty($repoArchiveList)) {
                 try {
-                    $ch->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$repoArchiveList})");
-                    $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$repoArchiveList})");
+                    $ch->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$repoArchiveList}) SETTINGS mutations_sync=1");
+                    $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$repoArchiveList}) SETTINGS mutations_sync=1");
                 } catch (\Exception $e) { /* may not exist yet */ }
             }
             $missingArchives = $crArchives;
@@ -910,8 +910,8 @@ foreach ($serverJobs as $sj) {
             if (!empty($orphanedInCh)) {
                 $orphanList = implode(',', array_map('intval', $orphanedInCh));
                 try {
-                    $ch->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$orphanList})");
-                    $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$orphanList})");
+                    $ch->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$orphanList}) SETTINGS mutations_sync=1");
+                    $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id IN ({$orphanList}) SETTINGS mutations_sync=1");
                 } catch (\Exception $e) { /* non-fatal */ }
                 echo date('Y-m-d H:i:s') . " Catalog rebuild job #{$sj['id']}: cleaned up " . count($orphanedInCh) . " pruned archives from ClickHouse\n";
             }
@@ -1359,7 +1359,9 @@ foreach ($serverJobs as $sj) {
                 ];
                 $listEnv = [];
             } else {
-                $listCmd = \BBS\Services\BorgCommandBuilder::buildListCommand($localRepo);
+                $overrideRepo = $localRepo;
+                $overrideRepo['path'] = $localPath;
+                $listCmd = \BBS\Services\BorgCommandBuilder::buildListCommand($overrideRepo);
                 $listEnv = $envStrings ?? [];
             }
             $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
@@ -1399,8 +1401,8 @@ foreach ($serverJobs as $sj) {
                     try {
                         $chPrune = \BBS\Core\ClickHouse::getInstance();
                         $archiveIdInt = (int) $dbA['id'];
-                        $chPrune->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveIdInt}");
-                        $chPrune->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveIdInt}");
+                        $chPrune->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveIdInt} SETTINGS mutations_sync=1");
+                        $chPrune->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveIdInt} SETTINGS mutations_sync=1");
                     } catch (\Exception $e) { /* ClickHouse may not be available */ }
                     $removedNames[] = $dbA['archive_name'];
                     $removed++;

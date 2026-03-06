@@ -73,8 +73,9 @@ class SQLiteCatalog
         $sql = preg_replace("/formatDateTime\\(mtime,\\s*'%Y-%m-%d %H:%i:%S'\\)/i", 'mtime', $sql);
         
         // Translate ALTER TABLE DELETE
-        if (stripos(trim($sql), 'ALTER TABLE catalog_dirs DELETE') === 0) {
-            $sql = preg_replace('/^ALTER TABLE catalog_dirs DELETE WHERE (.*?) SETTINGS.*/i', 'DELETE FROM catalog_dirs WHERE $1', $sql);
+        $trimmedSql = trim($sql);
+        if (stripos($trimmedSql, 'ALTER TABLE') === 0 && stripos($trimmedSql, 'DELETE WHERE') !== false) {
+            $sql = preg_replace('/^ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+DELETE\s+WHERE\s+(.*?)(?:\s+SETTINGS.*)?$/i', 'DELETE FROM $1 WHERE $2', $trimmedSql);
         }
         
         return $sql;
