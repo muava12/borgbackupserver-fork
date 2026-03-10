@@ -25,12 +25,61 @@ class SettingsController extends Controller
         ]);
     }
 
+    public function dockerSetup(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $hostname = trim($_POST['hostname'] ?? '');
+        $webPort = (int) ($_POST['web_port'] ?? 8080);
+        $sshPort = (int) ($_POST['ssh_port'] ?? 22);
+
+        if (empty($hostname)) {
+            $this->flash('danger', 'Server hostname or IP is required.');
+            $this->redirect('/');
+            return;
+        }
+
+        // Build server_host (include port if non-standard)
+        $serverHost = $hostname;
+        if ($webPort && $webPort !== 80 && $webPort !== 443) {
+            $serverHost .= ':' . $webPort;
+        }
+
+        // Save settings
+        $settings = [
+            'server_host' => $serverHost,
+            'ssh_port' => (string) $sshPort,
+            'docker_setup_complete' => '1',
+        ];
+        foreach ($settings as $key => $value) {
+            $existing = $this->db->fetchOne("SELECT `key` FROM settings WHERE `key` = ?", [$key]);
+            if ($existing) {
+                $this->db->update('settings', ['value' => $value], "`key` = ?", [$key]);
+            } else {
+                $this->db->insert('settings', ['key' => $key, 'value' => $value]);
+            }
+        }
+
+        // Update APP_URL in .env
+        $newAppUrl = "http://{$serverHost}";
+        $envPath = dirname(__DIR__, 2) . '/config/.env';
+        if (file_exists($envPath) && is_writable($envPath)) {
+            $env = file_get_contents($envPath);
+            $env = preg_replace('/^APP_URL=.*$/m', 'APP_URL=' . $newAppUrl, $env);
+            file_put_contents($envPath, $env);
+        }
+
+        $this->flash('success', 'Docker network settings configured.');
+        $this->redirect('/');
+    }
+
     public function update(): void
     {
         $this->requireAdmin();
         $this->verifyCsrf();
 
-        $allowed = ['max_queue', 'server_host', 'agent_poll_interval', 'session_timeout_hours', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'storage_path', 'apprise_urls', 'self_backup_retention'];
+        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'session_timeout_hours', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'storage_path', 'apprise_urls', 'self_backup_retention'];
 
         foreach ($allowed as $key) {
             if (isset($_POST[$key])) {

@@ -44,7 +44,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.17.1"
+AGENT_VERSION = "2.17.6"
 BORG_PATH = None  # Resolved in get_system_info()
 IS_WINDOWS = sys.platform == "win32"
 
@@ -97,19 +97,75 @@ current_proc = None  # Track active borg subprocess for clean shutdown
 
 
 def _lockdown_key_windows(path):
-    """Remove all ACLs from a file, then grant read-only to SYSTEM and Administrators only."""
+    """Set SSH key permissions so only SYSTEM and Administrators can read it.
+
+    Uses PowerShell to create a clean ACL from scratch — no leftover ACEs.
+    SIDs are used instead of group names for locale independence.
+    Falls back to icacls if PowerShell is unavailable.
+    """
+    # PowerShell: build a fresh ACL with only SYSTEM + Administrators read access
+    ps_cmd = (
+        "$acl = New-Object System.Security.AccessControl.FileSecurity; "
+        "$acl.SetAccessRuleProtection($true, $false); "
+        "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("
+        "(New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'), "
+        "[System.Security.AccessControl.FileSystemRights]::Read, "
+        "[System.Security.AccessControl.AccessControlType]::Allow))); "
+        "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("
+        "(New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'), "
+        "[System.Security.AccessControl.FileSystemRights]::Read, "
+        "[System.Security.AccessControl.AccessControlType]::Allow))); "
+        "Set-Acl -Path '{}' -AclObject $acl"
+    ).format(path.replace("'", "''"))
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
+    if result.returncode == 0:
+        return
+
+    # Fallback: icacls with well-known SIDs
+    logger.warning("PowerShell ACL set failed (rc={}), falling back to icacls".format(result.returncode))
     subprocess.run(
         ["icacls", path, "/inheritance:r"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+    for sid in [
+        "*S-1-5-32-545", "*S-1-5-11", "*S-1-1-0",
+        "*S-1-5-32-546", "*S-1-3-0", "*S-1-3-1",
+    ]:
+        subprocess.run(
+            ["icacls", path, "/remove", sid],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
     subprocess.run(
-        ["icacls", path, "/remove", "Users", "Authenticated Users", "Everyone", "BUILTIN\\Users"],
+        ["icacls", path, "/grant:r", "*S-1-5-18:(R)", "*S-1-5-32-544:(R)"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-    subprocess.run(
-        ["icacls", path, "/grant:r", "SYSTEM:(R)", "Administrators:(R)"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+
+
+def _verify_key_readable(path):
+    """Verify the SSH key file is readable and log diagnostics if not."""
+    try:
+        with open(path, "r") as f:
+            content = f.read(32)
+        if content:
+            logger.info("SSH key file is readable ({})".format(path))
+            return True
+    except PermissionError:
+        logger.error("SSH key file NOT readable (PermissionError): {}".format(path))
+    except Exception as e:
+        logger.error("SSH key file read check failed: {}".format(e))
+    # Log current ACL for diagnostics
+    try:
+        result = subprocess.run(
+            ["icacls", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        acl_output = result.stdout.decode("utf-8", errors="replace").strip()
+        logger.error("Current ACL: {}".format(acl_output))
+    except Exception:
+        pass
+    return False
 
 
 def setup_logging():
@@ -380,6 +436,9 @@ def download_ssh_key(config):
     have_info = os.path.exists(SSH_INFO_PATH)
 
     if have_key and have_info:
+        if IS_WINDOWS:
+            _lockdown_key_windows(SSH_KEY_PATH)
+            _verify_key_readable(SSH_KEY_PATH)
         return True
 
     if have_key and not have_info:
