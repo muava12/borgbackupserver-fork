@@ -60,7 +60,12 @@ case "$ACTION" in
         fi
 
         # Set ownership: user owns, www-data group for server-side borg operations (init, prune, compact)
-        chown "$USERNAME":www-data "$HOME_DIR"
+        # This MUST succeed — sshd requires correct ownership of home/.ssh for key auth.
+        # If this fails (e.g. NAS/NFS mount), the SSH home dir must be on a local filesystem.
+        if ! chown "$USERNAME":www-data "$HOME_DIR" 2>&1; then
+            echo "Error: chown failed on $HOME_DIR — SSH home directories must be on a local filesystem, not a NAS/NFS mount. Check your storage_path setting."
+            exit 1
+        fi
         chmod 750 "$HOME_DIR"
 
         # Configure SSH authorized_keys with gate dispatcher
@@ -250,13 +255,15 @@ case "$ACTION" in
         chown "$USERNAME":"$USERNAME" "$BORG_DIR"
 
         # Run borg list --json as the repo-owning user
+        # Do NOT use 2>&1 here — borg warnings on stderr corrupt the JSON output
+        # and cause json_decode to fail, which can wipe all archive records.
         sudo -u "$USERNAME" \
             BORG_PASSPHRASE="$PASSPHRASE" \
             BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes \
             BORG_RELOCATED_REPO_ACCESS_IS_OK=yes \
             BORG_BASE_DIR="$BORG_DIR" \
             HOME="$BORG_DIR" \
-            borg list --json "$REPO_PATH" 2>&1
+            borg list --json "$REPO_PATH"
 
         exit $?
         ;;

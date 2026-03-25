@@ -72,7 +72,7 @@ class RepositoryController extends Controller
         }
 
         $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-        $host = $serverHost['value'] ?? '';
+        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : ($serverHost['value'] ?? '');
 
         // Determine if this storage location differs from the SSH user's home directory.
         // Compare the location path against the parent of the agent's actual ssh_home_dir
@@ -467,13 +467,15 @@ class RepositoryController extends Controller
         $this->requirePermission(PermissionService::REPO_MAINTENANCE, $repo['agent_id']);
 
         // Map action to task_type
+        // "Rebuild Full" dispatches as catalog_sync which wipes archives,
+        // re-reads them from borg (with sizes), then auto-queues catalog_rebuild
         $taskType = match($action) {
             'check' => 'repo_check',
             'compact' => 'compact',
             'repair' => 'repo_repair',
             'break_lock' => 'break_lock',
             'catalog_rebuild' => 'catalog_rebuild',
-            'catalog_rebuild_full' => 'catalog_rebuild_full',
+            'catalog_rebuild_full' => 'catalog_sync',
             default => null,
         };
 
@@ -648,7 +650,7 @@ class RepositoryController extends Controller
         $mode = $_POST['mode'] ?? 'replace';
 
         $repo = $this->db->fetchOne("
-            SELECT r.*, a.name as agent_name, a.ssh_unix_user
+            SELECT r.*, a.name as agent_name, a.ssh_unix_user, a.server_host_override
             FROM repositories r
             JOIN agents a ON a.id = r.agent_id
             WHERE r.id = ? AND r.agent_id = ?
@@ -702,7 +704,7 @@ class RepositoryController extends Controller
                 $copyStoragePath = $storageSetting['value'] ?? '';
             }
             $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-            $host = $serverHost['value'] ?? '';
+            $host = !empty($repo['server_host_override']) ? $repo['server_host_override'] : ($serverHost['value'] ?? '');
 
             $storageSetting2 = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
             $sshHomePath2 = rtrim($storageSetting2['value'] ?? '/var/bbs/home', '/');
@@ -841,7 +843,7 @@ class RepositoryController extends Controller
             $storagePath = $storageSetting['value'] ?? '';
         }
         $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-        $host = $serverHost['value'] ?? '';
+        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : ($serverHost['value'] ?? '');
 
         if (!empty($agent['ssh_unix_user']) && !empty($host)) {
             $path = SshKeyManager::buildSshRepoPath($agent['ssh_unix_user'], $host, $repoName);
@@ -1183,7 +1185,7 @@ class RepositoryController extends Controller
         }
 
         $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-        $host = $serverHost['value'] ?? '';
+        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : ($serverHost['value'] ?? '');
 
         // Determine if this is a non-default storage location (same logic as storeLocal)
         $locationPath = rtrim($location['path'], '/');

@@ -167,7 +167,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
 
     <!-- Edit Client Modal -->
     <div class="modal fade" id="editClientModal" tabindex="-1">
-        <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-dialog modal-dialog-centered">
             <div class="modal-content">
                 <form method="POST" action="/clients/<?= $agent['id'] ?>/edit">
                     <div class="modal-header">
@@ -189,6 +189,19 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                 <option value="<?= $u['id'] ?>" <?= ($agent['user_id'] ?? '') == $u['id'] ? 'selected' : '' ?>><?= htmlspecialchars($u['username']) ?></option>
                                 <?php endforeach; ?>
                             </select>
+                        </div>
+                        <?php endif; ?>
+                        <?php if ($this->isAdmin()): ?>
+                        <hr class="my-3">
+                        <p class="text-muted small mb-2">For agents connecting from outside your network. Leave empty to use global settings.</p>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold small">Server Host Override</label>
+                            <input type="text" class="form-control form-control-sm" name="server_host_override" value="<?= htmlspecialchars($agent['server_host_override'] ?? '') ?>" placeholder="e.g. backup.example.com">
+                            <div class="form-text">Hostname or IP only — no protocol or port.</div>
+                        </div>
+                        <div>
+                            <label class="form-label fw-semibold small">SSH Port Override</label>
+                            <input type="number" class="form-control form-control-sm" name="ssh_port_override" value="<?= htmlspecialchars($agent['ssh_port_override'] ?? '') ?>" placeholder="e.g. 22222" min="1" max="65535">
                         </div>
                         <?php endif; ?>
                     </div>
@@ -698,7 +711,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
             <div class="card border-0 shadow-sm h-100 repo-card position-relative" style="cursor: pointer; overflow: visible;" onclick="window.location='/clients/<?= $agent['id'] ?>/repo/<?= $repo['id'] ?>'">
                 <!-- Maintenance menu in upper right -->
                 <div class="position-absolute dropdown" style="top: 6px; right: 6px; z-index: 10;" onclick="event.stopPropagation()">
-                    <button class="btn btn-sm btn-link text-muted p-1" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Actions">
+                    <button class="btn btn-sm btn-link text-muted p-1" type="button" data-bs-toggle="dropdown" data-bs-strategy="fixed" aria-expanded="false" title="Actions">
                         <i class="bi bi-three-dots-vertical"></i>
                     </button>
                     <ul class="dropdown-menu dropdown-menu-end">

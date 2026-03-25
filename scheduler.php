@@ -47,13 +47,14 @@ if ($stale->rowCount() > 0) {
     }
 }
 
-// Step 2: Fail jobs for agents that are offline (queued, sent, or running)
+// Step 2: Fail jobs for agents that are offline (sent or running only)
+// Queued jobs are left alone — the agent may come back online and pick them up.
 // Excludes server-side tasks (prune, compact, catalog, etc.) — those don't need the agent
 $staleJobs = $db->fetchAll("
     SELECT bj.id, bj.agent_id, bj.task_type, bj.backup_plan_id, bj.status, a.name as agent_name
     FROM backup_jobs bj
     JOIN agents a ON a.id = bj.agent_id
-    WHERE bj.status IN ('queued', 'sent', 'running')
+    WHERE bj.status IN ('sent', 'running')
       AND a.status = 'offline'
       AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full')
 ");
@@ -153,7 +154,7 @@ try {
         // Skip archives created in the last 30 minutes — the normal post-backup
         // catalog indexing handles those; triggering a rebuild too early causes loops
         $repos = $db->fetchAll(
-            "SELECT r.id, r.agent_id, r.repo_path, r.storage_type, a.id AS archive_id
+            "SELECT r.id, r.agent_id, r.path as repo_path, r.storage_type, a.id AS archive_id
              FROM repositories r
              JOIN archives a ON a.repository_id = r.id
              WHERE a.created_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE)"
@@ -175,10 +176,13 @@ try {
             }
             // Check for pending/running rebuild on this repo OR any repo for same agent
             // Concurrent rebuilds for same agent contend on borg repo locks
+            // Also skip if a rebuild completed in the last 24 hours (prevents infinite loop
+            // when some archives can never be indexed, e.g. corrupted or inaccessible)
             $pending = $db->fetchOne(
                 "SELECT id FROM backup_jobs
                  WHERE (repository_id = ? OR agent_id = ?) AND task_type IN ('catalog_rebuild', 'catalog_rebuild_full')
-                   AND status IN ('queued','sent','running')",
+                   AND (status IN ('queued','sent','running')
+                        OR (status IN ('completed','failed') AND completed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)))",
                 [$repoId, $agentId]
             );
             if (!$pending) {
@@ -594,6 +598,35 @@ foreach ($serverJobs as $sj) {
         $csNow = date('Y-m-d H:i:s');
         if ($csExitCode <= 1) {
             $csData = json_decode($csOutput, true);
+
+            // Safety check: if JSON parse failed, fail the job rather than deleting all archive records
+            if ($csData === null || !isset($csData['archives'])) {
+                $stderrHint = !empty($csError) ? trim($csError) : '';
+                $stdoutHint = trim(substr($csOutput, 0, 500));
+                $errorMsg = "borg list output was not valid JSON";
+                if ($stderrHint) {
+                    $errorMsg .= ": " . $stderrHint;
+                } elseif ($stdoutHint) {
+                    $errorMsg .= ": " . $stdoutHint;
+                } else {
+                    $errorMsg .= " (empty output, exit code {$csExitCode})";
+                }
+                $db->update('backup_jobs', [
+                    'status' => 'failed',
+                    'completed_at' => $csNow,
+                    'duration_seconds' => max(0, strtotime($csNow) - strtotime($startedAt)),
+                    'error_log' => $errorMsg,
+                ], 'id = ?', [$sj['id']]);
+                $db->insert('server_log', [
+                    'agent_id' => $sj['agent_id'],
+                    'backup_job_id' => $sj['id'],
+                    'level' => 'error',
+                    'message' => "Catalog sync failed: {$errorMsg}",
+                ]);
+                echo date('Y-m-d H:i:s') . " Catalog sync job #{$sj['id']} failed: {$errorMsg}\n";
+                continue;
+            }
+
             $archives = $csData['archives'] ?? [];
 
             // Clear existing archives for this repo and rebuild
@@ -682,7 +715,7 @@ foreach ($serverJobs as $sj) {
                 // Update progress
                 $db->update('backup_jobs', [
                     'files_processed' => $archiveCount,
-                    'last_progress_at' => date('Y-m-d H:i:s'),
+                    'last_progress_at' => $db->now(),
                 ], 'id = ?', [$sj['id']]);
 
                 echo date('Y-m-d H:i:s') . "   Catalog sync {$archiveCount}/{$totalArchiveCount}: {$archiveName}\n";
@@ -816,9 +849,13 @@ foreach ($serverJobs as $sj) {
             }
         }
 
-        if ($syncExitCode <= 1) {
+        if ($syncExitCode <= 1 && $syncOutput) {
             $syncData = json_decode($syncOutput, true);
-            $borgArchives = $syncData['archives'] ?? [];
+            if ($syncData === null || !isset($syncData['archives'])) {
+                echo date('Y-m-d H:i:s') . " Catalog rebuild job #{$sj['id']}: borg list returned invalid JSON, skipping archive sync\n";
+                $syncData = ['archives' => []];
+            }
+            $borgArchives = $syncData['archives'];
             $existingNames = array_column(
                 $db->fetchAll("SELECT archive_name FROM archives WHERE repository_id = ?", [$crRepo['id']]),
                 'archive_name'
@@ -1129,7 +1166,7 @@ foreach ($serverJobs as $sj) {
             // Update progress for UI progress bar (files_processed = archives processed)
             $db->update('backup_jobs', [
                 'files_processed' => $processedArchives,
-                'last_progress_at' => date('Y-m-d H:i:s'),
+                'last_progress_at' => $db->now(),
             ], 'id = ?', [$sj['id']]);
 
             // Log progress to server_log for UI visibility
@@ -1378,6 +1415,18 @@ foreach ($serverJobs as $sj) {
 
         if ($listExit <= 1 && $listOut) {
             $listData = json_decode($listOut, true);
+
+            // Safety check: if JSON parse failed (e.g., borg warnings mixed into output),
+            // skip the sync entirely to avoid deleting all archive records
+            if ($listData === null || !isset($listData['archives'])) {
+                $db->insert('server_log', [
+                    'agent_id' => $sj['agent_id'],
+                    'backup_job_id' => $sj['id'],
+                    'level' => 'warning',
+                    'message' => "Post-prune archive sync skipped: borg list output was not valid JSON",
+                ]);
+                echo date('Y-m-d H:i:s') . " Skipping post-prune archive sync for job #{$sj['id']}: invalid JSON from borg list\n";
+            } else {
             $borgArchives = [];
             if (!empty($listData['archives'])) {
                 foreach ($listData['archives'] as $a) {
@@ -1429,6 +1478,7 @@ foreach ($serverJobs as $sj) {
                     'message' => "Prune completed — all " . count($borgArchives) . " recovery point(s) retained, none removed",
                 ]);
             }
+            } // end JSON validation else
         }
     }
 
@@ -1494,6 +1544,24 @@ if ((int) date('i') % 5 === 0) {
     }
 }
 
+// Step 5b: Poll remote SSH host disk usage (every 15 minutes)
+if ((int) date('i') % 15 === 0) {
+    $remoteSshService = $remoteSshService ?? new RemoteSshService();
+    $remoteConfigs = $db->fetchAll("SELECT * FROM remote_ssh_configs");
+    foreach ($remoteConfigs as $rc) {
+        $rcFull = $remoteSshService->getDecrypted((int) $rc['id']);
+        if ($rcFull) {
+            $diskData = $remoteSshService->getDiskUsage($rcFull);
+            $remoteSshService->updateDiskUsage((int) $rc['id'], $diskData);
+            if ($diskData) {
+                echo date('Y-m-d H:i:s') . " Remote SSH \"{$rc['name']}\": {$diskData['percent']}% used\n";
+            } else {
+                echo date('Y-m-d H:i:s') . " Remote SSH \"{$rc['name']}\": df unavailable\n";
+            }
+        }
+    }
+}
+
 // Step 6: Check storage for low disk space (all storage locations)
 $notificationService = $notificationService ?? new NotificationService();
 $thresholdSetting = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_alert_threshold'");
@@ -1523,11 +1591,28 @@ foreach ($storageLocations as $sl) {
         }
     }
 }
+
+// Also check remote SSH storage
+$remoteConfigs = $db->fetchAll("SELECT * FROM remote_ssh_configs WHERE disk_total_bytes IS NOT NULL AND disk_total_bytes > 0");
+foreach ($remoteConfigs as $rc) {
+    $total = (int) $rc['disk_total_bytes'];
+    $free = (int) $rc['disk_free_bytes'];
+    if ($total > 0) {
+        $usagePercent = round((($total - $free) / $total) * 100, 1);
+        if ($usagePercent >= $storageThreshold) {
+            $notificationService->notify('storage_low', null, null,
+                "Remote storage \"{$rc['name']}\" is at {$usagePercent}% capacity ({$rc['remote_user']}@{$rc['remote_host']})",
+                'warning');
+            $anyLow = true;
+        }
+    }
+}
+
 if (!$anyLow) {
     $notificationService->resolve('storage_low', null, null);
 }
 
-// Step 6: Cleanup old resolved notifications and server logs
+// Step 7: Cleanup old resolved notifications and server logs
 $notificationService->cleanup();
 
 // Purge server_log entries older than 30 days
@@ -1599,17 +1684,16 @@ if (!$lastJobCleanupTime || strtotime($lastJobCleanupTime) < time() - 86400) {
 // Step 10: Generate daily backup report (once per calendar day)
 // Check if a report already exists for today's date — prevents duplicate generation
 // regardless of what time zone or hour the scheduler runs.
+// Regenerate today's report every run so counts stay current
+// (the report is emailed at each user's preferred hour — it should reflect
+// all backups completed so far, not just the ones before midnight)
 $todayDate = date('Y-m-d');
-$existingReport = $db->fetchOne("SELECT id FROM daily_reports WHERE report_date = ? LIMIT 1", [$todayDate]);
-if (!$existingReport) {
-    try {
-        $reportService = new \BBS\Services\ReportService();
-        $report = $reportService->generate($todayDate);
-        echo date('Y-m-d H:i:s') . " Generated daily report #{$report['id']}\n";
-        $reportService->cleanup();
-    } catch (\Exception $e) {
-        echo date('Y-m-d H:i:s') . " Daily report error: {$e->getMessage()}\n";
-    }
+try {
+    $reportService = new \BBS\Services\ReportService();
+    $report = $reportService->generate($todayDate);
+    $reportService->cleanup();
+} catch (\Exception $e) {
+    echo date('Y-m-d H:i:s') . " Daily report error: {$e->getMessage()}\n";
 }
 
 // Step 10b: Email daily report to subscribers at their preferred local hour

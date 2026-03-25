@@ -44,7 +44,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.17.9"
+AGENT_VERSION = "2.18.6"
 BORG_PATH = None  # Resolved in get_system_info()
 IS_WINDOWS = sys.platform == "win32"
 
@@ -215,7 +215,7 @@ def load_config():
     }
 
 
-def api_request(config, endpoint, method="GET", data=None, timeout=30):
+def api_request(config, endpoint, method="GET", data=None, timeout=60):
     """Make an authenticated request to the BBS server."""
     url = "{}{}".format(config['server_url'], endpoint)
     headers = {
@@ -877,7 +877,13 @@ def _install_borg_pip(target_version):
             logger.warning("Could not check/remove existing binary: {}".format(e))
 
     version_spec = "borgbackup=={}".format(target_version) if target_version and target_version != "latest" else "borgbackup"
-    cmd = ["pip3", "install", "--upgrade", version_spec]
+    # Use pip3 if available, fall back to pip (FreeBSD uses pip, not pip3)
+    pip_cmd = "pip3"
+    try:
+        subprocess.run(["pip3", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pip_cmd = "pip"
+    cmd = [pip_cmd, "install", "--upgrade", version_spec]
     logger.info("Installing borg via pip: {}".format(' '.join(cmd)))
 
     try:
@@ -949,6 +955,9 @@ def _install_borg_package_manager():
         pre_cmd = None
     elif os.path.exists("/usr/bin/pacman"):
         cmd = ["pacman", "-Sy", "--noconfirm", "borg"]
+        pre_cmd = None
+    elif os.path.exists("/usr/local/sbin/pkg"):
+        cmd = ["pkg", "install", "-y", "borgbackup"]
         pre_cmd = None
     elif os.path.exists("/usr/local/bin/brew") or os.path.exists("/opt/homebrew/bin/brew"):
         cmd = ["brew", "install", "borgbackup"]
@@ -1106,6 +1115,7 @@ def log_to_server(config, job_id, message, level="info"):
 PLUGIN_DISPLAY_NAMES = {
     "mysql_dump": "MySQL Dump",
     "pg_dump": "PostgreSQL Dump",
+    "shell_hook": "Shell Script Hook",
 }
 
 
@@ -1602,9 +1612,10 @@ def cleanup_plugin_shell_hook(config, plugin_result):
 
 
 def test_plugin_shell_hook(config):
-    """Test that configured shell hook scripts exist and are executable."""
+    """Test shell hook scripts by actually running them."""
     pre_script = config.get("pre_script", "").strip()
     post_script = config.get("post_script", "").strip()
+    timeout = int(config.get("timeout", 300))
     results = []
 
     if not pre_script and not post_script:
@@ -1618,7 +1629,21 @@ def test_plugin_shell_hook(config):
             raise Exception("{} not found: {}".format(label, path))
         if not os.access(path, os.X_OK):
             raise Exception("{} not executable: {} - run: chmod +x {}".format(label, path, path))
-        results.append("{}: {} ok".format(label, path))
+        # Actually run the script to verify it works under the agent's context
+        try:
+            proc = subprocess.run(
+                [path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                universal_newlines=True,
+            )
+            output = (proc.stdout or "").strip()[:500]
+            if proc.returncode != 0:
+                raise Exception("{} exited with code {}: {}".format(label, proc.returncode, output))
+            results.append("{}: {} exit 0{}".format(label, path, " — {}".format(output) if output else ""))
+        except subprocess.TimeoutExpired:
+            raise Exception("{} timed out after {}s: {}".format(label, timeout, path))
 
     return " | ".join(results)
 

@@ -105,6 +105,8 @@ CREATE TABLE agents (
     ssh_public_key TEXT DEFAULT NULL,
     ssh_private_key_encrypted TEXT DEFAULT NULL,
     ssh_home_dir VARCHAR(255) DEFAULT NULL,
+    server_host_override VARCHAR(255) DEFAULT NULL,
+    ssh_port_override INT DEFAULT NULL,
     status ENUM('setup', 'online', 'offline', 'error') NOT NULL DEFAULT 'setup',
     last_heartbeat DATETIME DEFAULT NULL,
     user_id INT DEFAULT NULL,
@@ -135,6 +137,10 @@ CREATE TABLE remote_ssh_configs (
     ssh_private_key_encrypted TEXT NOT NULL,
     borg_remote_path VARCHAR(255) DEFAULT NULL,
     append_repo_name TINYINT(1) NOT NULL DEFAULT 1,
+    disk_total_bytes BIGINT DEFAULT NULL,
+    disk_used_bytes BIGINT DEFAULT NULL,
+    disk_free_bytes BIGINT DEFAULT NULL,
+    disk_checked_at DATETIME DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;

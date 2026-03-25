@@ -276,6 +276,14 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
         </div>
         <?php endif; ?>
 
+        <?php /* Remote storage dashboard widgets — disabled pending redesign
+        <?php if (!empty($storage['remote_storage'])): ?>
+        <?php foreach ($storage['remote_storage'] as $rs): ?>
+        ...
+        <?php endforeach; ?>
+        <?php endif; ?>
+        */ ?>
+
         <?php if (!empty($mysqlStats)): ?>
         <div class="card border-0 shadow-sm mt-4">
             <div class="card-header bg-body fw-semibold py-2">

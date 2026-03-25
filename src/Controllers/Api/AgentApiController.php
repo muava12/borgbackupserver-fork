@@ -107,9 +107,9 @@ class AgentApiController extends Controller
         $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
         $sshPort = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'ssh_port'");
 
-        // Strip web port from server_host — agent uses this for SSH connections,
-        // and the SSH port is sent separately via ssh_port
-        $host = SshKeyManager::stripHostPort($serverHost['value'] ?? '');
+        // Per-agent overrides take precedence over global settings
+        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : SshKeyManager::stripHostPort($serverHost['value'] ?? '');
+        $port = !empty($agent['ssh_port_override']) ? (int) $agent['ssh_port_override'] : (int) ($sshPort['value'] ?? 22);
 
         $this->json([
             'status' => 'ok',
@@ -118,7 +118,7 @@ class AgentApiController extends Controller
             'poll_interval' => (int) ($pollInterval['value'] ?? 30),
             'ssh_unix_user' => $agent['ssh_unix_user'] ?? '',
             'server_host' => $host,
-            'ssh_port' => (int) ($sshPort['value'] ?? 22),
+            'ssh_port' => $port,
         ]);
     }
 
@@ -144,19 +144,30 @@ class AgentApiController extends Controller
 
         // Detect stalled jobs: running/sent with no recent progress from this agent
         // Exclude server-side task types — those run in the scheduler, not on the agent
+        // Exclude jobs being delivered in THIS response (race condition: agent would
+        // report "not running" for a task it literally just received)
+        $deliveredJobIds = array_map(fn($t) => (int) ($t['job_id'] ?? 0), $tasks);
+        $excludeClause = '';
+        $stalledParams = [$agent['id']];
+        if (!empty($deliveredJobIds)) {
+            $placeholders = implode(',', array_fill(0, count($deliveredJobIds), '?'));
+            $excludeClause = "AND bj.id NOT IN ({$placeholders})";
+            $stalledParams = array_merge($stalledParams, $deliveredJobIds);
+        }
         $stalledJobs = $this->db->fetchAll("
-            SELECT id FROM backup_jobs
-            WHERE agent_id = ?
-              AND status IN ('running', 'sent')
-              AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full')
+            SELECT bj.id FROM backup_jobs bj
+            WHERE bj.agent_id = ?
+              AND bj.status IN ('running', 'sent')
+              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full')
+              {$excludeClause}
               AND (
-                  (last_progress_at IS NOT NULL AND last_progress_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE))
+                  (bj.last_progress_at IS NOT NULL AND bj.last_progress_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE))
                   OR
-                  (last_progress_at IS NULL AND started_at IS NOT NULL AND started_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE))
+                  (bj.last_progress_at IS NULL AND bj.started_at IS NOT NULL AND bj.started_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE))
                   OR
-                  (last_progress_at IS NULL AND started_at IS NULL AND queued_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE))
+                  (bj.last_progress_at IS NULL AND bj.started_at IS NULL AND bj.queued_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE))
               )
-        ", [$agent['id']]);
+        ", $stalledParams);
 
         $response = [
             'status' => 'ok',
@@ -200,7 +211,7 @@ class AgentApiController extends Controller
             $this->json(['status' => 'ok']);
         }
 
-        $data = ['status' => 'running', 'last_progress_at' => date('Y-m-d H:i:s')];
+        $data = ['status' => 'running', 'last_progress_at' => $this->db->now()];
         if (isset($input['files_total']))      $data['files_total'] = (int) $input['files_total'];
         if (isset($input['files_processed']))  $data['files_processed'] = (int) $input['files_processed'];
         if (isset($input['bytes_total']))      $data['bytes_total'] = (int) $input['bytes_total'];
@@ -311,7 +322,7 @@ class AgentApiController extends Controller
             $this->json(['status' => 'ok']);
         }
 
-        $now = date('Y-m-d H:i:s');
+        $now = $this->db->now();
         $startedAt = $job['started_at'] ?? $job['queued_at'] ?? $now;
         $duration = strtotime($now) - strtotime($startedAt);
 
@@ -917,15 +928,19 @@ class AgentApiController extends Controller
         }
 
         // Return server_host and ssh_port settings so the agent knows how to connect
+        // Per-agent overrides take precedence over global settings
         $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
         $sshPort = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'ssh_port'");
+
+        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : SshKeyManager::stripHostPort($serverHost['value'] ?? '');
+        $port = !empty($agent['ssh_port_override']) ? (int) $agent['ssh_port_override'] : (int) ($sshPort['value'] ?? 22);
 
         $this->json([
             'status' => 'ok',
             'ssh_private_key' => $privateKey,
             'ssh_unix_user' => $agent['ssh_unix_user'],
-            'server_host' => SshKeyManager::stripHostPort($serverHost['value'] ?? ''),
-            'ssh_port' => (int) ($sshPort['value'] ?? 22),
+            'server_host' => $host,
+            'ssh_port' => $port,
         ]);
     }
 
