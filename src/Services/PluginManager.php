@@ -479,6 +479,144 @@ class PluginManager
                     'default' => '--no-owner --no-privileges',
                 ],
             ],
+            'mongo_dump' => [
+                'host' => [
+                    'type' => 'text',
+                    'label' => 'MongoDB Host',
+                    'default' => '127.0.0.1',
+                    'help' => 'Use 127.0.0.1 instead of localhost to avoid IPv6 connection issues.',
+                ],
+                'port' => [
+                    'type' => 'number',
+                    'label' => 'Port',
+                    'default' => 27017,
+                ],
+                'user' => [
+                    'type' => 'text',
+                    'label' => 'Username',
+                    'default' => '',
+                    'help' => 'Leave empty if MongoDB does not require authentication.',
+                ],
+                'password' => [
+                    'type' => 'text',
+                    'label' => 'Password',
+                    'generate' => true,
+                    'sensitive' => true,
+                    'help' => 'Leave empty if MongoDB does not require authentication.',
+                ],
+                'auth_db' => [
+                    'type' => 'text',
+                    'label' => 'Authentication Database',
+                    'default' => 'admin',
+                    'help' => 'The database used for authentication (usually "admin").',
+                ],
+                'databases' => [
+                    'type' => 'text',
+                    'label' => 'Databases',
+                    'default' => '*',
+                    'help' => 'Use * for all databases, or a comma-separated list of specific names.',
+                ],
+                'dump_dir' => [
+                    'type' => 'text',
+                    'label' => 'Dump Directory',
+                    'default' => '/home/bbs/mongodump',
+                    'required' => true,
+                    'help' => 'Local directory where dumps are saved. Automatically included in backup directories.',
+                ],
+                'compress' => [
+                    'type' => 'checkbox',
+                    'label' => 'Compress dumps (gzip)',
+                    'default' => true,
+                ],
+                'cleanup_after' => [
+                    'type' => 'checkbox',
+                    'label' => 'Delete dumps after backup completes',
+                    'default' => true,
+                ],
+                'exclude_databases' => [
+                    'type' => 'tags',
+                    'label' => 'Exclude Databases',
+                    'default' => ['admin', 'config', 'local'],
+                    'help' => 'Comma-separated list of databases to skip when using * above.',
+                ],
+                'extra_options' => [
+                    'type' => 'text',
+                    'label' => 'Extra mongodump Options',
+                    'default' => '',
+                    'help' => 'Additional command-line flags for mongodump (e.g. --oplog for replica sets).',
+                ],
+            ],
+            'interworx' => [
+                'backup_type' => [
+                    'type' => 'select',
+                    'label' => 'Backup Type',
+                    'options' => [
+                        'structure_only' => 'Structure Only (manifest XML, no data files)',
+                        'full' => 'Full Backup (all data)',
+                        'partial' => 'Partial Backup (select components)',
+                    ],
+                    'default' => 'structure_only',
+                ],
+                'include_web' => [
+                    'type' => 'checkbox',
+                    'label' => 'Include website files',
+                    'default' => true,
+                    'show_when' => ['backup_type' => 'partial'],
+                ],
+                'include_db' => [
+                    'type' => 'checkbox',
+                    'label' => 'Include databases',
+                    'default' => true,
+                    'show_when' => ['backup_type' => 'partial'],
+                ],
+                'include_mail' => [
+                    'type' => 'checkbox',
+                    'label' => 'Include email',
+                    'default' => true,
+                    'show_when' => ['backup_type' => 'partial'],
+                ],
+                'no_logs' => [
+                    'type' => 'checkbox',
+                    'label' => 'Exclude log files',
+                    'default' => false,
+                    'show_when' => ['backup_type' => 'partial'],
+                ],
+                'no_stats' => [
+                    'type' => 'checkbox',
+                    'label' => 'Exclude stats files',
+                    'default' => false,
+                    'show_when' => ['backup_type' => 'partial'],
+                ],
+                'domains' => [
+                    'type' => 'text',
+                    'label' => 'Domains',
+                    'default' => 'all',
+                    'help' => 'Use "all" for all domains, or space/comma-separated list.',
+                ],
+                'output_dir' => [
+                    'type' => 'text',
+                    'label' => 'Output Directory',
+                    'default' => '/chroot/home/backup/interworx',
+                    'required' => true,
+                    'help' => 'Directory where InterWorx backup archives are saved. Automatically included in backup directories.',
+                ],
+                'no_disabled' => [
+                    'type' => 'checkbox',
+                    'label' => 'Skip disabled/inactive domains',
+                    'default' => true,
+                ],
+                'compression' => [
+                    'type' => 'number',
+                    'label' => 'Compression Level',
+                    'default' => 6,
+                    'help' => 'Compression level 1-9 (default 6). Higher = smaller files but slower.',
+                ],
+                'cleanup_after' => [
+                    'type' => 'checkbox',
+                    'label' => 'Delete backup files after borg archive completes',
+                    'default' => true,
+                ],
+            ],
             's3_sync' => [
                 'credential_source' => [
                     'type' => 'select',
@@ -528,7 +666,33 @@ class PluginManager
                     'type' => 'text',
                     'label' => 'Bandwidth Limit',
                     'default' => '',
-                    'help' => 'e.g. 50M for 50 MB/s. Leave empty for unlimited.',
+                    'help' => 'e.g. 50M for 50 MB/s. Leave empty for unlimited. Overrides global setting.',
+                ],
+                'storage_class' => [
+                    'type' => 'select',
+                    'label' => 'Storage Class',
+                    'options' => [
+                        '' => 'Use Global Setting',
+                        'STANDARD' => 'Standard',
+                        'STANDARD_IA' => 'Standard-IA',
+                        'ONEZONE_IA' => 'One Zone-IA',
+                        'INTELLIGENT_TIERING' => 'Intelligent-Tiering',
+                        'GLACIER_IR' => 'Glacier Instant Retrieval',
+                        'DEEP_ARCHIVE' => 'Glacier Deep Archive',
+                    ],
+                    'default' => '',
+                    'show_when' => ['credential_source' => 'custom'],
+                ],
+                'sse_mode' => [
+                    'type' => 'select',
+                    'label' => 'Server-Side Encryption',
+                    'options' => [
+                        '' => 'Use Global Setting',
+                        'AES256' => 'AES-256 (SSE-S3)',
+                        'aws:kms' => 'AWS KMS (SSE-KMS)',
+                    ],
+                    'default' => '',
+                    'show_when' => ['credential_source' => 'custom'],
                 ],
             ],
             'shell_hook' => [
@@ -590,6 +754,33 @@ class PluginManager
                 . "-- For database restore via GUI (requires additional privileges):\n"
                 . "ALTER ROLE backup_user CREATEDB;\n"
                 . "GRANT ALL PRIVILEGES ON DATABASE mydb TO backup_user;",
+            'mongo_dump' => "-- MongoDB user setup for backup (run in mongosh):\n"
+                . "use admin\n"
+                . "db.createUser({\n"
+                . "  user: \"bbs_backup\",\n"
+                . "  pwd: \"strong_password\",\n"
+                . "  roles: [\n"
+                . "    { role: \"backup\", db: \"admin\" },\n"
+                . "    { role: \"readAnyDatabase\", db: \"admin\" }\n"
+                . "  ]\n"
+                . "})\n\n"
+                . "-- For database restore via GUI (additional roles):\n"
+                . "db.grantRolesToUser(\"bbs_backup\", [\n"
+                . "  { role: \"restore\", db: \"admin\" },\n"
+                . "  { role: \"readWriteAnyDatabase\", db: \"admin\" }\n"
+                . "])\n\n"
+                . "-- Note: Authentication is optional. Leave username/password\n"
+                . "-- empty if your MongoDB instance does not require auth.",
+            'interworx' => "InterWorx control panel backup plugin.\n\n"
+                . "Requires InterWorx to be installed at the default location\n"
+                . "(~iworx/bin/backup.pex must be accessible).\n\n"
+                . "Backup types:\n"
+                . "  Full    - All website files, databases, and email\n"
+                . "  Partial - Select components (web, db, mail)\n"
+                . "  Structure Only - Manifest XML only, no data files\n\n"
+                . "The output directory is automatically included in the\n"
+                . "backup plan's directory list. After borg archives the\n"
+                . "backup files, they can optionally be cleaned up.",
         ];
 
         return $help[$slug] ?? '';

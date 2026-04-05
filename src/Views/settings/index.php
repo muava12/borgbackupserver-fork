@@ -39,6 +39,11 @@ $updateAvailable = $updateService->isUpdateAvailable();
         </a>
     </li>
     <li class="nav-item">
+        <a class="nav-link <?= $activeTab === 'api' ? 'active' : '' ?>" href="/settings?tab=api">
+            <i class="bi bi-key me-1"></i><span class="tab-label">API</span>
+        </a>
+    </li>
+    <li class="nav-item">
         <a class="nav-link <?= $activeTab === 'updates' ? 'active' : '' ?>" href="/settings?tab=updates">
             <i class="bi bi-cloud-arrow-down me-1"></i><span class="tab-label">Updates</span>
             <?php if ($updateAvailable): ?>
@@ -844,8 +849,8 @@ const serviceSchemas = {
         fields: [
             { name: 'smtp_host', label: 'SMTP Server', type: 'text', required: true, placeholder: 'smtp.gmail.com', width: 'col-md-4' },
             { name: 'smtp_port', label: 'Port', type: 'number', placeholder: '587', width: 'col-md-2', default: '587' },
-            { name: 'smtp_user', label: 'Username', type: 'text', required: true, placeholder: 'user@gmail.com', width: 'col-md-6' },
-            { name: 'smtp_pass', label: 'Password', type: 'password', required: true, placeholder: 'App password', width: 'col-md-6' },
+            { name: 'smtp_user', label: 'Username', type: 'text', placeholder: 'user@gmail.com (optional)', width: 'col-md-6' },
+            { name: 'smtp_pass', label: 'Password', type: 'password', placeholder: 'App password (optional)', width: 'col-md-6' },
             { name: 'smtp_to', label: 'Send To', type: 'email', required: true, placeholder: 'recipient@example.com', width: 'col-md-6' },
             { name: 'smtp_from', label: 'From Address', type: 'email', placeholder: 'Same as username', width: 'col-md-6', help: 'Leave blank to use username' },
             { name: 'smtp_secure', label: 'Security', type: 'select', width: 'col-md-3', default: 'starttls', options: [
@@ -860,12 +865,13 @@ const serviceSchemas = {
             const host = f.smtp_host || '';
             const port = f.smtp_port || '587';
             const to = encodeURIComponent(f.smtp_to || '');
-            const from = encodeURIComponent(f.smtp_from || f.smtp_user || '');
+            const from = encodeURIComponent(f.smtp_from || f.smtp_user || f.smtp_to || '');
             let mode = '';
             if (f.smtp_secure === 'ssl') mode = 'mailtos';
             else if (f.smtp_secure === 'none') mode = 'mailto';
             else mode = 'mailto'; // starttls is default
-            return `${mode}://${user}:${pass}@${host}:${port}?to=${to}&from=${from}`;
+            const auth = (f.smtp_user || f.smtp_pass) ? `${user}:${pass}@` : '';
+            return `${mode}://${auth}${host}:${port}?to=${to}&from=${from}`;
         }
     },
     discord: {
@@ -1126,7 +1132,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
         <i class="bi bi-clipboard-check me-1"></i> Backup Templates
     </div>
     <div class="card-body">
-        <p class="text-muted small mb-3">Templates pre-fill directories and excludes when creating backup plans. Select a template to auto-populate the form.</p>
+        <p class="text-muted small mb-3">Templates pre-fill directories, excludes, and borg options when creating backup plans. Select a template to auto-populate the form.</p>
 
         <?php if (!empty($templates)): ?>
         <div class="table-responsive mb-4">
@@ -1137,6 +1143,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
                         <th>Description</th>
                         <th>Directories</th>
                         <th>Excludes</th>
+                        <th>Options</th>
                         <th></th>
                     </tr>
                 </thead>
@@ -1147,6 +1154,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
                         <td class="small text-muted"><?= htmlspecialchars($tpl['description'] ?? '') ?></td>
                         <td><code class="small"><?= htmlspecialchars(str_replace("\n", ', ', $tpl['directories'])) ?></code></td>
                         <td><code class="small"><?= htmlspecialchars(str_replace("\n", ', ', $tpl['excludes'] ?? '')) ?></code></td>
+                        <td><code class="small"><?= htmlspecialchars($tpl['advanced_options'] ?? '') ?></code></td>
                         <td class="text-nowrap">
                             <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#edit-tpl-<?= $tpl['id'] ?>">
                                 <i class="bi bi-pencil"></i>
@@ -1157,24 +1165,76 @@ function updateBuiltUrl(containerId, schema, prefix) {
                             </form>
                         </td>
                     </tr>
+                    <?php
+                        $editAdv = $tpl['advanced_options'] ?? '';
+                        $editHasComp = (bool)preg_match('/--compression\s+(\S+)/', $editAdv, $editCompMatch);
+                        $editCompSpec = $editHasComp ? $editCompMatch[1] : 'lz4';
+                    ?>
                     <tr class="collapse" id="edit-tpl-<?= $tpl['id'] ?>">
-                        <td colspan="5">
-                            <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/edit" class="p-2">
+                        <td colspan="6">
+                            <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/edit" class="p-2 tpl-form">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                                <div class="row g-2">
+                                <div class="row g-2 mb-2">
                                     <div class="col-md-3">
+                                        <label class="form-label small text-muted mb-0">Name</label>
                                         <input type="text" class="form-control form-control-sm" name="name" value="<?= htmlspecialchars($tpl['name']) ?>" required>
                                     </div>
                                     <div class="col-md-3">
+                                        <label class="form-label small text-muted mb-0">Description</label>
                                         <input type="text" class="form-control form-control-sm" name="description" value="<?= htmlspecialchars($tpl['description'] ?? '') ?>" placeholder="Description">
                                     </div>
-                                    <div class="col-md-2">
+                                    <div class="col-md-3">
+                                        <label class="form-label small text-muted mb-0">Directories</label>
                                         <textarea class="form-control form-control-sm" name="directories" rows="3" required placeholder="One per line"><?= htmlspecialchars($tpl['directories']) ?></textarea>
                                     </div>
-                                    <div class="col-md-2">
+                                    <div class="col-md-3">
+                                        <label class="form-label small text-muted mb-0">Excludes</label>
                                         <textarea class="form-control form-control-sm" name="excludes" rows="3" placeholder="One per line"><?= htmlspecialchars($tpl['excludes'] ?? '') ?></textarea>
                                     </div>
-                                    <div class="col-md-2 d-flex align-items-start">
+                                </div>
+                                <div class="row g-2 mb-2">
+                                    <div class="col-md-6">
+                                        <label class="form-label small text-muted mb-0">Borg Options</label>
+                                        <div class="d-flex flex-wrap gap-3">
+                                            <div class="form-check form-check-inline">
+                                                <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="compression" <?= $editHasComp ? 'checked' : '' ?>>
+                                                <label class="form-check-label small">Compression</label>
+                                            </div>
+                                            <div class="form-check form-check-inline">
+                                                <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--exclude-caches" <?= str_contains($editAdv, '--exclude-caches') ? 'checked' : '' ?>>
+                                                <label class="form-check-label small">Exclude caches</label>
+                                            </div>
+                                            <div class="form-check form-check-inline">
+                                                <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--one-file-system" <?= str_contains($editAdv, '--one-file-system') ? 'checked' : '' ?>>
+                                                <label class="form-check-label small">One file system</label>
+                                            </div>
+                                            <div class="form-check form-check-inline">
+                                                <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--noatime" <?= str_contains($editAdv, '--noatime') ? 'checked' : '' ?>>
+                                                <label class="form-check-label small">No atime</label>
+                                            </div>
+                                            <div class="form-check form-check-inline">
+                                                <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--numeric-ids" <?= str_contains($editAdv, '--numeric-ids') ? 'checked' : '' ?>>
+                                                <label class="form-check-label small">Numeric IDs</label>
+                                            </div>
+                                            <div class="form-check form-check-inline">
+                                                <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--noxattrs" <?= str_contains($editAdv, '--noxattrs') ? 'checked' : '' ?>>
+                                                <label class="form-check-label small">Skip xattrs</label>
+                                            </div>
+                                            <div class="form-check form-check-inline">
+                                                <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--noacls" <?= str_contains($editAdv, '--noacls') ? 'checked' : '' ?>>
+                                                <label class="form-check-label small">Skip ACLs</label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <label class="form-label small text-muted mb-0">Compression spec</label>
+                                        <input type="text" class="form-control form-control-sm tpl-comp-type" value="<?= htmlspecialchars($editCompSpec) ?>" placeholder="lz4">
+                                    </div>
+                                    <div class="col-md-2">
+                                        <label class="form-label small text-muted mb-0">Custom options</label>
+                                        <input type="text" class="form-control form-control-sm font-monospace tpl-adv-field" name="advanced_options" value="<?= htmlspecialchars($editAdv) ?>">
+                                    </div>
+                                    <div class="col-md-2 d-flex align-items-end">
                                         <button type="submit" class="btn btn-sm btn-primary w-100">Save</button>
                                     </div>
                                 </div>
@@ -1188,9 +1248,9 @@ function updateBuiltUrl(containerId, schema, prefix) {
         <?php endif; ?>
 
         <h6>Add Template</h6>
-        <form method="POST" action="/settings/templates/add">
+        <form method="POST" action="/settings/templates/add" class="tpl-form" id="addTplForm">
             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-            <div class="row g-3">
+            <div class="row g-3 mb-2">
                 <div class="col-md-3">
                     <label class="form-label fw-semibold">Name</label>
                     <input type="text" class="form-control" name="name" required placeholder="e.g. cPanel Server">
@@ -1199,19 +1259,229 @@ function updateBuiltUrl(containerId, schema, prefix) {
                     <label class="form-label fw-semibold">Description</label>
                     <input type="text" class="form-control" name="description" placeholder="Short description">
                 </div>
-                <div class="col-md-2">
+                <div class="col-md-3">
                     <label class="form-label fw-semibold">Directories</label>
                     <textarea class="form-control" name="directories" rows="3" required placeholder="/home&#10;/etc&#10;/var/www"></textarea>
                 </div>
-                <div class="col-md-2">
+                <div class="col-md-3">
                     <label class="form-label fw-semibold">Excludes</label>
                     <textarea class="form-control" name="excludes" rows="3" placeholder="*.tmp&#10;*.log"></textarea>
+                </div>
+            </div>
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="form-label fw-semibold">Borg Options</label>
+                    <div class="d-flex flex-wrap gap-3">
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="compression" checked>
+                            <label class="form-check-label small">Compression</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--exclude-caches" checked>
+                            <label class="form-check-label small">Exclude caches</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--one-file-system">
+                            <label class="form-check-label small">One file system</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--noatime" checked>
+                            <label class="form-check-label small">No atime</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--numeric-ids">
+                            <label class="form-check-label small">Numeric IDs</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--noxattrs">
+                            <label class="form-check-label small">Skip xattrs</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input tpl-borg-opt" type="checkbox" data-flag="--noacls">
+                            <label class="form-check-label small">Skip ACLs</label>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label fw-semibold">Compression spec</label>
+                    <input type="text" class="form-control form-control-sm tpl-comp-type" value="lz4" placeholder="lz4">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label fw-semibold">Custom options</label>
+                    <input type="text" class="form-control form-control-sm font-monospace tpl-adv-field" name="advanced_options" placeholder="e.g. --pattern ...">
                 </div>
                 <div class="col-md-2 d-flex align-items-end">
                     <button type="submit" class="btn btn-success w-100">Add Template</button>
                 </div>
             </div>
         </form>
+    </div>
+</div>
+<script>
+(function() {
+    const managedFlags = ['--compression\\s+\\S+', '--exclude-caches', '--one-file-system', '--noatime', '--numeric-ids', '--noxattrs', '--noacls'];
+    function stripManaged(val) {
+        managedFlags.forEach(f => { val = val.replace(new RegExp(f, 'g'), ''); });
+        return val.replace(/\s+/g, ' ').trim();
+    }
+    function syncTplForm(form) {
+        const advField = form.querySelector('.tpl-adv-field');
+        const compType = form.querySelector('.tpl-comp-type');
+        const checks = form.querySelectorAll('.tpl-borg-opt');
+        const custom = stripManaged(advField.value);
+        const opts = [];
+        checks.forEach(cb => {
+            if (!cb.checked) return;
+            if (cb.dataset.flag === 'compression') {
+                if (compType.value.trim()) opts.push('--compression ' + compType.value.trim());
+            } else {
+                opts.push(cb.dataset.flag);
+            }
+        });
+        advField.value = [opts.join(' '), custom].filter(Boolean).join(' ');
+    }
+    document.querySelectorAll('.tpl-form').forEach(form => {
+        form.querySelectorAll('.tpl-borg-opt').forEach(cb => cb.addEventListener('change', () => syncTplForm(form)));
+        const compType = form.querySelector('.tpl-comp-type');
+        if (compType) compType.addEventListener('input', () => syncTplForm(form));
+        form.addEventListener('submit', () => syncTplForm(form));
+        syncTplForm(form);
+    });
+})();
+</script>
+<?php endif; ?>
+
+<!-- API Tab -->
+<?php if ($activeTab === 'api'): ?>
+<div class="card border-0 shadow-sm">
+    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+        <i class="bi bi-key me-1"></i> API Tokens
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-3">API tokens allow automated access to the BBS provisioning API. Tokens have full admin access. Keep them secret.</p>
+
+        <?php if (!empty($_SESSION['new_api_token'])): ?>
+        <div class="alert alert-success d-flex align-items-center mb-3">
+            <i class="bi bi-shield-check me-2 fs-5"></i>
+            <div class="flex-grow-1">
+                <strong>New API Token</strong> — copy it now, it will not be shown again:
+                <div class="mt-1">
+                    <code id="newTokenValue" class="user-select-all fs-6"><?= htmlspecialchars($_SESSION['new_api_token']) ?></code>
+                    <button type="button" class="btn btn-sm btn-outline-success ms-2" onclick="navigator.clipboard.writeText(document.getElementById('newTokenValue').textContent).then(() => { this.innerHTML = '<i class=\'bi bi-check\'></i> Copied'; })">
+                        <i class="bi bi-clipboard"></i> Copy
+                    </button>
+                </div>
+            </div>
+        </div>
+        <?php unset($_SESSION['new_api_token']); ?>
+        <?php endif; ?>
+
+        <?php if (!empty($apiTokens)): ?>
+        <div class="table-responsive mb-4">
+            <table class="table table-hover">
+                <thead class="table-light">
+                    <tr>
+                        <th>Name</th>
+                        <th>User</th>
+                        <th>Created</th>
+                        <th>Last Used</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($apiTokens as $token): ?>
+                    <tr>
+                        <td class="fw-semibold"><i class="bi bi-key me-1 text-muted"></i><?= htmlspecialchars($token['name']) ?></td>
+                        <td class="small text-muted"><?= htmlspecialchars($token['username']) ?></td>
+                        <td class="small text-muted"><?= \BBS\Core\TimeHelper::format($token['created_at'], 'M j, Y') ?></td>
+                        <td class="small text-muted"><?= $token['last_used_at'] ? \BBS\Core\TimeHelper::format($token['last_used_at'], 'M j, Y g:i A') : '<span class="text-muted">never</span>' ?></td>
+                        <td>
+                            <form method="POST" action="/settings/api/tokens/<?= $token['id'] ?>/revoke" class="d-inline" data-confirm="Revoke API token &quot;<?= htmlspecialchars($token['name']) ?>&quot;? Any automation using this token will stop working." data-confirm-danger>
+                                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-circle me-1"></i>Revoke</button>
+                            </form>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+
+        <h6>Create Token</h6>
+        <form method="POST" action="/settings/api/tokens/create">
+            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+            <div class="row g-3 align-items-end">
+                <div class="col-md-4">
+                    <label class="form-label fw-semibold">Token Name</label>
+                    <input type="text" class="form-control" name="name" required placeholder="e.g. ansible-provisioner">
+                </div>
+                <div class="col-md-2">
+                    <button type="submit" class="btn btn-success w-100"><i class="bi bi-plus-circle me-1"></i>Create Token</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card border-0 shadow-sm mt-4">
+    <div class="card-header bg-body fw-semibold">
+        <i class="bi bi-book me-1"></i> API Reference
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-3">Use your API token with the <code>Authorization: Bearer &lt;token&gt;</code> header. All endpoints accept and return JSON.</p>
+
+        <table class="table table-sm small mb-0">
+            <thead class="table-light">
+                <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients</code></td><td>List all clients</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients</code></td><td>Create a client (returns api_key for agent install)</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}</code></td><td>Get client details with repos &amp; plans</td></tr>
+                <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}</code></td><td>Delete a client</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/repositories</code></td><td>List repositories</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/repositories</code></td><td>Create a repository</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>List backup plans</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>Create a backup plan (with optional plugin configs)</td></tr>
+                <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/clients/{id}/repositories/{repo_id}</code></td><td>Rename a repository</td></tr>
+                <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}/repositories/{repo_id}</code></td><td>Delete a repository</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Backup Plans</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>List backup plans</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>Create a backup plan</td></tr>
+                <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}</code></td><td>Edit plan, schedule, plugins</td></tr>
+                <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}</code></td><td>Delete a plan</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}/pause</code></td><td>Pause schedule</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}/resume</code></td><td>Resume schedule</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}/trigger</code></td><td>Run backup now</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Jobs &amp; Queue</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/jobs</code></td><td>Backup history (paginated)</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/jobs/{job_id}</code></td><td>Job detail with output</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/queue</code></td><td>Global queue (all active jobs)</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Plugins</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/plugins</code></td><td>List available plugins</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/plugins/schema</code></td><td>Get plugin field schemas</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/plugin-configs</code></td><td>List plugin configs for a client</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plugin-configs</code></td><td>Create a plugin config</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Storage</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/storage</code></td><td>List local &amp; remote SSH storage locations</td></tr>
+            </tbody>
+        </table>
+
+        <div class="mt-3">
+            <p class="small text-muted mb-1"><strong>Example: Create a client</strong></p>
+            <pre class="bg-body-secondary p-2 rounded small mb-0"><code>curl -X POST https://your-server/api/v1/clients \
+  -H "Authorization: Bearer bbs_tok_..." \
+  -H "Content-Type: application/json" \
+  -d '{"name": "web-server-01"}'</code></pre>
+        </div>
+
+        <div class="mt-3">
+            <p class="small text-muted mb-1"><strong>CLI token management</strong></p>
+            <pre class="bg-body-secondary p-2 rounded small mb-0"><code>sudo /var/www/bbs/bin/bbs-token create --name "ansible"
+sudo /var/www/bbs/bin/bbs-token list
+sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
+        </div>
     </div>
 </div>
 <?php endif; ?>

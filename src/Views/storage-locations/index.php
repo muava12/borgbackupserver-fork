@@ -73,6 +73,43 @@ $section = $_GET['section'] ?? '';
                         <div class="form-text">Repos sync to: <code>bucket/prefix/agent-name/repo-name/</code></div>
                     </div>
 
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Storage Class</label>
+                        <select class="form-select" name="s3_storage_class">
+                            <?php $sc = $settings['s3_storage_class'] ?? ''; ?>
+                            <option value="" <?= $sc === '' ? 'selected' : '' ?>>Default (provider default)</option>
+                            <option value="STANDARD" <?= $sc === 'STANDARD' ? 'selected' : '' ?>>Standard</option>
+                            <option value="STANDARD_IA" <?= $sc === 'STANDARD_IA' ? 'selected' : '' ?>>Standard-IA (Infrequent Access)</option>
+                            <option value="ONEZONE_IA" <?= $sc === 'ONEZONE_IA' ? 'selected' : '' ?>>One Zone-IA</option>
+                            <option value="INTELLIGENT_TIERING" <?= $sc === 'INTELLIGENT_TIERING' ? 'selected' : '' ?>>Intelligent-Tiering</option>
+                            <option value="GLACIER_IR" <?= $sc === 'GLACIER_IR' ? 'selected' : '' ?>>Glacier Instant Retrieval</option>
+                            <option value="DEEP_ARCHIVE" <?= $sc === 'DEEP_ARCHIVE' ? 'selected' : '' ?>>Glacier Deep Archive</option>
+                        </select>
+                        <div class="form-text">Not all providers support all classes. Wasabi and B2 ignore this setting.</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Server-Side Encryption</label>
+                        <select class="form-select" name="s3_sse_mode" id="s3SseMode">
+                            <?php $sse = $settings['s3_sse_mode'] ?? ''; ?>
+                            <option value="" <?= $sse === '' ? 'selected' : '' ?>>None</option>
+                            <option value="AES256" <?= $sse === 'AES256' ? 'selected' : '' ?>>AES-256 (SSE-S3)</option>
+                            <option value="aws:kms" <?= $sse === 'aws:kms' ? 'selected' : '' ?>>AWS KMS (SSE-KMS)</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-3" id="s3KmsKeyWrap" style="<?= $sse === 'aws:kms' ? '' : 'display:none;' ?>">
+                        <label class="form-label fw-semibold">KMS Key ID</label>
+                        <input type="text" class="form-control" name="s3_sse_kms_key_id" value="<?= htmlspecialchars($settings['s3_sse_kms_key_id'] ?? '') ?>" placeholder="arn:aws:kms:region:account:key/key-id">
+                        <div class="form-text">Required when using AWS KMS encryption. Leave empty for the default KMS key.</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Bandwidth Limit</label>
+                        <input type="text" class="form-control" name="s3_bandwidth_limit" value="<?= htmlspecialchars($settings['s3_bandwidth_limit'] ?? '') ?>" placeholder="e.g. 50M for 50 MB/s">
+                        <div class="form-text">Limits upload speed. Examples: 50M (50 MB/s), 10M, 1G. Leave empty for unlimited.</div>
+                    </div>
+
                     <hr>
                     <div class="form-check mb-3">
                         <input type="hidden" name="s3_sync_server_backups" value="0">
@@ -121,6 +158,11 @@ $section = $_GET['section'] ?? '';
 </form>
 
 <script>
+// KMS key field visibility
+document.getElementById('s3SseMode')?.addEventListener('change', function() {
+    document.getElementById('s3KmsKeyWrap').style.display = this.value === 'aws:kms' ? '' : 'none';
+});
+
 document.getElementById('btnTestS3')?.addEventListener('click', function() {
     var btn = this;
     var result = document.getElementById('s3TestResult');
@@ -1001,32 +1043,15 @@ function applyRemotePreset(select, form) {
                         </h6>
                         <code class="small text-muted"><?= htmlspecialchars($loc['path']) ?></code>
                     </div>
-                    <div class="dropdown">
-                        <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="dropdown">
-                            <i class="bi bi-three-dots-vertical"></i>
+                    <?php if (!$loc['is_default'] && $loc['repo_count'] === 0): ?>
+                    <form method="POST" action="/storage-locations/<?= $loc['id'] ?>/delete"
+                          onsubmit="return confirm('Delete storage location \'<?= htmlspecialchars($loc['label'], ENT_QUOTES) ?>\'?')">
+                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                        <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete">
+                            <i class="bi bi-trash"></i>
                         </button>
-                        <ul class="dropdown-menu dropdown-menu-end">
-                            <li>
-                                <a class="dropdown-item" href="#" data-bs-toggle="collapse"
-                                   data-bs-target="#editLoc<?= $loc['id'] ?>"
-                                   onclick="event.preventDefault();">
-                                    <i class="bi bi-pencil me-1"></i> Edit
-                                </a>
-                            </li>
-                            <?php if (!$loc['is_default'] && $loc['repo_count'] === 0): ?>
-                            <li><hr class="dropdown-divider"></li>
-                            <li>
-                                <form method="POST" action="/storage-locations/<?= $loc['id'] ?>/delete"
-                                      onsubmit="return confirm('Delete storage location \'<?= htmlspecialchars($loc['label'], ENT_QUOTES) ?>\'?')">
-                                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                                    <button type="submit" class="dropdown-item text-danger">
-                                        <i class="bi bi-trash me-1"></i> Delete
-                                    </button>
-                                </form>
-                            </li>
-                            <?php endif; ?>
-                        </ul>
-                    </div>
+                    </form>
+                    <?php endif; ?>
                 </div>
 
                 <!-- Disk Usage -->
@@ -1058,36 +1083,6 @@ function applyRemotePreset(select, form) {
                 </div>
             </div>
 
-            <!-- Inline Edit Form (collapsed) -->
-            <div class="collapse" id="editLoc<?= $loc['id'] ?>">
-                <div class="card-footer bg-light">
-                    <form method="POST" action="/storage-locations/<?= $loc['id'] ?>">
-                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                        <div class="row g-2">
-                            <div class="col-md-4">
-                                <input type="text" class="form-control form-control-sm" name="label"
-                                       value="<?= htmlspecialchars($loc['label']) ?>" required>
-                            </div>
-                            <div class="col-md-4">
-                                <input type="text" class="form-control form-control-sm" name="path"
-                                       value="<?= htmlspecialchars($loc['path']) ?>" required
-                                       <?= $loc['repo_count'] > 0 ? 'readonly title="Cannot change path while repos exist"' : '' ?>>
-                            </div>
-                            <div class="col-md-2 d-flex align-items-center">
-                                <div class="form-check">
-                                    <input class="form-check-input" type="checkbox" name="is_default"
-                                           id="editDefault<?= $loc['id'] ?>"
-                                           <?= $loc['is_default'] ? 'checked' : '' ?>>
-                                    <label class="form-check-label small" for="editDefault<?= $loc['id'] ?>">Default</label>
-                                </div>
-                            </div>
-                            <div class="col-md-2 d-flex align-items-center">
-                                <button type="submit" class="btn btn-sm btn-primary w-100">Save</button>
-                            </div>
-                        </div>
-                    </form>
-                </div>
-            </div>
         </div>
     </div>
     <?php endforeach; ?>

@@ -106,7 +106,9 @@ class App
         $this->router->map('POST', '/repositories/create', 'RepositoryController@store');
         $this->router->map('POST', '/repositories/[i:id]/delete', 'RepositoryController@delete');
         $this->router->map('POST', '/repositories/[i:id]/maintenance', 'RepositoryController@maintenance');
+        $this->router->map('POST', '/repositories/[i:id]/rename', 'RepositoryController@rename');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]', 'RepositoryController@detail');
+        $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/delete', 'RepositoryController@deleteArchive');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-restore', 'RepositoryController@s3Restore');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-config', 'RepositoryController@s3Config');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-config/delete', 'RepositoryController@s3ConfigDelete');
@@ -147,6 +149,8 @@ class App
         $this->router->map('POST', '/settings/templates/add', 'SettingsController@addTemplate');
         $this->router->map('POST', '/settings/templates/[i:id]/edit', 'SettingsController@editTemplate');
         $this->router->map('POST', '/settings/templates/[i:id]/delete', 'SettingsController@deleteTemplate');
+        $this->router->map('POST', '/settings/api/tokens/create', 'SettingsController@createApiToken');
+        $this->router->map('POST', '/settings/api/tokens/[i:id]/revoke', 'SettingsController@revokeApiToken');
         $this->router->map('POST', '/settings/docker-setup', 'SettingsController@dockerSetup');
         $this->router->map('POST', '/settings/test-smtp', 'SettingsController@testSmtp');
         $this->router->map('POST', '/settings/check-update', 'SettingsController@checkUpdate');
@@ -154,7 +158,6 @@ class App
         // Storage Locations
         $this->router->map('GET', '/storage-locations', 'StorageLocationController@index');
         $this->router->map('POST', '/storage-locations', 'StorageLocationController@store');
-        $this->router->map('POST', '/storage-locations/[i:id]', 'StorageLocationController@update');
         $this->router->map('POST', '/storage-locations/[i:id]/delete', 'StorageLocationController@destroy');
         $this->router->map('POST', '/storage-locations/s3', 'StorageLocationController@saveS3');
         $this->router->map('POST', '/storage-locations/s3/test', 'StorageLocationController@testS3');
@@ -231,6 +234,32 @@ class App
         $this->router->map('GET', '/get-agent', 'Api\\AgentApiController@getAgent');
         $this->router->map('GET', '/get-agent-windows', 'Api\\AgentApiController@getAgentWindows');
 
+        // Admin API (token-authenticated)
+        $this->router->map('GET', '/api/v1/clients', 'Api\\AdminApiController@listClients');
+        $this->router->map('POST', '/api/v1/clients', 'Api\\AdminApiController@createClient');
+        $this->router->map('GET', '/api/v1/clients/[i:id]', 'Api\\AdminApiController@getClient');
+        $this->router->map('PUT', '/api/v1/clients/[i:id]', 'Api\\AdminApiController@updateClient');
+        $this->router->map('DELETE', '/api/v1/clients/[i:id]', 'Api\\AdminApiController@deleteClient');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/repositories', 'Api\\AdminApiController@listRepositories');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/repositories', 'Api\\AdminApiController@createRepository');
+        $this->router->map('PUT', '/api/v1/clients/[i:id]/repositories/[i:repoId]', 'Api\\AdminApiController@renameRepository');
+        $this->router->map('DELETE', '/api/v1/clients/[i:id]/repositories/[i:repoId]', 'Api\\AdminApiController@deleteRepository');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/plans', 'Api\\AdminApiController@listPlans');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/plans', 'Api\\AdminApiController@createPlan');
+        $this->router->map('PUT', '/api/v1/clients/[i:id]/plans/[i:planId]', 'Api\\AdminApiController@updatePlan');
+        $this->router->map('DELETE', '/api/v1/clients/[i:id]/plans/[i:planId]', 'Api\\AdminApiController@deletePlan');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/plans/[i:planId]/pause', 'Api\\AdminApiController@pausePlan');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/plans/[i:planId]/resume', 'Api\\AdminApiController@resumePlan');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/plans/[i:planId]/trigger', 'Api\\AdminApiController@triggerPlan');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/jobs', 'Api\\AdminApiController@listJobs');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/jobs/[i:jobId]', 'Api\\AdminApiController@getJob');
+        $this->router->map('GET', '/api/v1/queue', 'Api\\AdminApiController@getQueue');
+        $this->router->map('GET', '/api/v1/plugins', 'Api\\AdminApiController@listPlugins');
+        $this->router->map('GET', '/api/v1/plugins/schema', 'Api\\AdminApiController@getPluginSchema');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/plugin-configs', 'Api\\AdminApiController@listPluginConfigs');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/plugin-configs', 'Api\\AdminApiController@createPluginConfig');
+        $this->router->map('GET', '/api/v1/storage', 'Api\\AdminApiController@listStorageLocations');
+
         // Catalog & Restore (client-facing)
         $this->router->map('GET', '/clients/[i:id]/catalog/[i:archive_id]', 'ClientController@catalog');
         $this->router->map('GET', '/clients/[i:id]/catalog/[i:archive_id]/tree', 'ClientController@catalogTree');
@@ -238,6 +267,7 @@ class App
         $this->router->map('POST', '/clients/[i:id]/restore', 'ClientController@restoreSubmit');
         $this->router->map('POST', '/clients/[i:id]/restore-mysql', 'ClientController@restoreMysqlSubmit');
         $this->router->map('POST', '/clients/[i:id]/restore-pg', 'ClientController@restorePgSubmit');
+        $this->router->map('POST', '/clients/[i:id]/restore-mongo', 'ClientController@restoreMongoSubmit');
         $this->router->map('GET', '/clients/[i:id]/archive/[i:archive_id]/databases', 'ClientController@archiveDatabases');
         $this->router->map('POST', '/clients/[i:id]/download', 'ClientController@download');
     }

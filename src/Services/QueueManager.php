@@ -58,7 +58,7 @@ class QueueManager
         // jobs shouldn't block the entire queue).
         $activeCount = $this->db->count('backup_jobs',
             "status IN ('sent', 'running')
-             AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'update_borg', 'update_agent')
+             AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'update_borg', 'update_agent')
              AND agent_id IN (SELECT id FROM agents WHERE status = 'online')"
         );
 
@@ -109,14 +109,14 @@ class QueueManager
         $promoted = [];
         $promotedCount = 0;
 
-        $serverSideTypes = ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full'];
+        $serverSideTypes = ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete'];
         $managementTypes = ['update_borg', 'update_agent'];
 
         // Get agents that currently have a backup/restore running (for management task gating)
         $busyAgents = $this->db->fetchAll(
             "SELECT DISTINCT agent_id FROM backup_jobs
              WHERE status IN ('sent', 'running')
-               AND task_type IN ('backup', 'restore', 'restore_mysql', 'restore_pg')"
+               AND task_type IN ('backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo')"
         );
         $busyAgentIds = array_column($busyAgents, 'agent_id');
 
@@ -253,7 +253,7 @@ class QueueManager
                         'message' => "Plugins: " . implode(', ', $pluginSlugs),
                     ]);
                 }
-            } elseif (in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full'])) {
+            } elseif (in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete'])) {
                 // Server-side jobs — mark as sent, scheduler will execute them
                 $taskPayload = ['task' => $job['task_type'], 'server_side' => true, 'job_id' => $job['id']];
             } elseif ($job['task_type'] === 'restore') {
@@ -262,6 +262,8 @@ class QueueManager
                 $taskPayload = $this->buildRestoreMysqlPayload($job);
             } elseif ($job['task_type'] === 'restore_pg') {
                 $taskPayload = $this->buildRestorePgPayload($job);
+            } elseif ($job['task_type'] === 'restore_mongo') {
+                $taskPayload = $this->buildRestoreMongoPayload($job);
             } elseif ($job['task_type'] === 'update_borg') {
                 $taskPayload = $this->buildBorgUpdatePayload($job);
             } elseif ($job['task_type'] === 'update_agent') {
@@ -406,6 +408,16 @@ class QueueManager
                 if ($payload) {
                     $tasks[] = $payload;
                 }
+            } elseif ($job['task_type'] === 'restore_pg') {
+                $payload = $this->buildRestorePgPayload($job);
+                if ($payload) {
+                    $tasks[] = $payload;
+                }
+            } elseif ($job['task_type'] === 'restore_mongo') {
+                $payload = $this->buildRestoreMongoPayload($job);
+                if ($payload) {
+                    $tasks[] = $payload;
+                }
             } elseif ($job['task_type'] === 'update_borg') {
                 $tasks[] = $this->buildBorgUpdatePayload($job);
             } elseif ($job['task_type'] === 'update_agent') {
@@ -448,7 +460,7 @@ class QueueManager
             LEFT JOIN agents a ON a.id = bj.agent_id
             LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
             WHERE bj.status = 'sent'
-              AND bj.task_type IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full')
+              AND bj.task_type IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
             ORDER BY bj.queued_at ASC
         ");
     }
@@ -581,10 +593,23 @@ class QueueManager
 
         $dumpDir = $mysqlConfig['dump_dir'] ?? '/home/bbs/mysql';
 
-        // Build borg extract command: extract the dump_dir from the archive
+        // Build borg extract command: extract only the specific dump file(s) needed
         $repo = ['path' => $archive['repo_path'], 'passphrase_encrypted' => $archive['passphrase_encrypted']];
-        $extractPath = ltrim($dumpDir, '/');
-        $cmd = BorgCommandBuilder::buildExtractCommand($repo, $archive['archive_name'], [$extractPath]);
+        $extractPaths = [];
+        $basePath = ltrim($dumpDir, '/');
+        if ($perDatabase && !empty($databases)) {
+            foreach ($databases as $db) {
+                $dbName = $db['database'] ?? '';
+                if (empty($dbName)) continue;
+                $ext = $compress ? '.sql.gz' : '.sql';
+                $extractPaths[] = $basePath . '/' . $dbName . $ext;
+            }
+        }
+        // Fallback to full directory if non-per-database or no specific DBs
+        if (empty($extractPaths)) {
+            $extractPaths[] = $basePath;
+        }
+        $cmd = BorgCommandBuilder::buildExtractCommand($repo, $archive['archive_name'], $extractPaths);
 
         // Handle remote SSH repos
         $remoteSshConfig = null;
@@ -683,9 +708,23 @@ class QueueManager
 
         $dumpDir = $pgConfig['dump_dir'] ?? '/home/bbs/pgdump';
 
+        // Build borg extract command targeting only the specific dump file(s) needed
         $repo = ['path' => $archive['repo_path'], 'passphrase_encrypted' => $archive['passphrase_encrypted']];
-        $extractPath = ltrim($dumpDir, '/');
-        $cmd = BorgCommandBuilder::buildExtractCommand($repo, $archive['archive_name'], [$extractPath]);
+        $extractPaths = [];
+        $basePath = ltrim($dumpDir, '/');
+        $perDatabase = $dbInfo['per_database'] ?? true;
+        if ($perDatabase && !empty($databases)) {
+            foreach ($databases as $db) {
+                $dbName = $db['database'] ?? '';
+                if (empty($dbName)) continue;
+                $ext = $compress ? '.sql.gz' : '.sql';
+                $extractPaths[] = $basePath . '/' . $dbName . $ext;
+            }
+        }
+        if (empty($extractPaths)) {
+            $extractPaths[] = $basePath;
+        }
+        $cmd = BorgCommandBuilder::buildExtractCommand($repo, $archive['archive_name'], $extractPaths);
 
         // Handle remote SSH repos
         $remoteSshConfig = null;
@@ -711,6 +750,120 @@ class QueueManager
                 'port' => $pgConfig['port'] ?? 5432,
                 'user' => $pgConfig['user'] ?? '',
                 'password' => $pgConfig['password'] ?? '',
+                'dump_dir' => $dumpDir,
+                'compress' => $compress,
+            ],
+        ];
+
+        // Include remote SSH key for agent
+        if ($remoteSshConfig && !empty($archive['remote_ssh_key_encrypted'])) {
+            try {
+                $payload['remote_ssh_key'] = Encryption::decrypt($archive['remote_ssh_key_encrypted']);
+            } catch (\Exception $e) {
+                $payload['remote_ssh_key'] = $archive['remote_ssh_key_encrypted'];
+            }
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Build a restore_mongo task payload from a job record.
+     */
+    private function buildRestoreMongoPayload(array $job): ?array
+    {
+        $archiveId = $job['restore_archive_id'] ?? null;
+        if (!$archiveId) return null;
+
+        $archive = $this->db->fetchOne("
+            SELECT ar.archive_name, ar.databases_backed_up,
+                   r.path as repo_path, r.passphrase_encrypted,
+                   r.storage_type, r.remote_ssh_config_id,
+                   rsc.remote_port, rsc.ssh_private_key_encrypted as remote_ssh_key_encrypted,
+                   rsc.borg_remote_path
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
+            WHERE ar.id = ?
+        ", [$archiveId]);
+
+        if (!$archive) return null;
+
+        $dbInfo = json_decode($archive['databases_backed_up'] ?? '{}', true) ?: [];
+        $databases = json_decode($job['restore_databases'] ?? '[]', true) ?: [];
+        $compress = $dbInfo['compress'] ?? true;
+
+        // Find mongo_dump plugin config: use specified config ID, or fall back to first available
+        $pluginManager = new PluginManager();
+        $mongoConfig = null;
+
+        if (!empty($job['plugin_config_id'])) {
+            $payload = $pluginManager->buildTestPayload((int) $job['plugin_config_id']);
+            if ($payload && $payload['slug'] === 'mongo_dump') {
+                $mongoConfig = $payload['config'];
+            }
+        }
+
+        if (!$mongoConfig) {
+            $configs = $pluginManager->getPluginConfigs($job['agent_id']);
+            foreach ($configs as $c) {
+                if ($c['slug'] === 'mongo_dump') {
+                    $configData = json_decode($c['config'] ?? '{}', true) ?: [];
+                    if (!empty($configData['password'])) {
+                        $configData['password'] = Encryption::decrypt($configData['password']);
+                    }
+                    $mongoConfig = $configData;
+                    break;
+                }
+            }
+        }
+
+        if (!$mongoConfig) return null;
+
+        $dumpDir = $mongoConfig['dump_dir'] ?? '/home/bbs/mongodump';
+
+        // Build borg extract command targeting only the specific database directories needed
+        // mongodump creates dump_dir/db_name/ directories
+        $repo = ['path' => $archive['repo_path'], 'passphrase_encrypted' => $archive['passphrase_encrypted']];
+        $extractPaths = [];
+        $basePath = ltrim($dumpDir, '/');
+        if (!empty($databases)) {
+            foreach ($databases as $db) {
+                $dbName = $db['database'] ?? '';
+                if (empty($dbName)) continue;
+                $extractPaths[] = $basePath . '/' . $dbName;
+            }
+        }
+        if (empty($extractPaths)) {
+            $extractPaths[] = $basePath;
+        }
+        $cmd = BorgCommandBuilder::buildExtractCommand($repo, $archive['archive_name'], $extractPaths);
+
+        // Handle remote SSH repos
+        $remoteSshConfig = null;
+        if (($archive['storage_type'] ?? 'local') === 'remote_ssh' && !empty($archive['remote_ssh_key_encrypted'])) {
+            $remoteSshConfig = [
+                'remote_port' => $archive['remote_port'] ?? 22,
+                'borg_remote_path' => $archive['borg_remote_path'] ?? null,
+            ];
+            $cmd = BorgCommandBuilder::appendRemotePath($cmd, $archive['borg_remote_path'] ?? null);
+        }
+
+        $env = BorgCommandBuilder::buildEnv($repo, true, $this->getSshPortForAgent($job['agent_id']), $remoteSshConfig);
+
+        $payload = [
+            'task' => 'restore_mongo',
+            'job_id' => $job['id'],
+            'command' => $cmd,
+            'env' => $env,
+            'cwd' => '/',
+            'databases' => $databases,
+            'mongo_config' => [
+                'host' => $mongoConfig['host'] ?? '127.0.0.1',
+                'port' => $mongoConfig['port'] ?? 27017,
+                'user' => $mongoConfig['user'] ?? '',
+                'password' => $mongoConfig['password'] ?? '',
+                'auth_db' => $mongoConfig['auth_db'] ?? 'admin',
                 'dump_dir' => $dumpDir,
                 'compress' => $compress,
             ],

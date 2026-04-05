@@ -21,13 +21,27 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
         <div class="d-flex justify-content-between align-items-start">
             <div>
                 <h4 class="mb-0">
-                    <i class="bi bi-archive text-primary me-2"></i><?= htmlspecialchars($repo['name']) ?>
+                    <i class="bi bi-archive text-primary me-2"></i><span id="repoNameDisplay"><?= htmlspecialchars($repo['name']) ?></span>
                     <?php if (($repo['storage_type'] ?? 'local') === 'remote_ssh'): ?>
                     <span class="badge bg-info ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd-network me-1"></i>Remote SSH</span>
                     <?php else: ?>
                     <span class="badge bg-secondary ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd me-1"></i>Local</span>
+                    <button type="button" class="btn btn-sm btn-link text-muted p-0 ms-2" id="renameToggle" title="Rename repository"><i class="bi bi-pencil"></i></button>
                     <?php endif; ?>
                 </h4>
+                <?php if (($repo['storage_type'] ?? 'local') !== 'remote_ssh'): ?>
+                <form method="POST" action="/repositories/<?= $repo['id'] ?>/rename" class="mt-2 d-none" id="renameForm">
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                    <div class="d-flex align-items-center gap-2">
+                        <input type="text" name="name" class="form-control form-control-sm" style="max-width: 300px;" value="<?= htmlspecialchars($repo['name']) ?>" required>
+                        <button type="submit" class="btn btn-sm btn-primary"<?= $activeJob ? ' disabled title="Wait for active jobs to finish"' : '' ?>>Rename</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="renameCancel">Cancel</button>
+                    </div>
+                    <?php if ($activeJob): ?>
+                    <div class="form-text text-warning"><i class="bi bi-exclamation-triangle me-1"></i>Cannot rename while jobs are running.</div>
+                    <?php endif; ?>
+                </form>
+                <?php endif; ?>
             </div>
             <?php if ($activeJob): ?>
             <span class="badge bg-info"><i class="bi bi-hourglass-split me-1"></i>Active: <?= $activeJob['task_type'] ?></span>
@@ -48,7 +62,8 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                 </div>
             </div>
             <div class="col-6 col-md-3">
-                <div class="d-flex align-items-center p-2 rounded bg-body-secondary">
+                <a href="#archives-section" class="text-decoration-none">
+                <div class="d-flex align-items-center p-2 rounded bg-body-secondary" style="cursor:pointer;">
                     <div class="stat-icon-sm bg-info bg-opacity-10 text-info rounded-2 p-2 me-2">
                         <i class="bi bi-stack"></i>
                     </div>
@@ -57,6 +72,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                         <div class="text-muted" style="font-size: 0.7rem;">Archives</div>
                     </div>
                 </div>
+                </a>
             </div>
             <div class="col-6 col-md-3">
                 <div class="d-flex align-items-center p-2 rounded bg-body-secondary">
@@ -454,6 +470,92 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
     </div>
 </div>
 
+<!-- Archives -->
+<div class="card border-0 shadow-sm mt-4" id="archives-section">
+    <div class="card-header bg-body fw-semibold d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-stack me-1"></i> Recovery Points (<?= $archiveCount ?>)</span>
+    </div>
+    <div class="card-body p-0">
+        <?php if (empty($archives)): ?>
+        <div class="p-3 text-muted small">No archives yet. Run a backup to create the first recovery point.</div>
+        <?php else: ?>
+        <div class="table-responsive">
+            <table class="table table-hover mb-0 small">
+                <thead class="table-light">
+                    <tr>
+                        <th>Archive</th>
+                        <th>Date</th>
+                        <th>Files</th>
+                        <th>Original Size</th>
+                        <th>Dedup Size</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($archives as $ar):
+                        $origLabel = $ar['original_size'] >= 1073741824 ? round($ar['original_size'] / 1073741824, 1) . ' GB'
+                            : ($ar['original_size'] >= 1048576 ? round($ar['original_size'] / 1048576, 1) . ' MB'
+                            : round($ar['original_size'] / 1024, 1) . ' KB');
+                        $dedupLabel = $ar['deduplicated_size'] >= 1073741824 ? round($ar['deduplicated_size'] / 1073741824, 1) . ' GB'
+                            : ($ar['deduplicated_size'] >= 1048576 ? round($ar['deduplicated_size'] / 1048576, 1) . ' MB'
+                            : round($ar['deduplicated_size'] / 1024, 1) . ' KB');
+                    ?>
+                    <tr>
+                        <td>
+                            <code class="small"><?= htmlspecialchars($ar['archive_name']) ?></code>
+                            <?php if (!empty($ar['databases_backed_up'])): ?>
+                            <i class="bi bi-database text-info ms-1" title="Contains database backup"></i>
+                            <?php endif; ?>
+                        </td>
+                        <td class="text-nowrap"><?= \BBS\Core\TimeHelper::format($ar['created_at'], 'M j, Y g:i A') ?></td>
+                        <td><?= number_format($ar['file_count']) ?></td>
+                        <td><?= $origLabel ?></td>
+                        <td><?= $dedupLabel ?></td>
+                        <td class="text-end">
+                            <button type="button" class="btn btn-sm btn-outline-danger"
+                                    data-bs-toggle="modal" data-bs-target="#deleteArchiveModal<?= $ar['id'] ?>">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+    </div>
+</div>
+
+<?php foreach ($archives as $ar): ?>
+<div class="modal fade" id="deleteArchiveModal<?= $ar['id'] ?>" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header border-danger">
+                <h5 class="modal-title text-danger"><i class="bi bi-exclamation-triangle me-2"></i>Delete Archive</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p>Are you sure you want to permanently delete this archive? This action cannot be undone.</p>
+                <table class="table table-sm small mb-0">
+                    <tr><td class="text-muted" style="width:35%;">Client</td><td class="fw-semibold"><?= htmlspecialchars($repo['agent_name'] ?? '') ?></td></tr>
+                    <tr><td class="text-muted">Repository</td><td class="fw-semibold"><?= htmlspecialchars($repo['name']) ?></td></tr>
+                    <tr><td class="text-muted">Archive</td><td><code><?= htmlspecialchars($ar['archive_name']) ?></code></td></tr>
+                    <tr><td class="text-muted">Created</td><td><?= \BBS\Core\TimeHelper::format($ar['created_at'], 'M j, Y g:i A') ?></td></tr>
+                    <tr><td class="text-muted">Files</td><td><?= number_format($ar['file_count']) ?></td></tr>
+                </table>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/archive/<?= $ar['id'] ?>/delete" class="d-inline">
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                    <button type="submit" class="btn btn-sm btn-danger"><i class="bi bi-trash me-1"></i>Delete Archive</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+<?php endforeach; ?>
+
 <!-- Danger Zone -->
 <?php if ($this->isAdmin()): ?>
 <hr class="mt-4 mb-0">
@@ -537,5 +639,23 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
         });
     }
 })();
+
+// Rename toggle
+var renameToggle = document.getElementById('renameToggle');
+var renameForm = document.getElementById('renameForm');
+var renameCancel = document.getElementById('renameCancel');
+if (renameToggle && renameForm) {
+    renameToggle.addEventListener('click', function() {
+        renameForm.classList.remove('d-none');
+        renameToggle.classList.add('d-none');
+        renameForm.querySelector('input[name="name"]').focus();
+    });
+    if (renameCancel) {
+        renameCancel.addEventListener('click', function() {
+            renameForm.classList.add('d-none');
+            renameToggle.classList.remove('d-none');
+        });
+    }
+}
 </script>
 <?php endif; ?>

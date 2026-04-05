@@ -6,12 +6,30 @@ class TimeHelper
 {
     /**
      * Format a UTC timestamp for display in the user's timezone.
+     * Automatically converts 12h format tokens to 24h if the user prefers it.
      */
     public static function format(string $utcTimestamp, string $format = 'Y-m-d H:i:s'): string
     {
         $dt = new \DateTime($utcTimestamp, new \DateTimeZone('UTC'));
         $dt->setTimezone(new \DateTimeZone(self::userTz()));
+
+        if (self::is24h()) {
+            $format = str_replace(
+                ['g:i:s A T', 'g:i:s A', 'g:i A T', 'g:i A', 'g:ia', 'g:i a'],
+                ['H:i:s T',   'H:i:s',   'H:i T',   'H:i',   'H:i',  'H:i'],
+                $format
+            );
+        }
+
         return $dt->format($format);
+    }
+
+    /**
+     * Check if user prefers 24-hour time format.
+     */
+    public static function is24h(): bool
+    {
+        return ($_SESSION['time_format'] ?? '12h') === '24h';
     }
 
     /**

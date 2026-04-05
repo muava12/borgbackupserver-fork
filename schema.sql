@@ -13,6 +13,7 @@ CREATE TABLE users (
     role ENUM('admin', 'user') NOT NULL DEFAULT 'user',
     all_clients TINYINT(1) NOT NULL DEFAULT 0,
     timezone VARCHAR(50) NOT NULL DEFAULT 'America/New_York',
+    time_format VARCHAR(3) NOT NULL DEFAULT '12h',
     theme VARCHAR(10) NOT NULL DEFAULT 'dark',
     totp_secret VARCHAR(255) DEFAULT NULL,
     totp_enabled TINYINT(1) NOT NULL DEFAULT 0,
@@ -209,7 +210,7 @@ CREATE TABLE backup_jobs (
     agent_id INT NOT NULL,
     repository_id INT DEFAULT NULL,
     source_repository_id INT DEFAULT NULL,
-    task_type ENUM('backup', 'prune', 'restore', 'restore_mysql', 'restore_pg', 'check', 'compact', 'update_borg', 'update_agent', 'plugin_test', 's3_sync', 'repo_check', 'repo_repair', 'break_lock', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full') NOT NULL DEFAULT 'backup',
+    task_type ENUM('backup', 'prune', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'check', 'compact', 'update_borg', 'update_agent', 'plugin_test', 's3_sync', 'repo_check', 'repo_repair', 'break_lock', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete') NOT NULL DEFAULT 'backup',
     plugin_config_id INT DEFAULT NULL,
     status ENUM('queued', 'sent', 'running', 'completed', 'failed', 'cancelled') NOT NULL DEFAULT 'queued',
     files_total INT DEFAULT NULL,
@@ -418,8 +419,24 @@ CREATE TABLE repository_s3_configs (
 INSERT INTO plugins (slug, name, description, plugin_type) VALUES
 ('mysql_dump', 'MySQL Backup/Restore', 'Dumps MySQL databases before each backup, storing them in the repository for easy one-click restore back to the server.', 'pre_backup'),
 ('pg_dump', 'PostgreSQL Backup/Restore', 'Dumps PostgreSQL databases before each backup, storing them in the repository for easy one-click restore back to the server.', 'pre_backup'),
+('mongo_dump', 'MongoDB Backup/Restore', 'Dumps MongoDB databases using mongodump before backup. Supports per-database dumps with optional gzip compression and automatic cleanup. Restore via mongorestore.', 'pre_backup'),
+('interworx', 'InterWorx Backup', 'Runs InterWorx control panel backups before each borg archive. Supports full, partial (web/mail/db), and structure-only backup modes for all domains.', 'pre_backup'),
 ('shell_hook', 'Shell Script Hook', 'Runs custom shell scripts on the client before and/or after backup. Useful for application quiescing, cache clearing, notifications, or custom integrations.', 'pre_backup'),
 ('s3_sync', 'S3 Offsite Sync', 'Automatic sync of repositories to any S3-compatible storage after backup and prune operations. Stores a manifest for fast restore without long borg operations.', 'post_backup');
+
+-- --------------------------------------------------------
+-- API Tokens (admin API authentication)
+-- --------------------------------------------------------
+
+CREATE TABLE api_tokens (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    token_hash VARCHAR(64) NOT NULL UNIQUE,
+    user_id INT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_used_at DATETIME DEFAULT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
 
 -- --------------------------------------------------------
 -- Backup Templates

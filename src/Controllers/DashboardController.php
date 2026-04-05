@@ -79,7 +79,7 @@ class DashboardController extends Controller
         foreach ($jobs as $job) {
             $label = match($job['task_type']) {
                 'backup' => 'Backup',
-                'restore', 'restore_mysql', 'restore_pg' => 'Restore',
+                'restore', 'restore_mysql', 'restore_pg', 'restore_mongo' => 'Restore',
                 'update_agent' => 'Agent Update',
                 'update_borg' => 'Borg Update',
                 'plugin_test' => 'Plugin Test',
@@ -194,7 +194,7 @@ class DashboardController extends Controller
         // Group task types into 3 categories
         $categoryMap = [
             'backup' => 'backups',
-            'restore' => 'restores', 'restore_mysql' => 'restores', 'restore_pg' => 'restores',
+            'restore' => 'restores', 'restore_mysql' => 'restores', 'restore_pg' => 'restores', 'restore_mongo' => 'restores',
             's3_sync' => 's3_sync',
         ];
         // Index by hour+category
@@ -216,7 +216,7 @@ class DashboardController extends Controller
             $hourKey = $hourDt->format('Y-m-d H:00');
             $localDt = clone $hourDt;
             $localDt->setTimezone($userTz);
-            $label = $localDt->format('ga');
+            $label = (($_SESSION['time_format'] ?? '12h') === '24h') ? $localDt->format('H:00') : $localDt->format('ga');
             $counts = $hourCounts[$hourKey] ?? [];
             $chartData[] = [
                 'label' => $label,

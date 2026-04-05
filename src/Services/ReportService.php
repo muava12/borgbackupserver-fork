@@ -93,7 +93,9 @@ class ReportService
             ];
         }
 
-        // Day's errors
+        // Day's errors (from the report period)
+        $dayStart = $reportDate . ' 00:00:00';
+        $dayEnd = $reportDate . ' 23:59:59';
         $errors = $this->db->fetchAll("
             SELECT sl.agent_id, sl.message, sl.created_at, a.name as agent_name
             FROM server_log sl
@@ -241,9 +243,13 @@ class ReportService
             else $offline++;
         }
 
-        $fmtTime = function (string $utc, string $format) use ($tz): string {
+        $is24h = \BBS\Core\TimeHelper::is24h();
+        $fmtTime = function (string $utc, string $format) use ($tz, $is24h): string {
             $dt = new \DateTime($utc, new \DateTimeZone('UTC'));
             $dt->setTimezone($tz);
+            if ($is24h) {
+                $format = str_replace(['g:i A T', 'g:i A', 'g:i a'], ['H:i T', 'H:i', 'H:i'], $format);
+            }
             return $dt->format($format);
         };
 

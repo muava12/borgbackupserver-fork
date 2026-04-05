@@ -174,11 +174,15 @@
 
                             <h6 class="mt-3 mb-2">Storage</h6>
                             <div class="mb-3">
-                                <label class="form-label fw-semibold">Storage Path</label>
-                                <input type="text" class="form-control" name="storage_path"
-                                       value="<?= htmlspecialchars($_SESSION['setup']['storage_path'] ?? '/var/bbs/home') ?>" required>
-                                <div class="form-text">Absolute path where agent home directories and borg repositories will be stored.
-                                    The recommended default is <code>/var/bbs/home</code>. If you have a dedicated storage volume, mount it at this path before continuing.</div>
+                                <input type="hidden" name="storage_path" value="/var/bbs/home">
+                                <div class="p-3 bg-body-secondary rounded small">
+                                    <i class="bi bi-info-circle me-1"></i>
+                                    <strong>Default storage:</strong> <code>/var/bbs/home</code> — SSH keys, agent home directories, and repositories are stored here by default.
+                                    On Docker, the MySQL database and ClickHouse data are also under <code>/var/bbs</code>.
+                                    On bare metal installs, MySQL uses its default location (<code>/var/lib/mysql</code>).
+                                    <br><br>
+                                    Ensure this partition has enough space for your backup data. To store repositories on external storage (NFS, dedicated drives, etc.), use the <strong>Storage Locations</strong> page after setup.
+                                </div>
                             </div>
 
                             <h6 class="mt-4 mb-2">Server Connection</h6>

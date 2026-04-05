@@ -296,11 +296,11 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
             <div class="card border-0 shadow-sm h-100 metric-card-blue">
                 <div class="card-body d-flex align-items-center position-relative">
                     <?php if ($nextBackup && $nextBackup['plan_id']): ?>
-                    <div class="dropdown position-absolute top-0 end-0 mt-2 me-2">
-                        <button class="btn btn-sm btn-link text-muted p-1 border-0" type="button" data-bs-toggle="dropdown">
+                    <div class="dropdown position-absolute top-0 end-0 mt-2 me-2" style="z-index:2147483647;">
+                        <button class="btn btn-sm btn-link text-muted p-1 border-0" type="button" data-bs-toggle="dropdown" data-bs-strategy="fixed">
                             <i class="bi bi-three-dots-vertical"></i>
                         </button>
-                        <ul class="dropdown-menu dropdown-menu-end">
+                        <ul class="dropdown-menu dropdown-menu-end" style="z-index:2147483647;">
                             <li>
                                 <form method="POST" action="/plans/<?= $nextBackup['plan_id'] ?>/trigger">
                                     <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -460,7 +460,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     <div class="flex-grow-1">
                         <div class="d-flex justify-content-between">
                             <span class="fw-semibold"><?= ucfirst($job['task_type']) ?></span>
-                            <small class="text-muted"><?= \BBS\Core\TimeHelper::format($job['started_at'] ?? $job['queued_at'], 'M j g:ia') ?></small>
+                            <small class="text-muted"><?= \BBS\Core\TimeHelper::format($job['completed_at'] ?? $job['started_at'] ?? $job['queued_at'], 'M j g:ia') ?></small>
                         </div>
                         <div class="small text-muted">
                             <?= htmlspecialchars($job['repo_name'] ?? '') ?>
@@ -694,7 +694,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     </script>
 
     <?php if (!empty($repositories)): ?>
-    <div id="repo-cards-grid" class="row g-3 mb-4 pb-5">
+    <div id="repo-cards-grid" class="row g-3 mb-4 pb-5" style="overflow:visible;">
         <?php foreach ($repositories as $repo):
             $s = $repo['size_bytes'];
             $sizeLabel = $s >= 1073741824 ? round($s / 1073741824, 1) . ' GB' : ($s >= 1048576 ? round($s / 1048576, 1) . ' MB' : ($s > 0 ? round($s / 1024, 1) . ' KB' : '--'));
@@ -1174,7 +1174,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
 
     <!-- Existing Plans -->
     <?php if (!empty($plans)): ?>
-    <div id="schedule-cards-grid" class="row g-3 mb-4">
+    <div id="schedule-cards-grid" class="row g-3 mb-4" style="overflow:visible;">
         <?php foreach ($plans as $plan):
             $freq = $plan['frequency'] ?? 'manual';
             $isActive = $plan['schedule_enabled'] ?? false;
@@ -1199,11 +1199,11 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         <div class="col-md-6 col-lg-4">
             <div class="card border-0 shadow-sm h-100 schedule-card" style="overflow: visible;">
                 <div class="card-body p-3 position-relative">
-                    <div class="dropdown position-absolute" style="top:8px;right:8px;z-index:10;">
-                        <button class="btn btn-sm btn-link text-muted p-1 border-0" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                    <div class="dropdown position-absolute" style="top:8px;right:8px;z-index:2147483647;">
+                        <button class="btn btn-sm btn-link text-muted p-1 border-0" type="button" data-bs-toggle="dropdown" data-bs-strategy="fixed" aria-expanded="false">
                             <i class="bi bi-three-dots-vertical"></i>
                         </button>
-                        <ul class="dropdown-menu dropdown-menu-end">
+                        <ul class="dropdown-menu dropdown-menu-end" style="z-index:2147483647;">
                             <li>
                                 <form method="POST" action="/plans/<?= $plan['id'] ?>/trigger">
                                     <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -1859,7 +1859,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             </div>
                             <div class="col">
                                 <label class="form-label small text-muted">Hours</label>
-                                <input type="number" class="form-control" name="prune_hours" value="24" min="0">
+                                <input type="number" class="form-control" name="prune_hours" value="0" min="0">
                             </div>
                             <div class="col">
                                 <label class="form-label small text-muted">Days</label>
@@ -2077,20 +2077,6 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         });
     });
 
-    // Template selector
-    const tplSelect = document.getElementById('templateSelect');
-    if (tplSelect) {
-        tplSelect.addEventListener('change', function() {
-            if (!this.value) return;
-            fetch('/api/templates/' + this.value, { credentials: 'same-origin' })
-                .then(r => r.json())
-                .then(tpl => {
-                    document.getElementById('directoriesInput').value = (tpl.directories || '').replace(/\\n/g, '\n');
-                    document.getElementById('excludesInput').value = (tpl.excludes || '').replace(/\\n/g, '\n');
-                });
-        });
-    }
-
     // Managed borg flags (checkbox-controlled)
     const managedFlags = ['--compression\\s+\\S+', '--exclude-caches', '--one-file-system', '--noatime', '--numeric-ids', '--noxattrs', '--noacls'];
     function stripManagedFlags(val) {
@@ -2139,6 +2125,44 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         syncCreateField();
 
         createForm.addEventListener('submit', syncCreateField);
+
+        // Template selector (create form)
+        const tplSelect = document.getElementById('templateSelect');
+        if (tplSelect) {
+            tplSelect.addEventListener('change', function() {
+                if (!this.value) return;
+                fetch('/api/templates/' + this.value, { credentials: 'same-origin' })
+                    .then(r => r.json())
+                    .then(tpl => {
+                        document.getElementById('directoriesInput').value = (tpl.directories || '').replace(/\\n/g, '\n');
+                        document.getElementById('excludesInput').value = (tpl.excludes || '').replace(/\\n/g, '\n');
+                        applyTemplateOptions(tpl.advanced_options || '', createForm, document.getElementById('compressionType'), advField);
+                        syncCreateField();
+                    });
+            });
+        }
+    }
+
+    // Apply template options to checkboxes and compression field
+    function applyTemplateOptions(advOpts, container, compField, advField) {
+        const opts = advOpts || '';
+        const compMatch = opts.match(/--compression\s+(\S+)/);
+        const flagMap = {
+            'opt_compression': !!compMatch,
+            'opt_exclude_caches': opts.includes('--exclude-caches'),
+            'opt_one_file_system': opts.includes('--one-file-system'),
+            'opt_noatime': opts.includes('--noatime'),
+            'opt_numeric_ids': opts.includes('--numeric-ids'),
+            'opt_no_xattrs': opts.includes('--noxattrs'),
+            'opt_no_acls': opts.includes('--noacls')
+        };
+        container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            if (cb.name in flagMap) cb.checked = flagMap[cb.name];
+        });
+        if (compMatch) compField.value = compMatch[1];
+        let custom = opts;
+        managedFlags.forEach(f => { custom = custom.replace(new RegExp(f, 'g'), ''); });
+        advField.value = custom.replace(/\s+/g, ' ').trim();
     }
 
     // Edit plan forms: sync checkboxes into the visible field
@@ -2184,6 +2208,23 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                 .then(tpl => {
                     panel.querySelector('.edit-directories').value = (tpl.directories || '').replace(/\\n/g, '\n');
                     panel.querySelector('.edit-excludes').value = (tpl.excludes || '').replace(/\\n/g, '\n');
+                    const opts = tpl.advanced_options || '';
+                    const checks = panel.querySelectorAll('.edit-borg-opt');
+                    const compMatch = opts.match(/--compression\s+(\S+)/);
+                    if (checks[0]) checks[0].checked = !!compMatch;
+                    if (checks[1]) checks[1].checked = opts.includes('--exclude-caches');
+                    if (checks[2]) checks[2].checked = opts.includes('--one-file-system');
+                    if (checks[3]) checks[3].checked = opts.includes('--noatime');
+                    if (checks[4]) checks[4].checked = opts.includes('--numeric-ids');
+                    if (checks[5]) checks[5].checked = opts.includes('--noxattrs');
+                    if (checks[6]) checks[6].checked = opts.includes('--noacls');
+                    if (compMatch) panel.querySelector('.edit-comp-type').value = compMatch[1];
+                    let custom = opts;
+                    managedFlags.forEach(f => { custom = custom.replace(new RegExp(f, 'g'), ''); });
+                    panel.querySelector('.edit-adv-field').value = custom.replace(/\s+/g, ' ').trim();
+                    // Trigger sync via checkbox change event
+                    const firstCheck = panel.querySelector('.edit-borg-opt');
+                    if (firstCheck) firstCheck.dispatchEvent(new Event('change'));
                 });
         });
     });
@@ -2214,6 +2255,8 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     $pluginLogos = [
         'mysql_dump' => '/images/mysql.png',
         'pg_dump' => '/images/postgresql.svg',
+        'mongo_dump' => '/images/mongodb.svg',
+        'interworx' => '/images/interworx-icon.png',
     ];
     $randomPass = substr(str_shuffle('abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'), 0, 20);
 
@@ -2361,14 +2404,29 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             <?php foreach ($schema as $field => $def):
                                 $val = $cfgData[$field] ?? $def['default'] ?? '';
                                 if (is_array($val)) $val = implode(', ', $val);
+                                $showWhen = $def['show_when'] ?? null;
+                                $showWhenAttr = '';
+                                if ($showWhen) {
+                                    $swField = array_key_first($showWhen);
+                                    $swValue = $showWhen[$swField];
+                                    $showWhenAttr = ' class="plugin-show-when" data-show-field="' . htmlspecialchars($swField) . '" data-show-value="' . htmlspecialchars($swValue) . '"';
+                                }
                             ?>
-                            <div class="mb-2">
+                            <div class="mb-2"<?= $showWhenAttr ?>>
                                 <?php if ($def['type'] === 'checkbox'): ?>
                                     <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[<?= $field ?>]" value="1" id="editCfg<?= $cfg['id'] ?>_<?= $field ?>" <?= $val ? 'checked' : '' ?>><label class="form-check-label small" for="editCfg<?= $cfg['id'] ?>_<?= $field ?>"><?= htmlspecialchars($def['label']) ?></label></div>
+                                <?php elseif ($def['type'] === 'select'): ?>
+                                    <label class="form-label small fw-semibold mb-1"><?= htmlspecialchars($def['label']) ?></label>
+                                    <select class="form-select form-select-sm plugin-select-trigger" name="plugin_config[<?= $field ?>]" data-field="<?= $field ?>">
+                                        <?php foreach ($def['options'] as $optVal => $optLabel): ?>
+                                        <option value="<?= htmlspecialchars($optVal) ?>" <?= $val === $optVal ? 'selected' : '' ?>><?= htmlspecialchars($optLabel) ?></option>
+                                        <?php endforeach; ?>
+                                    </select>
                                 <?php else: ?>
                                     <label class="form-label small fw-semibold mb-1"><?= htmlspecialchars($def['label']) ?></label>
                                     <input type="<?= $def['type'] === 'number' ? 'number' : 'text' ?>" class="form-control form-control-sm" name="plugin_config[<?= $field ?>]" value="<?= !empty($def['sensitive']) ? '' : htmlspecialchars($val) ?>" <?= !empty($def['sensitive']) ? 'placeholder="(unchanged if empty)"' : '' ?>>
                                 <?php endif; ?>
+                                <?php if (!empty($def['help'])): ?><div class="form-text small"><?= htmlspecialchars($def['help']) ?></div><?php endif; ?>
                             </div>
                             <?php endforeach; ?>
                         <?php endif; ?>
@@ -2456,14 +2514,29 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                     <?php foreach ($schema as $field => $def):
                                         $default = $def['default'] ?? '';
                                         $fieldVal = is_array($default) ? implode(', ', $default) : $default;
+                                        $showWhen = $def['show_when'] ?? null;
+                                        $showWhenAttr = '';
+                                        if ($showWhen) {
+                                            $swField = array_key_first($showWhen);
+                                            $swValue = $showWhen[$swField];
+                                            $showWhenAttr = ' data-show-field="' . htmlspecialchars($swField) . '" data-show-value="' . htmlspecialchars($swValue) . '"';
+                                        }
                                     ?>
-                                    <div class="mb-2">
+                                    <div class="mb-2<?= $showWhen ? ' plugin-show-when' : '' ?>"<?= $showWhenAttr ?>>
                                         <?php if ($def['type'] === 'checkbox'): ?>
                                             <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[<?= $field ?>]" value="1" id="newCfg<?= $plugin['id'] ?>_<?= $field ?>" <?= $default ? 'checked' : '' ?>><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_<?= $field ?>"><?= htmlspecialchars($def['label']) ?></label></div>
+                                        <?php elseif ($def['type'] === 'select'): ?>
+                                            <label class="form-label small fw-semibold mb-1"><?= htmlspecialchars($def['label']) ?></label>
+                                            <select class="form-select form-select-sm plugin-select-trigger" name="plugin_config[<?= $field ?>]" data-field="<?= $field ?>">
+                                                <?php foreach ($def['options'] as $optVal => $optLabel): ?>
+                                                <option value="<?= htmlspecialchars($optVal) ?>" <?= $default === $optVal ? 'selected' : '' ?>><?= htmlspecialchars($optLabel) ?></option>
+                                                <?php endforeach; ?>
+                                            </select>
                                         <?php else: ?>
                                             <label class="form-label small fw-semibold mb-1"><?= htmlspecialchars($def['label']) ?></label>
                                             <input type="<?= $def['type'] === 'number' ? 'number' : 'text' ?>" class="form-control form-control-sm" name="plugin_config[<?= $field ?>]" value="<?= htmlspecialchars($fieldVal) ?>">
                                         <?php endif; ?>
+                                        <?php if (!empty($def['help'])): ?><div class="form-text small"><?= htmlspecialchars($def['help']) ?></div><?php endif; ?>
                                     </div>
                                     <?php endforeach; ?>
                                 <?php endif; ?>
@@ -2609,20 +2682,24 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     <?php
     $mysqlPluginEnabled = false;
     $pgPluginEnabled = false;
+    $mongoPluginEnabled = false;
     $mysqlConfigs = [];
     $pgConfigs = [];
+    $mongoConfigs = [];
     foreach ($agentPlugins as $ap) {
         if ($ap['slug'] === 'mysql_dump' && $ap['agent_enabled']) $mysqlPluginEnabled = true;
         if ($ap['slug'] === 'pg_dump' && $ap['agent_enabled']) $pgPluginEnabled = true;
+        if ($ap['slug'] === 'mongo_dump' && $ap['agent_enabled']) $mongoPluginEnabled = true;
     }
     if (!empty($pluginConfigs)) {
         foreach ($pluginConfigs as $pc) {
             if ($pc['slug'] === 'mysql_dump' && $mysqlPluginEnabled) $mysqlConfigs[] = $pc;
             if ($pc['slug'] === 'pg_dump' && $pgPluginEnabled) $pgConfigs[] = $pc;
+            if ($pc['slug'] === 'mongo_dump' && $mongoPluginEnabled) $mongoConfigs[] = $pc;
         }
     }
-    $dbPluginEnabled = $mysqlPluginEnabled || $pgPluginEnabled;
-    $allDbConfigs = array_merge($mysqlConfigs, $pgConfigs);
+    $dbPluginEnabled = $mysqlPluginEnabled || $pgPluginEnabled || $mongoPluginEnabled;
+    $allDbConfigs = array_merge($mysqlConfigs, $pgConfigs, $mongoConfigs);
     $defaultDbUser = 'your_user';
     if (!empty($mysqlConfigs)) {
         $firstCfg = json_decode($mysqlConfigs[0]['config'] ?? '{}', true);
@@ -2700,6 +2777,13 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                                 <?php endforeach; ?>
                                 </optgroup>
                             <?php endif; ?>
+                            <?php if (!empty($mongoConfigs)): ?>
+                                <optgroup label="MongoDB">
+                                <?php foreach ($mongoConfigs as $mc): ?>
+                                    <option value="mongo:<?= $mc['id'] ?>"><?= htmlspecialchars($mc['name']) ?></option>
+                                <?php endforeach; ?>
+                                </optgroup>
+                            <?php endif; ?>
                         </select>
                     </div>
                 <?php endif; ?>
@@ -2729,7 +2813,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                         $dbLabel = " ({$n} " . ($n === 1 ? 'database' : 'databases') . ')';
                     ?>
                         <option value="<?= $ar['id'] ?>">
-                            <?= htmlspecialchars($ar['archive_name']) ?> (<?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?>)<?= $dbLabel ?>
+                            <?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?><?= $dbLabel ?>
                         </option>
                     <?php endforeach; ?>
                     <?php if ($currentGroup !== null) echo '</optgroup>'; ?>
@@ -2755,7 +2839,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                         endif;
                     ?>
                         <option value="<?= $ar['id'] ?>">
-                            <?= htmlspecialchars($ar['archive_name']) ?> (<?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?>)
+                            <?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?>
                         </option>
                     <?php endforeach; ?>
                     <?php if ($currentGroup !== null) echo '</optgroup>'; ?>
@@ -2946,7 +3030,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
             </div>
         </div>
 
-        <form id="db-restore-form" method="POST" action="/clients/<?= $agent['id'] ?>/restore-mysql" data-mysql-action="/clients/<?= $agent['id'] ?>/restore-mysql" data-pg-action="/clients/<?= $agent['id'] ?>/restore-pg" style="display:none;">
+        <form id="db-restore-form" method="POST" action="/clients/<?= $agent['id'] ?>/restore-mysql" data-mysql-action="/clients/<?= $agent['id'] ?>/restore-mysql" data-pg-action="/clients/<?= $agent['id'] ?>/restore-pg" data-mongo-action="/clients/<?= $agent['id'] ?>/restore-mongo" style="display:none;">
             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
             <input type="hidden" name="archive_id" id="db-restore-archive-id">
             <input type="hidden" name="plugin_config_id" id="db-restore-config-id">
@@ -2969,6 +3053,10 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
         array_combine(
             array_map(function($pc) { return 'pg:' . $pc['id']; }, $pgConfigs),
             array_map(function($pc) { $c = json_decode($pc['config'] ?? '{}', true); return $c['user'] ?? 'backup_user'; }, $pgConfigs)
+        ),
+        array_combine(
+            array_map(function($mongoc) { return 'mongo:' . $mongoc['id']; }, $mongoConfigs),
+            array_map(function($mongoc) { $c = json_decode($mongoc['config'] ?? '{}', true); return $c['user'] ?? ''; }, $mongoConfigs)
         )
     )) ?>;</script>
     <?php

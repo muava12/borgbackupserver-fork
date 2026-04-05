@@ -44,7 +44,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.18.6"
+AGENT_VERSION = "2.21.2"
 BORG_PATH = None  # Resolved in get_system_info()
 IS_WINDOWS = sys.platform == "win32"
 
@@ -1115,6 +1115,8 @@ def log_to_server(config, job_id, message, level="info"):
 PLUGIN_DISPLAY_NAMES = {
     "mysql_dump": "MySQL Dump",
     "pg_dump": "PostgreSQL Dump",
+    "mongo_dump": "MongoDB Dump",
+    "interworx": "InterWorx Backup",
     "shell_hook": "Shell Script Hook",
 }
 
@@ -1165,6 +1167,29 @@ def _plugin_summary(slug, config, result):
         total_size = sum(os.path.getsize(f) for f in dump_files if os.path.exists(f))
         size_str = _format_size(total_size)
         return "PostgreSQL dump: {} database(s) ({}) dumped to {} ({})".format(len(dump_files), ', '.join(db_names), dump_dir, size_str)
+    if slug == "mongo_dump":
+        dump_dir = result.get("dump_dir", "")
+        databases = result.get("databases", [])
+        # Calculate total size of dump directory
+        total_size = 0
+        for db_name in databases:
+            db_path = os.path.join(dump_dir, db_name)
+            if os.path.isdir(db_path):
+                for f in os.listdir(db_path):
+                    fp = os.path.join(db_path, f)
+                    if os.path.isfile(fp):
+                        total_size += os.path.getsize(fp)
+        size_str = _format_size(total_size)
+        return "MongoDB dump: {} database(s) ({}) dumped to {} ({})".format(len(databases), ', '.join(databases), dump_dir, size_str)
+    if slug == "interworx":
+        dump_dir = result.get("dump_dir", "")
+        backup_type = result.get("backup_type", "full")
+        file_count = result.get("file_count", 0)
+        dump_files = result.get("dump_files", [])
+        total_size = sum(os.path.getsize(f) for f in dump_files if os.path.exists(f))
+        size_str = _format_size(total_size)
+        type_label = {"full": "Full", "partial": "Partial", "structure_only": "Structure only"}.get(backup_type, backup_type)
+        return "InterWorx {}: {} file(s) in {} ({})".format(type_label, file_count, dump_dir, size_str)
     if slug == "shell_hook":
         parts = []
         pre = result.get("pre_script", "")
@@ -1196,22 +1221,42 @@ def _format_size(bytes_val):
     return "{:.1f} PB".format(bytes_val)
 
 
-def cleanup_plugins(plugins, plugin_results, config=None, job_id=None):
-    """Run post-backup cleanup for plugins."""
+def cleanup_plugins(plugins, plugin_results, config=None, job_id=None, backup_result="completed"):
+    """Run post-backup cleanup for plugins.
+    Shell hook post-scripts always run (to restart services stopped by pre-scripts).
+    File cleanup (dump deletion) only runs on successful backups.
+    """
     for plugin in plugins:
         slug = plugin.get("slug", "")
         cfg = plugin.get("config", {})
+
+        # Shell hook post-scripts ALWAYS run regardless of backup result
+        if slug == "shell_hook":
+            func = globals().get("cleanup_plugin_shell_hook")
+            if func:
+                try:
+                    cleanup_result = func(cfg, plugin_results.get(slug, {}))
+                    if config and job_id and cleanup_result:
+                        log_to_server(config, job_id, "Shell hook post-script: {}".format(cleanup_result))
+                except Exception as e:
+                    logger.warning("Shell hook post-script failed: {}".format(e))
+                    if config and job_id:
+                        log_to_server(config, job_id, "Shell hook post-script failed: {}".format(e), "warning")
+            continue
+
+        # Other plugin cleanup (dump file deletion) only on success
+        if backup_result != "completed":
+            continue
+
         func = globals().get("cleanup_plugin_{}".format(slug))
         if func:
             try:
-                cleanup_result = func(cfg, plugin_results.get(slug, {}))
+                func(cfg, plugin_results.get(slug, {}))
                 if config and job_id:
                     if cfg.get("cleanup_after", True):
                         dump_dir = plugin_results.get(slug, {}).get("dump_dir", "")
                         if dump_dir:
                             log_to_server(config, job_id, "Plugin cleanup: removed dump files from {}".format(dump_dir))
-                    if slug == "shell_hook" and cleanup_result:
-                        log_to_server(config, job_id, "Shell hook post-script: {}".format(cleanup_result))
             except Exception as e:
                 logger.warning("Plugin cleanup for {} failed: {}".format(slug, e))
                 if config and job_id:
@@ -1513,6 +1558,284 @@ def test_plugin_pg_dump(config):
     return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
 
 
+def _mongo_auth_args(host, port, user, password, auth_db):
+    """Build mongodump/mongorestore auth arguments. Returns list of args."""
+    args = ["--host={}".format(host), "--port={}".format(port)]
+    if user and password:
+        args.extend([
+            "--username={}".format(user),
+            "--password={}".format(password),
+            "--authenticationDatabase={}".format(auth_db),
+        ])
+    return args
+
+
+def _find_mongosh():
+    """Find mongosh or mongo shell binary."""
+    for name in ["mongosh", "mongo"]:
+        try:
+            r = subprocess.run([name, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+            if r.returncode == 0:
+                return name
+        except (FileNotFoundError, OSError):
+            continue
+    return None
+
+
+def _parse_mongo_db_list(raw_output, exclude=None):
+    """Parse mongosh JSON.stringify output to get database names.
+
+    mongosh --quiet may still emit extra lines (warnings, connection info).
+    We look for the JSON array line containing the database list.
+    """
+    import json as _json
+    if exclude is None:
+        exclude = []
+    for line in raw_output.split("\n"):
+        line = line.strip()
+        if line.startswith("["):
+            try:
+                names = _json.loads(line)
+                if isinstance(names, list):
+                    return [n for n in names if isinstance(n, str) and n not in exclude]
+            except (ValueError, TypeError):
+                continue
+    # Fallback: treat each non-empty, single-word line as a DB name
+    dbs = []
+    for line in raw_output.split("\n"):
+        name = line.strip()
+        if name and " " not in name and name not in exclude:
+            dbs.append(name)
+    if dbs:
+        return dbs
+    raise Exception("Could not parse database list from mongosh output: {}".format(raw_output[:500]))
+
+
+def execute_plugin_mongo_dump(config):
+    """Dump MongoDB databases before backup using mongodump."""
+    dump_dir = config.get("dump_dir", "/home/bbs/mongodump")
+    os.makedirs(dump_dir, exist_ok=True)
+
+    host = config.get("host", "127.0.0.1")
+    port = str(config.get("port", 27017))
+    user = config.get("user", "")
+    password = config.get("password", "")
+    auth_db = config.get("auth_db", "admin")
+    databases = config.get("databases", "*")
+    compress = config.get("compress", True)
+    exclude = config.get("exclude_databases", ["admin", "config", "local"])
+    extra_options = config.get("extra_options", "")
+
+    if isinstance(exclude, str):
+        exclude = [x.strip() for x in exclude.split(",") if x.strip()]
+
+    if isinstance(databases, str) and databases.strip() == "*":
+        # List all databases via mongosh
+        shell = _find_mongosh()
+        if not shell:
+            raise Exception("Neither mongosh nor mongo found. Install MongoDB Database Tools.")
+
+        list_cmd = [shell, "--host", host, "--port", port]
+        if user and password:
+            list_cmd.extend(["-u", user, "-p", password, "--authenticationDatabase", auth_db])
+        list_cmd.extend(["--quiet", "--eval", "JSON.stringify(db.adminCommand('listDatabases').databases.map(d => d.name))"])
+
+        result = subprocess.run(list_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if result.returncode != 0:
+            raise Exception("Failed to list databases: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
+
+        raw_output = result.stdout.decode("utf-8", errors="replace").strip()
+        databases = _parse_mongo_db_list(raw_output, exclude)
+    elif isinstance(databases, str):
+        databases = [d.strip() for d in databases.split(",") if d.strip()]
+
+    if not databases:
+        raise Exception("No databases found to dump")
+
+    dump_files = []
+    auth_args = _mongo_auth_args(host, port, user, password, auth_db)
+
+    for db in databases:
+        logger.info("Dumping MongoDB database {} to {}".format(db, dump_dir))
+
+        cmd = ["mongodump"] + auth_args + ["--db={}".format(db), "--out={}".format(dump_dir)]
+        if compress:
+            cmd.append("--gzip")
+        if extra_options:
+            cmd.extend(extra_options.split())
+
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+        if r.returncode != 0:
+            raise Exception("mongodump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
+
+        # mongodump creates dump_dir/db_name/ directory
+        db_dump_path = os.path.join(dump_dir, db)
+        dump_files.append(db_dump_path)
+
+    logger.info("MongoDB dump complete: {} database(s) in {}".format(len(databases), dump_dir))
+    return {
+        "dump_files": dump_files,
+        "dump_dir": dump_dir,
+        "databases": databases,
+        "per_database": True,
+        "compress": compress,
+    }
+
+
+def cleanup_plugin_mongo_dump(config, plugin_result):
+    """Delete MongoDB dump directories after backup if cleanup_after is enabled."""
+    if not config.get("cleanup_after", True):
+        return
+    dump_dir = plugin_result.get("dump_dir")
+    if not dump_dir or not os.path.exists(dump_dir):
+        return
+    logger.info("Cleaning up MongoDB dumps in {}".format(dump_dir))
+    databases = plugin_result.get("databases", [])
+    for db_name in databases:
+        db_path = os.path.join(dump_dir, db_name)
+        if os.path.isdir(db_path):
+            import shutil
+            shutil.rmtree(db_path, ignore_errors=True)
+
+
+def test_plugin_mongo_dump(config):
+    """Test MongoDB connectivity without dumping."""
+    host = config.get("host", "127.0.0.1")
+    port = str(config.get("port", 27017))
+    user = config.get("user", "")
+    password = config.get("password", "")
+    auth_db = config.get("auth_db", "admin")
+
+    shell = _find_mongosh()
+    if not shell:
+        raise Exception("Neither mongosh nor mongo found. Install MongoDB Database Tools.")
+
+    cmd = [shell, "--host", host, "--port", port]
+    if user and password:
+        cmd.extend(["-u", user, "-p", password, "--authenticationDatabase", auth_db])
+    cmd.extend(["--quiet", "--eval", "JSON.stringify(db.adminCommand('listDatabases').databases.map(d => d.name))"])
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+    if result.returncode != 0:
+        raise Exception("Connection failed: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
+
+    raw_output = result.stdout.decode("utf-8", errors="replace").strip()
+    dbs = _parse_mongo_db_list(raw_output)
+    return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
+
+
+def execute_plugin_interworx(config):
+    """Run InterWorx control panel backup before borg archive."""
+    output_dir = config.get("output_dir", "/chroot/home/backup/interworx")
+    os.makedirs(output_dir, exist_ok=True)
+
+    backup_type = config.get("backup_type", "full")
+    domains = config.get("domains", "all")
+    compression = str(config.get("compression", 6))
+    no_disabled = config.get("no_disabled", True)
+
+    # Build command
+    cmd = [os.path.expanduser("~iworx/bin/backup.pex")]
+    cmd.extend(["--output-dir", output_dir])
+    cmd.extend(["--tmp-dir", output_dir])
+    cmd.extend(["--compression", compression])
+
+    # Domains
+    if isinstance(domains, str):
+        domain_list = [d.strip() for d in domains.replace(",", " ").split() if d.strip()]
+    else:
+        domain_list = domains
+    cmd.extend(["--domains"] + domain_list)
+
+    # Backup type
+    if backup_type == "structure_only":
+        cmd.append("--structure-only")
+    elif backup_type == "partial":
+        opts = []
+        if config.get("include_web", True):
+            opts.append("web")
+        if config.get("include_db", True):
+            opts.append("db")
+        if config.get("include_mail", True):
+            opts.append("mail")
+        if config.get("no_logs", False):
+            opts.append("no-logs")
+        if config.get("no_stats", False):
+            opts.append("no-stats")
+        if opts:
+            cmd.extend(["--backup-options"] + opts)
+    else:
+        # Full backup
+        cmd.extend(["--backup-options", "all"])
+
+    if no_disabled:
+        cmd.append("--no-disabled")
+
+    logger.info("Running InterWorx backup: {}".format(" ".join(cmd)))
+
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=7200)
+    if r.returncode != 0:
+        stderr = r.stderr.decode("utf-8", errors="replace")
+        stdout = r.stdout.decode("utf-8", errors="replace")
+        raise Exception("InterWorx backup failed (exit {}): {}".format(r.returncode, (stderr or stdout)[:2000]))
+
+    # Count backup files created
+    backup_files = []
+    if os.path.isdir(output_dir):
+        for f in os.listdir(output_dir):
+            fp = os.path.join(output_dir, f)
+            if os.path.isfile(fp):
+                backup_files.append(fp)
+
+    logger.info("InterWorx backup complete: {} file(s) in {}".format(len(backup_files), output_dir))
+    return {
+        "dump_dir": output_dir,
+        "dump_files": backup_files,
+        "backup_type": backup_type,
+        "file_count": len(backup_files),
+    }
+
+
+def cleanup_plugin_interworx(config, plugin_result):
+    """Delete InterWorx backup files after borg archive completes."""
+    if not config.get("cleanup_after", True):
+        return
+    dump_dir = plugin_result.get("dump_dir")
+    if not dump_dir or not os.path.exists(dump_dir):
+        return
+    logger.info("Cleaning up InterWorx backups in {}".format(dump_dir))
+    for f in os.listdir(dump_dir):
+        fp = os.path.join(dump_dir, f)
+        if os.path.isfile(fp):
+            try:
+                os.unlink(fp)
+            except Exception:
+                pass
+        elif os.path.isdir(fp):
+            import shutil
+            shutil.rmtree(fp, ignore_errors=True)
+
+
+def test_plugin_interworx(config):
+    """Test InterWorx availability."""
+    backup_pex = os.path.expanduser("~iworx/bin/backup.pex")
+    if not os.path.exists(backup_pex):
+        raise Exception("InterWorx backup tool not found at {}".format(backup_pex))
+
+    # Check it's executable
+    if not os.access(backup_pex, os.X_OK):
+        raise Exception("{} exists but is not executable".format(backup_pex))
+
+    output_dir = config.get("output_dir", "/chroot/home/backup/interworx")
+    if not os.path.isdir(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            raise Exception("Cannot create output directory {}: {}".format(output_dir, e))
+
+    return "InterWorx backup tool found at {}. Output directory {} is ready.".format(backup_pex, output_dir)
+
+
 def execute_plugin_shell_hook(config):
     """Run pre-backup shell script hook."""
     pre_script = config.get("pre_script", "").strip()
@@ -1697,6 +2020,12 @@ def execute_restore_pg(config, task):
     pg_env = os.environ.copy()
     pg_env["PGPASSWORD"] = password
 
+    # Report running status immediately so the server tracks accurate start time
+    api_request(config, "/api/agent/progress", method="POST", data={
+        "job_id": job_id,
+        "output_log": "Extracting database dumps from archive...",
+    })
+
     # Step 1: Extract dump files from borg archive
     logger.info("Job #{}: Extracting PostgreSQL dumps from archive".format(job_id))
     if cwd:
@@ -1762,6 +2091,30 @@ def execute_restore_pg(config, task):
 
         try:
             psql_base = ["psql", "-h", host, "-p", port, "-U", user]
+            pg_dump_base = ["pg_dump", "-h", host, "-p", port, "-U", user]
+
+            # Safety backup: dump the current database before replacing it
+            if mode == "replace":
+                safety_file = os.path.join(dump_dir, "{}_pre_restore.sql.gz".format(target_db))
+                logger.info("Job #{}: Creating safety backup of {} to {}".format(job_id, target_db, safety_file))
+                try:
+                    dump_cmd = pg_dump_base + [target_db]
+                    dump_proc = subprocess.Popen(dump_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=pg_env)
+                    import gzip as _gzip_pg_safety
+                    with _gzip_pg_safety.open(safety_file, "wb") as sf:
+                        while True:
+                            chunk = dump_proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                            sf.write(chunk)
+                    dump_proc.wait()
+                    if dump_proc.returncode != 0:
+                        stderr_out = dump_proc.stderr.read().decode("utf-8", errors="replace")
+                        logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(job_id, target_db, stderr_out[:200]))
+                    else:
+                        logger.info("Job #{}: Safety backup saved to {}".format(job_id, safety_file))
+                except Exception as e:
+                    logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(job_id, target_db, e))
 
             # Create target database if renaming
             if mode == "rename":
@@ -1879,6 +2232,12 @@ def execute_restore_mysql(config, task):
             })
             return
 
+    # Report running status immediately so the server tracks accurate start time
+    api_request(config, "/api/agent/progress", method="POST", data={
+        "job_id": job_id,
+        "output_log": "Extracting database dumps from archive...",
+    })
+
     # Step 1: Extract dump files from borg archive
     logger.info("Job #{}: Extracting MySQL dumps from archive".format(job_id))
     if cwd:
@@ -1947,6 +2306,30 @@ def execute_restore_mysql(config, task):
 
         try:
             mysql_base = ["mysql", "--host={}".format(host), "--port={}".format(port), "--user={}".format(user), "--password={}".format(password)]
+            mysqldump_base = ["mysqldump", "--host={}".format(host), "--port={}".format(port), "--user={}".format(user), "--password={}".format(password), "--single-transaction", "--quick"]
+
+            # Safety backup: dump the current database before replacing it
+            if mode == "replace":
+                safety_file = os.path.join(dump_dir, "{}_pre_restore.sql.gz".format(target_db))
+                logger.info("Job #{}: Creating safety backup of {} to {}".format(job_id, target_db, safety_file))
+                try:
+                    dump_cmd = mysqldump_base + [target_db]
+                    dump_proc = subprocess.Popen(dump_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    import gzip as _gzip_safety
+                    with _gzip_safety.open(safety_file, "wb") as sf:
+                        while True:
+                            chunk = dump_proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                            sf.write(chunk)
+                    dump_proc.wait()
+                    if dump_proc.returncode != 0:
+                        stderr_out = dump_proc.stderr.read().decode("utf-8", errors="replace")
+                        logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(job_id, target_db, stderr_out[:200]))
+                    else:
+                        logger.info("Job #{}: Safety backup saved to {}".format(job_id, safety_file))
+                except Exception as e:
+                    logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(job_id, target_db, e))
 
             # Create target database if renaming
             if mode == "rename":
@@ -2009,6 +2392,168 @@ def execute_restore_mysql(config, task):
                 # Only import once for all_databases mode
                 imported.append("all databases (from {})".format(dump_file))
                 break
+
+            imported.append("{} -> {}".format(db_name, target_db))
+
+        except Exception as e:
+            errors.append("{}: {}".format(db_name, e))
+
+    # Report final status
+    if errors and not imported:
+        result = "failed"
+        error_log = "; ".join(errors)
+    else:
+        result = "completed"
+        error_log = "; ".join(errors) if errors else None
+
+    status_data = {
+        "job_id": job_id,
+        "result": result,
+        "files_total": total,
+        "files_processed": len(imported),
+    }
+    if error_log:
+        status_data["error_log"] = error_log[:10000]
+    if imported:
+        status_data["output_log"] = "Imported: {}".format(', '.join(imported))
+
+    report_status(config, status_data)
+
+
+def execute_restore_mongo(config, task):
+    """Restore MongoDB databases from a borg archive."""
+    job_id = task.get("job_id")
+    command = task.get("command", [])
+    if command and command[0] == "borg" and BORG_PATH:
+        command[0] = BORG_PATH
+    env_vars = task.get("env", {})
+    cwd = task.get("cwd")
+    databases = task.get("databases", [])
+    mongo_config = task.get("mongo_config", {})
+
+    host = mongo_config.get("host", "127.0.0.1")
+    port = str(mongo_config.get("port", 27017))
+    user = mongo_config.get("user", "")
+    password = mongo_config.get("password", "")
+    auth_db = mongo_config.get("auth_db", "admin")
+    compress = mongo_config.get("compress", True)
+    dump_dir = mongo_config.get("dump_dir", "/home/bbs/mongodump")
+
+    # Write temporary SSH key for remote SSH repos
+    remote_ssh_key = task.get("remote_ssh_key")
+    remote_key_path = REMOTE_KEY_PATH
+    if remote_ssh_key:
+        try:
+            normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+            with open(remote_key_path, "w") as kf:
+                kf.write(normalized_key)
+            if IS_WINDOWS:
+                _lockdown_key_windows(remote_key_path)
+            else:
+                os.chmod(remote_key_path, 0o600)
+            logger.info("Wrote temporary SSH key for remote repo")
+        except Exception as e:
+            logger.error("Failed to write remote SSH key: {}".format(e))
+            report_status(config, {
+                "job_id": job_id, "result": "failed",
+                "error_log": "Failed to write remote SSH key: {}".format(e),
+            })
+            return
+
+    # Report running status immediately so the server tracks accurate start time
+    api_request(config, "/api/agent/progress", method="POST", data={
+        "job_id": job_id,
+        "output_log": "Extracting database dumps from archive...",
+    })
+
+    # Step 1: Extract dump files from borg archive
+    logger.info("Job #{}: Extracting MongoDB dumps from archive".format(job_id))
+    if cwd:
+        os.makedirs(cwd, exist_ok=True)
+
+    env = os.environ.copy()
+    env.update(env_vars)
+
+    try:
+        proc = subprocess.run(
+            command, env=env, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=3600,
+        )
+        if proc.returncode > 1:
+            report_status(config, {
+                "job_id": job_id, "result": "failed",
+                "error_log": "borg extract failed: {}".format(proc.stderr.decode('utf-8', errors='replace')[:5000]),
+            })
+            return
+    except Exception as e:
+        report_status(config, {
+            "job_id": job_id, "result": "failed",
+            "error_log": "borg extract error: {}".format(e),
+        })
+        return
+    finally:
+        # Clean up temporary SSH key
+        if remote_ssh_key and os.path.exists(remote_key_path):
+            try:
+                os.unlink(remote_key_path)
+            except Exception:
+                pass
+
+    # Step 2: Restore each database using mongorestore
+    auth_args = _mongo_auth_args(host, port, user, password, auth_db)
+    imported = []
+    errors = []
+    total = len(databases)
+    for i, db_entry in enumerate(databases):
+        db_name = db_entry.get("database")
+        mode = db_entry.get("mode", "replace")
+        target_db = db_entry.get("target_name", "{}_copy".format(db_name)) if mode == "rename" else db_name
+
+        # mongodump creates dump_dir/db_name/ directory
+        db_dump_path = os.path.join(dump_dir, db_name)
+        if not os.path.isdir(db_dump_path):
+            errors.append("{}: dump directory not found at {}".format(db_name, db_dump_path))
+            continue
+
+        logger.info("Job #{}: Restoring {} as {} ({}/{})".format(job_id, db_name, target_db, i + 1, total))
+
+        # Report progress
+        api_request(config, "/api/agent/progress", method="POST", data={
+            "job_id": job_id,
+            "files_processed": i,
+            "files_total": total,
+            "output_log": "Restoring {} as {}...".format(db_name, target_db),
+        })
+
+        try:
+            # Safety backup: dump the current database before replacing it
+            if mode == "replace":
+                safety_path = os.path.join(dump_dir, "{}_pre_restore".format(target_db))
+                logger.info("Job #{}: Creating safety backup of {} to {}".format(job_id, target_db, safety_path))
+                try:
+                    safety_cmd = ["mongodump"] + auth_args + ["--db={}".format(target_db), "--out={}".format(dump_dir + "/_pre_restore")]
+                    if compress:
+                        safety_cmd.append("--gzip")
+                    r_safety = subprocess.run(safety_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+                    if r_safety.returncode != 0:
+                        logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(
+                            job_id, target_db, r_safety.stderr.decode("utf-8", errors="replace")[:200]))
+                    else:
+                        logger.info("Job #{}: Safety backup saved to {}/_pre_restore/{}".format(job_id, dump_dir, target_db))
+                except Exception as e:
+                    logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(job_id, target_db, e))
+
+            cmd = ["mongorestore"] + auth_args + ["--db={}".format(target_db), "--drop"]
+            if compress:
+                cmd.append("--gzip")
+            cmd.append(db_dump_path)
+
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+            if r.returncode != 0:
+                stderr = r.stderr.decode('utf-8', errors='replace')[:500]
+                errors.append("{}: restore failed: {}".format(db_name, stderr))
+                continue
 
             imported.append("{} -> {}".format(db_name, target_db))
 
@@ -2156,6 +2701,11 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     # Handle PostgreSQL database restore
     if task_type == "restore_pg":
         execute_restore_pg(config, task)
+        return
+
+    # Handle MongoDB database restore
+    if task_type == "restore_mongo":
+        execute_restore_mongo(config, task)
         return
 
     # Report running immediately so the UI shows activity
@@ -2525,14 +3075,24 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             "compress": pg_result.get("compress", True),
         }
 
+    # Report backed-up databases from mongo_dump plugin
+    if result == "completed" and task_type == "backup" and plugin_results.get("mongo_dump"):
+        mongo_result = plugin_results["mongo_dump"]
+        status_data["databases_backed_up"] = {
+            "databases": mongo_result.get("databases", []),
+            "per_database": mongo_result.get("per_database", True),
+            "compress": mongo_result.get("compress", True),
+        }
+
     # Report final status to server. For completed backups with catalog,
     # the server will detect and import the catalog file from disk.
     status_data["result"] = result
     report_status(config, status_data)
 
-    # Run post-backup plugin cleanup
-    if result == "completed" and task_type == "backup" and plugins and plugin_results:
-        cleanup_plugins(plugins, plugin_results, config, job_id)
+    # Run post-backup plugin cleanup (always run shell_hook post-scripts to
+    # restart services even if backup failed; other cleanup only on success)
+    if task_type == "backup" and plugins:
+        cleanup_plugins(plugins, plugin_results, config, job_id, backup_result=result)
 
     # Clean up temporary SSH key for remote repos
     if remote_ssh_key and os.path.exists(remote_key_path):
