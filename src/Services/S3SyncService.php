@@ -547,8 +547,9 @@ class S3SyncService
             $archiveNameById[$a['id']] = $a['archive_name'];
         }
 
-        // Stream file catalog from ClickHouse in batches
+        // Stream file catalog from ClickHouse/SQLite in batches
         $ch = \BBS\Core\ClickHouse::getInstance();
+        $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
         $agentId = (int) $agent['id'];
         fwrite($fp, '  "file_catalog": [' . "\n");
 
@@ -561,11 +562,14 @@ class S3SyncService
         $archiveIdList = array_keys($archiveNameById);
         if (!empty($archiveIdList)) {
             $idListStr = implode(',', array_map('intval', $archiveIdList));
+            $mtimeExpr = ($catalogDb instanceof \BBS\Core\ClickHouse)
+                ? "formatDateTime(mtime, '%Y-%m-%d %H:%i:%S')"
+                : "strftime('%Y-%m-%d %H:%M:%S', mtime)";
 
             do {
-                $files = $ch->fetchAll(
+                $files = $catalogDb->fetchAll(
                     "SELECT archive_id, path, file_size,
-                            formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
+                            {$mtimeExpr} as mtime
                      FROM file_catalog
                      WHERE agent_id = {$agentId}
                        AND archive_id IN ({$idListStr})
@@ -845,8 +849,9 @@ class S3SyncService
         $repo = $this->db->fetchOne("SELECT agent_id FROM repositories WHERE id = ?", [$repoId]);
         $agentId = (int) ($repo['agent_id'] ?? 0);
 
-        // Import file catalog via ClickHouse TSV upload
+        // Import file catalog via ClickHouse/SQLite TSV upload
         $ch = \BBS\Core\ClickHouse::getInstance();
+        $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
         $escape = fn(string $s) => str_replace(["\t", "\n", "\\"], ["\\t", "\\n", "\\\\"], $s);
         $fileCount = 0;
         $fileCatalog = $manifest['file_catalog'] ?? [];
@@ -868,7 +873,7 @@ class S3SyncService
 
             if ($fileCount > 0) {
                 try {
-                    $ch->insertTsv('file_catalog', $tsvFile, [
+                    $catalogDb->insertTsv('file_catalog', $tsvFile, [
                         'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'
                     ]);
                 } catch (\Exception $e) {

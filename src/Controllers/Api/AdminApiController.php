@@ -158,11 +158,17 @@ class AdminApiController extends Controller
             SshKeyManager::deleteStorage($clientDir);
         }
 
-        // Drop ClickHouse catalog data
+        // Drop catalog data (ClickHouse or SQLite fallback)
         try {
             $ch = \BBS\Core\ClickHouse::getInstance();
-            $ch->exec("ALTER TABLE file_catalog DROP PARTITION " . (int) $id);
-            $ch->exec("ALTER TABLE catalog_dirs DROP PARTITION " . (int) $id);
+            $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
+            if ($ch->isAvailable()) {
+                $ch->exec("ALTER TABLE file_catalog DROP PARTITION " . (int) $id);
+                $ch->exec("ALTER TABLE catalog_dirs DROP PARTITION " . (int) $id);
+            } elseif ($catalogDb) {
+                $catalogDb->exec("DELETE FROM file_catalog WHERE agent_id = " . (int) $id);
+                $catalogDb->exec("DELETE FROM catalog_dirs WHERE agent_id = " . (int) $id);
+            }
         } catch (\Exception $e) { /* ignore */ }
 
         $this->db->delete('agents', 'id = ?', [$id]);
