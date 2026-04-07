@@ -20,7 +20,14 @@
     <nav class="navbar navbar-expand navbar-dark topbar p-0">
         <div class="container-fluid p-0">
             <a href="/" class="navbar-brand d-flex align-items-center justify-content-center m-0 p-0 topbar-logo">
+                <?php
+                    $brandIcon = \BBS\Core\Database::getInstance()->fetchOne("SELECT `value` FROM settings WHERE `key` = 'branding_icon'");
+                    if (!empty($brandIcon['value'])):
+                ?>
+                <img src="data:image/png;base64,<?= $brandIcon['value'] ?>" alt="Logo" style="height: 36px;">
+                <?php else: ?>
                 <img src="/images/borg_icon_dark.png" alt="BBS" style="height: 36px;">
+                <?php endif; ?>
             </a>
             <span class="navbar-text fw-semibold ms-3 d-none d-sm-inline"><?= htmlspecialchars($pageTitle ?? '') ?></span>
             <span class="navbar-text fw-semibold ms-2 d-sm-none small"><?= htmlspecialchars($pageTitle ?? '') ?></span>
@@ -225,7 +232,10 @@
     <!-- Toast container -->
     <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer" style="z-index:1090;"></div>
 
-    <script>window.BBS_TIME_24H = <?= json_encode(($_SESSION['time_format'] ?? '12h') === '24h') ?>;</script>
+    <script>
+    window.BBS_TIME_24H = <?= json_encode(($_SESSION['time_format'] ?? '12h') === '24h') ?>;
+    window.BBS_TIMEZONE = <?= json_encode($_SESSION['timezone'] ?? 'America/New_York') ?>;
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
     function toggleTheme() {

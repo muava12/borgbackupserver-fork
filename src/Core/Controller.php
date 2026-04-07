@@ -20,6 +20,21 @@ class Controller
 
     protected function authView(string $template, array $data = []): void
     {
+        // Load branding and theme settings for auth pages
+        $brandingRows = $this->db->fetchAll("SELECT `key`, `value` FROM settings WHERE `key` IN ('default_theme', 'branding_login_logo', 'branding_login_theme')");
+        $brandSettings = [];
+        foreach ($brandingRows as $row) {
+            $brandSettings[$row['key']] = $row['value'];
+        }
+        if (!isset($data['defaultTheme'])) {
+            // Login theme override takes priority, then system default
+            $loginTheme = $brandSettings['branding_login_theme'] ?? 'default';
+            $data['defaultTheme'] = ($loginTheme !== 'default') ? $loginTheme : ($brandSettings['default_theme'] ?? 'dark');
+            $data['loginThemeForced'] = ($loginTheme !== 'default');
+        }
+        if (!isset($data['loginLogo'])) {
+            $data['loginLogo'] = $brandSettings['branding_login_logo'] ?? null;
+        }
         extract($data);
         $viewPath = dirname(__DIR__) . '/Views/';
         require $viewPath . 'layouts/auth.php';
@@ -59,8 +74,10 @@ class Controller
         $_SESSION['last_activity'] = time();
 
         // Force 2FA: redirect users without 2FA to profile setup
+        // Skip for OIDC users — they rely on their identity provider for auth strength
         $currentUri = $_SERVER['REQUEST_URI'] ?? '';
-        if (!str_starts_with($currentUri, '/profile') && !str_starts_with($currentUri, '/logout')) {
+        if (($_SESSION['auth_provider'] ?? 'local') !== 'oidc'
+            && !str_starts_with($currentUri, '/profile') && !str_starts_with($currentUri, '/logout')) {
             $force2fa = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'force_2fa'");
             if ($force2fa && $force2fa['value'] === '1') {
                 $user = $this->db->fetchOne("SELECT totp_enabled FROM users WHERE id = ?", [$_SESSION['user_id']]);

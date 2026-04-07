@@ -39,6 +39,16 @@ $updateAvailable = $updateService->isUpdateAvailable();
         </a>
     </li>
     <li class="nav-item">
+        <a class="nav-link <?= $activeTab === 'auth' ? 'active' : '' ?>" href="/settings?tab=auth">
+            <i class="bi bi-shield-lock me-1"></i><span class="tab-label">Authentication</span>
+        </a>
+    </li>
+    <li class="nav-item">
+        <a class="nav-link <?= $activeTab === 'branding' ? 'active' : '' ?>" href="/settings?tab=branding">
+            <i class="bi bi-palette me-1"></i><span class="tab-label">Branding</span>
+        </a>
+    </li>
+    <li class="nav-item">
         <a class="nav-link <?= $activeTab === 'api' ? 'active' : '' ?>" href="/settings?tab=api">
             <i class="bi bi-key me-1"></i><span class="tab-label">API</span>
         </a>
@@ -149,6 +159,14 @@ $updateAvailable = $updateService->isUpdateAvailable();
                         <label class="form-label fw-semibold">Session Timeout (hours)</label>
                         <input type="number" class="form-control" name="session_timeout_hours" value="<?= htmlspecialchars($settings['session_timeout_hours'] ?? '8') ?>" min="1" max="720">
                         <div class="form-text">Log out after this many hours of inactivity.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Default Theme</label>
+                        <select class="form-select" name="default_theme">
+                            <option value="dark" <?= ($settings['default_theme'] ?? 'dark') === 'dark' ? 'selected' : '' ?>>Dark</option>
+                            <option value="light" <?= ($settings['default_theme'] ?? 'dark') === 'light' ? 'selected' : '' ?>>Light</option>
+                        </select>
+                        <div class="form-text">Default theme for the login page and new users. Users can override this in their profile.</div>
                     </div>
                     <?php if (isset($_GET['debug']) && $_GET['debug'] === '1'): ?>
                     <div class="mb-0">
@@ -1348,6 +1366,246 @@ function updateBuiltUrl(containerId, schema, prefix) {
         syncTplForm(form);
     });
 })();
+</script>
+<?php endif; ?>
+
+<!-- Authentication Tab -->
+<?php if ($activeTab === 'auth'): ?>
+<div class="card border-0 shadow-sm">
+    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+        <i class="bi bi-shield-lock me-1"></i> Single Sign-On (OIDC)
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-3">Configure OpenID Connect (OIDC) to allow users to sign in with an external identity provider (Keycloak, Authentik, Azure AD, Google, Okta, etc.).</p>
+
+        <form method="POST" action="/settings/oidc">
+            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+
+            <div class="form-check form-switch mb-4">
+                <input class="form-check-input" type="checkbox" name="oidc_enabled" id="oidcEnabled" value="1" <?= ($settings['oidc_enabled'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label fw-semibold" for="oidcEnabled">Enable OIDC Single Sign-On</label>
+            </div>
+
+            <div class="row g-3 mb-3">
+                <div class="col-md-12">
+                    <label class="form-label fw-semibold">Provider URL</label>
+                    <input type="url" class="form-control" name="oidc_provider_url" value="<?= htmlspecialchars($settings['oidc_provider_url'] ?? '') ?>" placeholder="https://idp.example.com/realms/myrealm">
+                    <div class="form-text">The base URL for OpenID Connect discovery. BBS appends <code>/.well-known/openid-configuration</code> automatically.</div>
+                </div>
+            </div>
+
+            <div class="row g-3 mb-3">
+                <div class="col-md-6">
+                    <label class="form-label fw-semibold">Client ID</label>
+                    <input type="text" class="form-control" name="oidc_client_id" value="<?= htmlspecialchars($settings['oidc_client_id'] ?? '') ?>" placeholder="bbs">
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label fw-semibold">Client Secret</label>
+                    <input type="password" class="form-control" name="oidc_client_secret" placeholder="<?= !empty($settings['oidc_client_secret']) ? '(unchanged if empty)' : '' ?>">
+                    <?php if (!empty($settings['oidc_client_secret'])): ?>
+                    <div class="form-text">A value is saved. Leave empty to keep unchanged.</div>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <div class="row g-3 mb-3">
+                <div class="col-md-6">
+                    <label class="form-label fw-semibold">Button Label</label>
+                    <input type="text" class="form-control" name="oidc_button_label" value="<?= htmlspecialchars($settings['oidc_button_label'] ?? 'Login with SSO') ?>">
+                    <div class="form-text">Text shown on the SSO button on the login page.</div>
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label fw-semibold">Scopes</label>
+                    <input type="text" class="form-control" name="oidc_scopes" value="<?= htmlspecialchars($settings['oidc_scopes'] ?? 'openid email profile') ?>">
+                    <div class="form-text">Space-separated OIDC scopes. Must include <code>openid</code> and <code>email</code>.</div>
+                </div>
+            </div>
+
+            <hr>
+
+            <h6 class="mb-3">New User Handling</h6>
+            <p class="text-muted small">When an unknown user authenticates via SSO for the first time:</p>
+
+            <div class="mb-3">
+                <select class="form-select" name="oidc_new_user_policy" id="oidcNewUserPolicy">
+                    <?php $policy = $settings['oidc_new_user_policy'] ?? 'deny'; ?>
+                    <option value="deny" <?= $policy === 'deny' ? 'selected' : '' ?>>Deny access (user must already exist with matching email)</option>
+                    <option value="pending" <?= $policy === 'pending' ? 'selected' : '' ?>>Create user, pending admin approval</option>
+                    <option value="copy" <?= $policy === 'copy' ? 'selected' : '' ?>>Create user with permissions copied from a template user</option>
+                </select>
+            </div>
+
+            <div class="mb-3" id="oidcTemplateUserWrap" style="<?= $policy === 'copy' ? '' : 'display:none;' ?>">
+                <label class="form-label fw-semibold">Template User</label>
+                <select class="form-select" name="oidc_template_user_id">
+                    <option value="">-- Select a user --</option>
+                    <?php foreach ($oidcUsers ?? [] as $u): ?>
+                    <option value="<?= $u['id'] ?>" <?= ($settings['oidc_template_user_id'] ?? '') == $u['id'] ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($u['username']) ?> (<?= htmlspecialchars($u['email']) ?>) — <?= $u['role'] ?>
+                    </option>
+                    <?php endforeach; ?>
+                </select>
+                <div class="form-text">New SSO users will receive the same client access and permissions as this user.</div>
+            </div>
+
+            <hr>
+
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" name="oidc_logout_enabled" id="oidcLogout" value="1" <?= ($settings['oidc_logout_enabled'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="oidcLogout">Enable OIDC Logout</label>
+                <div class="form-text">When enabled, logging out of BBS also logs the user out of the identity provider.</div>
+            </div>
+
+            <button type="submit" class="btn btn-primary">
+                <i class="bi bi-check-lg me-1"></i> Save Authentication Settings
+            </button>
+        </form>
+    </div>
+</div>
+<script>
+document.getElementById('oidcNewUserPolicy').addEventListener('change', function() {
+    document.getElementById('oidcTemplateUserWrap').style.display = this.value === 'copy' ? '' : 'none';
+});
+</script>
+<?php endif; ?>
+
+<!-- Branding Tab -->
+<?php if ($activeTab === 'branding'): ?>
+<div class="card border-0 shadow-sm">
+    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+        <i class="bi bi-palette me-1"></i> Branding
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-4">Customize the BBS interface with your own logos. Images are stored in the database and persist across updates.</p>
+
+        <form method="POST" action="/settings/branding" enctype="multipart/form-data" id="brandingForm">
+            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+            <input type="hidden" name="branding_icon_data" id="brandingIconData">
+            <input type="hidden" name="branding_login_logo_data" id="brandingLoginLogoData">
+
+            <!-- Navbar Icon -->
+            <div class="row mb-4">
+                <div class="col-md-8">
+                    <h6><i class="bi bi-image me-1"></i> Navbar Icon</h6>
+                    <p class="text-muted small">Square transparent PNG shown in the top-left corner. Will be resized to 120x120px max.</p>
+                    <input type="file" class="form-control form-control-sm" id="iconFileInput" accept="image/png">
+                    <div class="small text-muted mt-1" id="iconDimensions"></div>
+                    <?php if (!empty($settings['branding_icon'])): ?>
+                    <div class="form-check mt-2">
+                        <input class="form-check-input" type="checkbox" name="remove_branding_icon" value="1" id="removeBrandingIcon">
+                        <label class="form-check-label small" for="removeBrandingIcon">Remove custom icon (revert to default)</label>
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <div class="col-md-4 text-center">
+                    <label class="form-label small text-muted">Preview</label>
+                    <div class="p-3 rounded <?= ($_SESSION['theme'] ?? 'dark') === 'dark' ? 'bg-dark' : 'bg-body-secondary' ?>">
+                        <img id="iconPreview" src="<?= !empty($settings['branding_icon']) ? 'data:image/png;base64,' . $settings['branding_icon'] : '/images/borg_icon_dark.png' ?>" alt="Icon preview" style="height: 36px;">
+                        <?php if (empty($settings['branding_icon'])): ?>
+                        <div class="text-muted small mt-1" id="iconDefaultLabel">Default</div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+
+            <hr>
+
+            <!-- Login Logo -->
+            <div class="row mb-4">
+                <div class="col-md-8">
+                    <h6><i class="bi bi-card-image me-1"></i> Login Page Logo</h6>
+                    <p class="text-muted small">Transparent PNG displayed on the login page. Will be resized to fit within 475 x 100 pixels.</p>
+                    <input type="file" class="form-control form-control-sm" id="loginLogoFileInput" accept="image/png">
+                    <div class="small text-muted mt-1" id="loginLogoDimensions"></div>
+                    <?php if (!empty($settings['branding_login_logo'])): ?>
+                    <div class="form-check mt-2">
+                        <input class="form-check-input" type="checkbox" name="remove_branding_login_logo" value="1" id="removeLoginLogo">
+                        <label class="form-check-label small" for="removeLoginLogo">Remove custom logo (revert to default)</label>
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <div class="col-md-4 text-center">
+                    <label class="form-label small text-muted">Preview</label>
+                    <div class="p-3 rounded <?= ($_SESSION['theme'] ?? 'dark') === 'dark' ? 'bg-dark' : 'bg-body-secondary' ?>">
+                        <img id="loginLogoPreview" src="<?= !empty($settings['branding_login_logo']) ? 'data:image/png;base64,' . $settings['branding_login_logo'] : '/images/borg_icon_dark.png' ?>" alt="Login logo preview" style="<?= !empty($settings['branding_login_logo']) ? 'max-width:300px;max-height:80px;' : 'max-width:80px;' ?>">
+                        <?php if (empty($settings['branding_login_logo'])): ?>
+                        <div class="text-muted small mt-1" id="loginLogoDefaultLabel">Default</div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+
+            <hr>
+
+            <!-- Login Page Theme -->
+            <div class="mb-4">
+                <h6><i class="bi bi-moon-stars me-1"></i> Login Page Theme</h6>
+                <p class="text-muted small">Override the login page theme independently. Useful when your logo only works well on a specific background.</p>
+                <select class="form-select" name="branding_login_theme" style="max-width: 300px;">
+                    <?php $loginTheme = $settings['branding_login_theme'] ?? 'default'; ?>
+                    <option value="default" <?= $loginTheme === 'default' ? 'selected' : '' ?>>Use Default Theme</option>
+                    <option value="dark" <?= $loginTheme === 'dark' ? 'selected' : '' ?>>Always Dark</option>
+                    <option value="light" <?= $loginTheme === 'light' ? 'selected' : '' ?>>Always Light</option>
+                </select>
+            </div>
+
+            <button type="submit" class="btn btn-primary">
+                <i class="bi bi-check-lg me-1"></i> Save Branding
+            </button>
+        </form>
+    </div>
+</div>
+<script>
+function resizeImage(file, maxW, maxH, callback) {
+    var reader = new FileReader();
+    reader.onload = function(e) {
+        var img = new Image();
+        img.onload = function() {
+            var w = img.width, h = img.height;
+            if (w <= maxW && h <= maxH) {
+                // Already within limits, use original
+                callback(e.target.result, w, h);
+                return;
+            }
+            var ratio = Math.min(maxW / w, maxH / h);
+            var nw = Math.round(w * ratio), nh = Math.round(h * ratio);
+            var canvas = document.createElement('canvas');
+            canvas.width = nw;
+            canvas.height = nh;
+            var ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, nw, nh);
+            callback(canvas.toDataURL('image/png'), nw, nh);
+        };
+        img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+}
+
+document.getElementById('iconFileInput').addEventListener('change', function() {
+    if (!this.files[0]) return;
+    resizeImage(this.files[0], 120, 120, function(dataUrl, w, h) {
+        document.getElementById('iconPreview').src = dataUrl;
+        document.getElementById('iconPreview').style.height = '36px';
+        document.getElementById('brandingIconData').value = dataUrl.split(',')[1];
+        document.getElementById('iconDimensions').textContent = 'Resized to ' + w + 'x' + h + 'px';
+        var lbl = document.getElementById('iconDefaultLabel');
+        if (lbl) lbl.style.display = 'none';
+    });
+});
+
+document.getElementById('loginLogoFileInput').addEventListener('change', function() {
+    if (!this.files[0]) return;
+    resizeImage(this.files[0], 475, 100, function(dataUrl, w, h) {
+        var preview = document.getElementById('loginLogoPreview');
+        preview.src = dataUrl;
+        preview.style.maxWidth = '300px';
+        preview.style.maxHeight = '80px';
+        document.getElementById('brandingLoginLogoData').value = dataUrl.split(',')[1];
+        document.getElementById('loginLogoDimensions').textContent = 'Resized to ' + w + 'x' + h + 'px';
+        var lbl = document.getElementById('loginLogoDefaultLabel');
+        if (lbl) lbl.style.display = 'none';
+    });
+});
 </script>
 <?php endif; ?>
 

@@ -18,6 +18,8 @@ class SettingsController extends Controller
 
         $templates = $this->db->fetchAll("SELECT * FROM backup_templates ORDER BY name");
 
+        $oidcUsers = $this->db->fetchAll("SELECT id, username, email, role FROM users ORDER BY username");
+
         $apiTokens = $this->db->fetchAll("
             SELECT t.id, t.name, t.created_at, t.last_used_at, u.username
             FROM api_tokens t
@@ -30,6 +32,7 @@ class SettingsController extends Controller
             'settings' => $settings,
             'templates' => $templates,
             'apiTokens' => $apiTokens,
+            'oidcUsers' => $oidcUsers,
         ]);
     }
 
@@ -87,7 +90,7 @@ class SettingsController extends Controller
         $this->requireAdmin();
         $this->verifyCsrf();
 
-        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'session_timeout_hours', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention'];
+        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'session_timeout_hours', 'default_theme', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention'];
 
         foreach ($allowed as $key) {
             if (isset($_POST[$key])) {
@@ -196,6 +199,78 @@ class SettingsController extends Controller
         $this->redirect('/settings?tab=templates');
     }
 
+    public function saveOidc(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        // Plain text settings
+        $fields = ['oidc_provider_url', 'oidc_client_id', 'oidc_button_label', 'oidc_scopes', 'oidc_new_user_policy', 'oidc_template_user_id'];
+        foreach ($fields as $key) {
+            if (isset($_POST[$key])) {
+                $this->saveSetting($key, trim($_POST[$key]));
+            }
+        }
+
+        // Checkboxes (default to 0 if not in POST)
+        $this->saveSetting('oidc_enabled', !empty($_POST['oidc_enabled']) ? '1' : '0');
+        $this->saveSetting('oidc_logout_enabled', !empty($_POST['oidc_logout_enabled']) ? '1' : '0');
+
+        // Encrypted client secret (only update if non-empty)
+        $secret = $_POST['oidc_client_secret'] ?? '';
+        if (!empty($secret)) {
+            $this->saveSetting('oidc_client_secret', \BBS\Services\Encryption::encrypt($secret));
+        }
+
+        $this->flash('success', 'Authentication settings saved.');
+        $this->redirect('/settings?tab=auth');
+    }
+
+    public function saveBranding(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $saved = [];
+
+        // Handle navbar icon
+        if (!empty($_POST['remove_branding_icon'])) {
+            $this->db->query("DELETE FROM settings WHERE `key` = 'branding_icon'");
+            $saved[] = 'Navbar icon removed';
+        } elseif (!empty($_POST['branding_icon_data'])) {
+            $data = $_POST['branding_icon_data'];
+            // Validate it's valid base64 PNG
+            $decoded = base64_decode($data, true);
+            if ($decoded && substr($decoded, 0, 4) === "\x89PNG") {
+                $this->saveSetting('branding_icon', $data);
+                $saved[] = 'Navbar icon updated';
+            }
+        }
+
+        // Handle login logo
+        if (!empty($_POST['remove_branding_login_logo'])) {
+            $this->db->query("DELETE FROM settings WHERE `key` = 'branding_login_logo'");
+            $saved[] = 'Login logo removed';
+        } elseif (!empty($_POST['branding_login_logo_data'])) {
+            $data = $_POST['branding_login_logo_data'];
+            $decoded = base64_decode($data, true);
+            if ($decoded && substr($decoded, 0, 4) === "\x89PNG") {
+                $this->saveSetting('branding_login_logo', $data);
+                $saved[] = 'Login logo updated';
+            }
+        }
+
+        // Login page theme override
+        $loginTheme = $_POST['branding_login_theme'] ?? 'default';
+        if (in_array($loginTheme, ['default', 'dark', 'light'])) {
+            $this->saveSetting('branding_login_theme', $loginTheme);
+            $saved[] = 'Login theme updated';
+        }
+
+        $this->flash('success', !empty($saved) ? implode('. ', $saved) . '.' : 'Branding saved.');
+        $this->redirect('/settings?tab=branding');
+    }
+
     public function createApiToken(): void
     {
         $this->requireAdmin();
@@ -236,6 +311,16 @@ class SettingsController extends Controller
         $this->db->delete('api_tokens', 'id = ?', [$id]);
         $this->flash('success', 'API token revoked.');
         $this->redirect('/settings?tab=api');
+    }
+
+    private function saveSetting(string $key, string $value): void
+    {
+        $existing = $this->db->fetchOne("SELECT `key` FROM settings WHERE `key` = ?", [$key]);
+        if ($existing) {
+            $this->db->update('settings', ['value' => $value], "`key` = ?", [$key]);
+        } else {
+            $this->db->insert('settings', ['key' => $key, 'value' => $value]);
+        }
     }
 
     public function agentUpdatesJson(): void

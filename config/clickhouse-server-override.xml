@@ -9,7 +9,6 @@
         <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
         <size>10M</size>
         <count>2</count>
-        <stderr>/dev/null</stderr>
     </logger>
 
     <!-- Disable system log tables that generate heavy disk I/O when idle -->
