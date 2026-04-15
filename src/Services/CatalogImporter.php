@@ -105,10 +105,21 @@ class CatalogImporter
                 return 0;
             }
 
-            $log("Catalog TSV generated: " . number_format($count) . " rows, {$tsvSize} MB in {$tsvElapsed}s — loading into ClickHouse");
+            $log("Catalog TSV generated: " . number_format($count) . " rows, {$tsvSize} MB in {$tsvElapsed}s — loading into catalog backend");
             $updateStatus("Importing " . number_format($count) . " catalog entries...");
 
             $loadStart = microtime(true);
+
+            // Delete existing rows for this archive before inserting — makes re-import
+            // idempotent. ClickHouse deduplicates within its window anyway, but SQLite
+            // has no such mechanism and would accumulate duplicates on retry/rebuild.
+            try {
+                if ($catalogDb instanceof \BBS\Core\ClickHouse) {
+                    $catalogDb->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
+                } else {
+                    $catalogDb->exec("DELETE FROM file_catalog WHERE agent_id = {$agentId} AND archive_id = {$archiveId}");
+                }
+            } catch (\Exception $e) { /* ignore — table may be empty */ }
 
             $catalogDb->insertTsv('file_catalog', $tsvFile, [
                 'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'

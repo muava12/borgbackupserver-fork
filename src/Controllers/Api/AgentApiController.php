@@ -783,9 +783,23 @@ class AgentApiController extends Controller
 
         $agentId = (int) $agent['id'];
         $ch = \BBS\Core\ClickHouse::getInstance();
-    $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
+        $catalogDb = $ch->isAvailable() ? $ch : \BBS\Core\SQLiteCatalog::getInstance();
 
-        // Build TSV and upload to ClickHouse
+        // On the first batch of a new import run, clear any existing entries for this
+        // archive. This makes the batch-catalog endpoint idempotent on retry.
+        // SQLite has no duplicate-merge semantics like ClickHouse's dedup window,
+        // so without this, a re-sent catalog would accumulate rows.
+        if (!empty($input['first_batch'])) {
+            try {
+                if ($catalogDb instanceof \BBS\Core\ClickHouse) {
+                    $catalogDb->exec("ALTER TABLE file_catalog DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
+                } else {
+                    $catalogDb->exec("DELETE FROM file_catalog WHERE agent_id = {$agentId} AND archive_id = {$archiveId}");
+                }
+            } catch (\Exception $e) { /* ignore — table may be empty */ }
+        }
+
+        // Build TSV and upload to catalog backend (ClickHouse or SQLite)
         $escape = fn(string $s) => str_replace(["\t", "\n", "\\"], ["\\t", "\\n", "\\\\"], $s);
         $tsvFile = sys_get_temp_dir() . "/catalog_api_{$agentId}_{$archiveId}_" . getmypid() . '.tsv';
         $fh = fopen($tsvFile, 'w');
@@ -805,10 +819,10 @@ class AgentApiController extends Controller
 
             if ($batchSize > 0) {
                 try {
-                $catalogDb->insertTsv('file_catalog', $tsvFile, [
-                    'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'
-                ]);
-            } finally {
+                    $catalogDb->insertTsv('file_catalog', $tsvFile, [
+                        'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'
+                    ]);
+                } finally {
                     @unlink($tsvFile);
                 }
             } else {
@@ -823,12 +837,12 @@ class AgentApiController extends Controller
             $logJobId = $archiveRow['backup_job_id'] ?? null;
 
             $totalRow = $catalogDb->fetchOne(
-            "SELECT count() as cnt FROM file_catalog WHERE agent_id = ? AND archive_id = ?",
-            [$agentId, $archiveId]
-        );
+                "SELECT count() as cnt FROM file_catalog WHERE agent_id = ? AND archive_id = ?",
+                [$agentId, $archiveId]
+            );
             $totalIndexed = (int) ($totalRow['cnt'] ?? 0);
 
-            // Build catalog_dirs index from ClickHouse data
+            // Build catalog_dirs index
             $this->buildDirsFromCatalog($agentId, $archiveId);
 
             $this->db->insert('server_log', [
