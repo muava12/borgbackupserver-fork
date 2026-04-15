@@ -364,7 +364,7 @@ class ServerStats
             $useClickHouse = $ch->isAvailable();
 
             if ($useClickHouse) {
-                // ClickHouse path: full stats including disk usage
+                // ClickHouse path: full stats including disk usage via system.parts
                 return self::getClickHouseStatsNative($ch);
             } else {
                 // SQLite fallback: basic stats without disk/compression info
@@ -377,20 +377,31 @@ class ServerStats
 
     /**
      * Full ClickHouse stats with disk usage and compression from system.parts.
+     * Uses system.parts for row/disk counts (avoids full-table-scan uniqExact).
+     * Agent and archive counts come from MySQL (authoritative and cheap).
      */
     private static function getClickHouseStatsNative(\BBS\Core\ClickHouse $ch): ?array
     {
-        $totals = $ch->fetchOne("
-            SELECT count() AS total_rows,
-                   uniqExact(agent_id) AS agent_count,
-                   uniqExact(archive_id) AS archive_count
-            FROM file_catalog
+        // Total row count from system.parts — avoids full-table-scan uniqExact()
+        // which pegs ClickHouse at 100% CPU on catalogs with hundreds of millions of rows.
+        $rowsRow = $ch->fetchOne("
+            SELECT sum(rows) AS total_rows
+            FROM system.parts
+            WHERE database = 'bbs' AND table = 'file_catalog' AND active = 1
         ");
-        if (!$totals) return null;
+        if (!$rowsRow) return null;
 
-        $totalRows = (int) ($totals['total_rows'] ?? 0);
-        $agentCount = (int) ($totals['agent_count'] ?? 0);
-        $archiveCount = (int) ($totals['archive_count'] ?? 0);
+        $totalRows = (int) ($rowsRow['total_rows'] ?? 0);
+
+        // Agent/archive counts from MySQL (authoritative, zero ClickHouse cost)
+        $db = \BBS\Core\Database::getInstance();
+        $agentCount = (int) ($db->fetchOne("
+            SELECT COUNT(DISTINCT a.id) AS cnt
+            FROM agents a
+            JOIN repositories r ON r.agent_id = a.id
+            JOIN archives ar ON ar.repository_id = r.id
+        ")['cnt'] ?? 0);
+        $archiveCount = (int) ($db->fetchOne("SELECT COUNT(*) AS cnt FROM archives")['cnt'] ?? 0);
         $avgPerArchive = $archiveCount > 0 ? round($totalRows / $archiveCount) : 0;
 
         // Disk usage from system.parts (active parts only)
@@ -415,11 +426,12 @@ class ServerStats
             ORDER BY rows DESC
         ");
 
-        // Get archive counts per agent
-        $archivesPerAgent = $ch->fetchAll("
-            SELECT agent_id, uniqExact(archive_id) AS archives
-            FROM file_catalog
-            GROUP BY agent_id
+        // Archive counts per agent from MySQL (zero ClickHouse scan cost)
+        $archivesPerAgent = $db->fetchAll("
+            SELECT r.agent_id, COUNT(ar.id) AS archives
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            GROUP BY r.agent_id
         ");
         $archiveMap = [];
         foreach ($archivesPerAgent as $a) {

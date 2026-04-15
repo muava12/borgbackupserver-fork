@@ -465,55 +465,61 @@ class RepositoryController extends Controller
             $this->redirect("/clients/{$agentId}/repo/{$id}");
         }
 
-        // Rename on disk
+        // Rename on disk (skip if paths resolve to the same directory, e.g.
+        // fixing a display name like "/home" → "home" where the filesystem
+        // path is already correct)
         $oldLocalPath = BorgCommandBuilder::getLocalRepoPath($repo);
         if (!empty($oldLocalPath) && is_dir($oldLocalPath)) {
             $newLocalPath = dirname($oldLocalPath) . '/' . $safeName;
 
-            // Safety: validate paths are within allowed storage locations
-            $allowedPaths = array_column(
-                $this->db->fetchAll("SELECT path FROM storage_locations"),
-                'path'
-            );
-            $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-            if (!empty($storageSetting['value'])) {
-                $allowedPaths[] = $storageSetting['value'];
-            }
-
-            $pathAllowed = false;
-            $realLocal = realpath($oldLocalPath);
-            foreach ($allowedPaths as $ap) {
-                if (!empty($ap) && $realLocal && str_starts_with($realLocal, realpath($ap) ?: '')) {
-                    $pathAllowed = true;
-                    break;
+            if (realpath($oldLocalPath) === realpath($newLocalPath) || $oldLocalPath === $newLocalPath) {
+                // Same directory — just update the DB name below, no disk rename needed
+            } else {
+                // Safety: validate paths are within allowed storage locations
+                $allowedPaths = array_column(
+                    $this->db->fetchAll("SELECT path FROM storage_locations"),
+                    'path'
+                );
+                $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
+                if (!empty($storageSetting['value'])) {
+                    $allowedPaths[] = $storageSetting['value'];
                 }
-            }
 
-            if (!$pathAllowed) {
-                $this->db->insert('server_log', [
-                    'agent_id' => $agentId,
-                    'level' => 'warning',
-                    'message' => "Rename blocked for repo \"{$repo['name']}\" — path outside known storage location.",
-                ]);
-                $this->flash('danger', 'Cannot rename — repository path is outside known storage locations.');
-                $this->redirect("/clients/{$agentId}/repo/{$id}");
-            }
+                $pathAllowed = false;
+                $realLocal = realpath($oldLocalPath);
+                foreach ($allowedPaths as $ap) {
+                    if (!empty($ap) && $realLocal && str_starts_with($realLocal, realpath($ap) ?: '')) {
+                        $pathAllowed = true;
+                        break;
+                    }
+                }
 
-            $output = [];
-            $retval = 0;
-            $cmd = 'sudo /usr/local/bin/bbs-ssh-helper rename-repo-dir '
-                 . escapeshellarg($oldLocalPath) . ' '
-                 . escapeshellarg($newLocalPath) . ' 2>&1';
-            exec($cmd, $output, $retval);
+                if (!$pathAllowed) {
+                    $this->db->insert('server_log', [
+                        'agent_id' => $agentId,
+                        'level' => 'warning',
+                        'message' => "Rename blocked for repo \"{$repo['name']}\" — path outside known storage location.",
+                    ]);
+                    $this->flash('danger', 'Cannot rename — repository path is outside known storage locations.');
+                    $this->redirect("/clients/{$agentId}/repo/{$id}");
+                }
 
-            if ($retval !== 0) {
-                $this->db->insert('server_log', [
-                    'agent_id' => $agentId,
-                    'level' => 'error',
-                    'message' => "Failed to rename repo directory: " . implode(' ', $output),
-                ]);
-                $this->flash('danger', 'Rename failed: ' . implode(' ', $output));
-                $this->redirect("/clients/{$agentId}/repo/{$id}");
+                $output = [];
+                $retval = 0;
+                $cmd = 'sudo /usr/local/bin/bbs-ssh-helper rename-repo-dir '
+                     . escapeshellarg($oldLocalPath) . ' '
+                     . escapeshellarg($newLocalPath) . ' 2>&1';
+                exec($cmd, $output, $retval);
+
+                if ($retval !== 0) {
+                    $this->db->insert('server_log', [
+                        'agent_id' => $agentId,
+                        'level' => 'error',
+                        'message' => "Failed to rename repo directory: " . implode(' ', $output),
+                    ]);
+                    $this->flash('danger', 'Rename failed: ' . implode(' ', $output));
+                    $this->redirect("/clients/{$agentId}/repo/{$id}");
+                }
             }
         }
 
@@ -601,6 +607,202 @@ class RepositoryController extends Controller
     /**
      * Queue a repository maintenance task (check, compact, repair, break_lock).
      */
+    /**
+     * GET /clients/{agentId}/repo/{id}/archive/{archiveId}
+     * Show detailed stats for a single recovery point.
+     */
+    public function archiveDetail(int $agentId, int $id, int $archiveId): void
+    {
+        $this->requireAuth();
+
+        $repo = $this->db->fetchOne("SELECT r.* FROM repositories r WHERE r.id = ? AND r.agent_id = ?", [$id, $agentId]);
+        if (!$repo || !$this->canAccessAgent($agentId)) {
+            $this->flash('danger', 'Repository not found.');
+            $this->redirect('/clients');
+        }
+
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$agentId]);
+
+        $archive = $this->db->fetchOne("SELECT * FROM archives WHERE id = ? AND repository_id = ?", [$archiveId, $id]);
+        if (!$archive) {
+            $this->flash('danger', 'Archive not found.');
+            $this->redirect("/clients/{$agentId}/repo/{$id}");
+        }
+
+        // Resolve plan name and job info
+        $planName = null;
+        $jobInfo = null;
+        if (!empty($archive['backup_job_id'])) {
+            $jobInfo = $this->db->fetchOne("
+                SELECT bj.started_at, bj.completed_at, bj.duration_seconds, bp.directories, bp.name AS plan_name
+                FROM backup_jobs bj
+                LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
+                WHERE bj.id = ?
+            ", [$archive['backup_job_id']]);
+            $planName = $jobInfo['plan_name'] ?? null;
+        }
+
+        // Previous archive for deleted-files comparison
+        $prevArchive = $this->db->fetchOne("
+            SELECT id, archive_name, created_at FROM archives
+            WHERE repository_id = ? AND created_at < ?
+            ORDER BY created_at DESC LIMIT 1
+        ", [$id, $archive['created_at']]);
+
+        // ClickHouse stats
+        $statusBreakdown = [];
+        $largestFiles = [];
+        $deletedCount = 0;
+        $deletedSize = 0;
+        $deletedFiles = [];
+        $clickhouseAvailable = false;
+
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            if ($ch->isAvailable()) {
+                $clickhouseAvailable = true;
+                $aid = (int) $agentId;
+                $arid = (int) $archiveId;
+
+                // Files by status
+                $statusBreakdown = $ch->fetchAll(
+                    "SELECT status, count() as cnt, sum(file_size) as total_size
+                     FROM file_catalog
+                     WHERE agent_id = {$aid} AND archive_id = {$arid} AND path != ''
+                     GROUP BY status ORDER BY cnt DESC"
+                );
+
+                // Largest files
+                $largestFiles = $ch->fetchAll(
+                    "SELECT path, file_name, file_size, status
+                     FROM file_catalog
+                     WHERE agent_id = {$aid} AND archive_id = {$arid} AND path != ''
+                     ORDER BY file_size DESC LIMIT 20"
+                );
+
+                // Deleted files (compared to previous archive)
+                if ($prevArchive) {
+                    $prevId = (int) $prevArchive['id'];
+                    $delSummary = $ch->fetchOne(
+                        "SELECT count() as cnt, sum(file_size) as total_size
+                         FROM file_catalog
+                         WHERE agent_id = {$aid} AND archive_id = {$prevId} AND path != ''
+                           AND path NOT IN (SELECT path FROM file_catalog WHERE agent_id = {$aid} AND archive_id = {$arid})"
+                    );
+                    $deletedCount = (int) ($delSummary['cnt'] ?? 0);
+                    $deletedSize = (int) ($delSummary['total_size'] ?? 0);
+
+                    if ($deletedCount > 0 && $deletedCount <= 10000) {
+                        $deletedFiles = $ch->fetchAll(
+                            "SELECT path, file_name, file_size
+                             FROM file_catalog
+                             WHERE agent_id = {$aid} AND archive_id = {$prevId} AND path != ''
+                               AND path NOT IN (SELECT path FROM file_catalog WHERE agent_id = {$aid} AND archive_id = {$arid})
+                             ORDER BY file_size DESC LIMIT 50"
+                        );
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            // ClickHouse unavailable
+        }
+
+        $this->view('repositories/archive_detail', [
+            'pageTitle' => $planName ? $planName . ' — ' . $archive['archive_name'] : $archive['archive_name'],
+            'repo' => $repo,
+            'agent' => $agent,
+            'agentId' => $agentId,
+            'archive' => $archive,
+            'archiveId' => $archiveId,
+            'planName' => $planName,
+            'jobInfo' => $jobInfo,
+            'prevArchive' => $prevArchive,
+            'statusBreakdown' => $statusBreakdown,
+            'largestFiles' => $largestFiles,
+            'deletedCount' => $deletedCount,
+            'deletedSize' => $deletedSize,
+            'deletedFiles' => $deletedFiles,
+            'clickhouseAvailable' => $clickhouseAvailable,
+        ]);
+    }
+
+    /**
+     * GET /clients/{agentId}/repo/{id}/archive/{archiveId}/files
+     * AJAX endpoint: paginated file list from ClickHouse with status filter + search.
+     */
+    public function archiveFiles(int $agentId, int $id, int $archiveId): void
+    {
+        $this->requireAuth();
+
+        $repo = $this->db->fetchOne("SELECT r.* FROM repositories r WHERE r.id = ? AND r.agent_id = ?", [$id, $agentId]);
+        if (!$repo || !$this->canAccessAgent($agentId)) {
+            $this->json(['error' => 'Not found'], 404);
+            return;
+        }
+
+        $archive = $this->db->fetchOne("SELECT id FROM archives WHERE id = ? AND repository_id = ?", [$archiveId, $id]);
+        if (!$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+            return;
+        }
+
+        $status = $_GET['status'] ?? '';
+        $search = trim($_GET['search'] ?? '');
+        $page = max(1, (int) ($_GET['page'] ?? 1));
+        $perPage = min(100, max(10, (int) ($_GET['per_page'] ?? 50)));
+        $offset = ($page - 1) * $perPage;
+        $prevArchiveId = !empty($_GET['prev_archive_id']) ? (int) $_GET['prev_archive_id'] : 0;
+
+        $aid = (int) $agentId;
+        $arid = (int) $archiveId;
+
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            if (!$ch->isAvailable()) {
+                $this->json(['files' => [], 'total' => 0]);
+            }
+
+            // Deleted files = present in previous archive but not in current
+            if ($status === 'deleted' && $prevArchiveId > 0) {
+                $where = "agent_id = {$aid} AND archive_id = {$prevArchiveId} AND path != ''
+                          AND path NOT IN (SELECT path FROM file_catalog WHERE agent_id = {$aid} AND archive_id = {$arid})";
+                if ($search !== '') {
+                    $searchEsc = addslashes($search);
+                    $where .= " AND path LIKE '%{$searchEsc}%'";
+                }
+
+                $countRow = $ch->fetchOne("SELECT count() as cnt FROM file_catalog WHERE {$where}");
+                $total = (int) ($countRow['cnt'] ?? 0);
+
+                $files = $ch->fetchAll("SELECT path, file_name, file_size, 'deleted' as status FROM file_catalog WHERE {$where} ORDER BY path LIMIT {$perPage} OFFSET {$offset}");
+            } else {
+                $where = "agent_id = {$aid} AND archive_id = {$arid} AND path != ''";
+                // Filter out non-file statuses unless specifically requested
+                $nonFileStatuses = ['D', 'S', 'H', 'X', 'B', 'F', 'E'];
+                if ($status !== '' && !in_array($status, $nonFileStatuses)) {
+                    $statusEsc = addslashes($status);
+                    $where .= " AND status = '{$statusEsc}'";
+                } elseif ($status === '') {
+                    // "All" tab: only show real files
+                    $where .= " AND status NOT IN ('D','S','H','X','B','F','E')";
+                }
+                if ($search !== '') {
+                    $searchEsc = addslashes($search);
+                    $where .= " AND path LIKE '%{$searchEsc}%'";
+                }
+
+                $countRow = $ch->fetchOne("SELECT count() as cnt FROM file_catalog WHERE {$where}");
+                $total = (int) ($countRow['cnt'] ?? 0);
+
+                $files = $ch->fetchAll("SELECT path, file_name, file_size, status FROM file_catalog WHERE {$where} ORDER BY path LIMIT {$perPage} OFFSET {$offset}");
+            }
+
+            $this->json(['files' => $files, 'total' => $total, 'page' => $page]);
+        } catch (\Exception $e) {
+            $this->json(['files' => [], 'total' => 0, 'error' => $e->getMessage()]);
+        }
+    }
+
     public function deleteArchive(int $agentId, int $id, int $archiveId): void
     {
         $this->requireAuth();
@@ -749,10 +951,44 @@ class RepositoryController extends Controller
             $this->redirect('/clients');
         }
 
-        // Get archives for this repo
+        // Get archives for this repo, with plan name resolved through backup_jobs
         $archives = $this->db->fetchAll("
-            SELECT * FROM archives WHERE repository_id = ? ORDER BY created_at DESC
+            SELECT ar.*, bp.name AS plan_name
+            FROM archives ar
+            LEFT JOIN backup_jobs bj ON bj.id = ar.backup_job_id
+            LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
+            WHERE ar.repository_id = ?
+            ORDER BY ar.created_at DESC
         ", [$id]);
+
+        // Backfill file_count from ClickHouse for archives that show 0
+        // (imported repos before the nfiles fix)
+        $zeroCountIds = array_filter(array_column($archives, 'id', 'id'), function ($aid) use ($archives) {
+            foreach ($archives as $a) {
+                if ($a['id'] == $aid && (int) $a['file_count'] === 0) return true;
+            }
+            return false;
+        });
+        if (!empty($zeroCountIds)) {
+            try {
+                $ch = \BBS\Core\ClickHouse::getInstance();
+                if ($ch->isAvailable()) {
+                    $idList = implode(',', array_map('intval', array_keys($zeroCountIds)));
+                    $chCounts = $ch->fetchAll("SELECT archive_id, count() as cnt FROM file_catalog WHERE archive_id IN ({$idList}) AND path != '' GROUP BY archive_id");
+                    $countMap = [];
+                    foreach ($chCounts as $row) {
+                        $countMap[(int) $row['archive_id']] = (int) $row['cnt'];
+                    }
+                    foreach ($archives as &$ar) {
+                        if ((int) $ar['file_count'] === 0 && isset($countMap[(int) $ar['id']]) && $countMap[(int) $ar['id']] > 0) {
+                            $ar['file_count'] = $countMap[(int) $ar['id']];
+                            $this->db->update('archives', ['file_count' => $ar['file_count']], 'id = ?', [$ar['id']]);
+                        }
+                    }
+                    unset($ar);
+                }
+            } catch (\Exception $e) { /* ClickHouse unavailable — leave as 0 */ }
+        }
 
         // Get plans using this repo
         $plans = $this->db->fetchAll("
@@ -1208,13 +1444,13 @@ class RepositoryController extends Controller
 
         $agentId = (int) ($_POST['agent_id'] ?? 0);
         $storageType = $_POST['storage_type'] ?? 'local';
-        $name = trim($_POST['name'] ?? '');
+        $name = $this->sanitizePathName(trim($_POST['name'] ?? ''));
         $passphrase = $_POST['passphrase'] ?? '';
         $storageLocationId = !empty($_POST['storage_location_id']) ? (int) $_POST['storage_location_id'] : null;
         $remoteSshConfigId = !empty($_POST['remote_ssh_config_id']) ? (int) $_POST['remote_ssh_config_id'] : null;
 
         if (empty($name) || empty($agentId)) {
-            $this->json(['status' => 'error', 'error' => 'Repository name and client are required.']);
+            $this->json(['status' => 'error', 'error' => 'Repository name and client are required. Names can only contain letters, numbers, hyphens, and underscores.']);
             return;
         }
 
@@ -1299,7 +1535,10 @@ class RepositoryController extends Controller
             }
 
             if ($exitCode !== 0) {
-                $errorMsg = trim($output ?: $stderr);
+                // Prefer stderr — borg writes real errors there and only emits
+                // info/cache messages on stdout. Falling back to stdout keeps
+                // the path reasonable if stderr happens to be empty.
+                $errorMsg = trim($stderr ?: $output);
                 if (str_contains($errorMsg, 'passphrase') || str_contains($errorMsg, 'Passphrase')) {
                     $errorMsg = 'Incorrect passphrase for this repository.';
                 } elseif (str_contains($errorMsg, 'not a valid repository') || str_contains($errorMsg, 'does not exist') || str_contains($errorMsg, 'Failed to create/acquire')) {
@@ -1369,10 +1608,18 @@ class RepositoryController extends Controller
             return;
         }
 
+        // Sanitize the name — import uses this for both the directory lookup
+        // and the DB record. Leading slashes, special characters, etc. get
+        // stripped to match how new repos are created.
+        $name = $this->sanitizePathName($name);
+        if (empty($name)) {
+            $this->flash('danger', 'Repository name must contain at least one alphanumeric character.');
+            $this->redirect("/clients/{$agentId}?tab=repos");
+            return;
+        }
+
         if ($storageType === 'remote_ssh') {
             $this->importRemoteSsh($agentId, $name, $encryption, $passphrase, $remoteSshConfigId);
-        } else {
-            $this->importLocal($agentId, $agent, $name, $encryption, $passphrase, $storageLocationId);
         }
     }
 

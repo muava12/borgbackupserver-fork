@@ -10,21 +10,30 @@ class App
     {
         Config::load();
 
-        // Set gc_maxlifetime to 30 days so Ubuntu's sessionclean cron
-        // doesn't delete session files before our app-level timeout
-        ini_set('session.gc_maxlifetime', 30 * 86400);
+        // Skip session_start() for API endpoints — agents authenticate with a
+        // Bearer token (no cookie), so starting a session would just create
+        // an empty sess_* file per request. With agents polling every 30s,
+        // that adds up to hundreds of thousands of orphan files per month.
+        $reqPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
+        $isApiRequest = str_starts_with($reqPath, '/api/');
 
-        $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-            || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+        if (!$isApiRequest) {
+            // Set gc_maxlifetime to 30 days so Ubuntu's sessionclean cron
+            // doesn't delete session files before our app-level timeout
+            ini_set('session.gc_maxlifetime', 30 * 86400);
 
-        session_set_cookie_params([
-            'lifetime' => 30 * 86400,
-            'path' => '/',
-            'httponly' => true,
-            'samesite' => 'Lax',
-            'secure' => $isHttps,
-        ]);
-        session_start();
+            $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+                || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+
+            session_set_cookie_params([
+                'lifetime' => 30 * 86400,
+                'path' => '/',
+                'httponly' => true,
+                'samesite' => 'Lax',
+                'secure' => $isHttps,
+            ]);
+            session_start();
+        }
         $this->router = new \AltoRouter();
     }
 
@@ -110,6 +119,8 @@ class App
         $this->router->map('POST', '/repositories/[i:id]/maintenance', 'RepositoryController@maintenance');
         $this->router->map('POST', '/repositories/[i:id]/rename', 'RepositoryController@rename');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]', 'RepositoryController@detail');
+        $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]', 'RepositoryController@archiveDetail');
+        $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/files', 'RepositoryController@archiveFiles');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/delete', 'RepositoryController@deleteArchive');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-restore', 'RepositoryController@s3Restore');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-config', 'RepositoryController@s3Config');

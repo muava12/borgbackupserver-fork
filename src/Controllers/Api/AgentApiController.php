@@ -400,12 +400,20 @@ class AgentApiController extends Controller
                 'message' => "Archive created: \"{$input['archive_name']}\" — {$origSize} original, {$dedupSize} deduplicated",
             ]);
 
-            // Update repo stats + borg version
+            // Update repo stats + borg version.
+            // size_bytes is only set from SUM(deduplicated_size) for remote SSH
+            // repos (where we can't du) OR when currently 0 (fresh repo). For
+            // local repos the scheduler's du scan is the source of truth — it
+            // includes repo metadata and uncompacted chunks that SUM misses.
             $borgVer = !empty($agent['borg_version']) ? preg_replace('/^borg\s+/', '', $agent['borg_version']) : null;
             $this->db->query("
                 UPDATE repositories SET
                     archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
-                    size_bytes = COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
+                    size_bytes = CASE
+                        WHEN storage_type = 'remote_ssh' OR size_bytes = 0
+                        THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
+                        ELSE size_bytes
+                    END
                     " . ($borgVer ? ", borg_version_last = ?" : "") . "
                 WHERE id = ?
             ", $borgVer
@@ -582,12 +590,16 @@ class AgentApiController extends Controller
                     'message' => "Archive created: \"{$input['archive_name']}\" — {$origSize} original, {$dedupSize} deduplicated",
                 ]);
 
-                // Update repo stats + borg version
+                // Update repo stats + borg version (see comment above on size_bytes)
                 $borgVer2 = !empty($agent['borg_version']) ? preg_replace('/^borg\s+/', '', $agent['borg_version']) : null;
                 $this->db->query("
                     UPDATE repositories SET
                         archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
-                        size_bytes = COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
+                        size_bytes = CASE
+                            WHEN storage_type = 'remote_ssh' OR size_bytes = 0
+                            THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
+                            ELSE size_bytes
+                        END
                         " . ($borgVer2 ? ", borg_version_last = ?" : "") . "
                     WHERE id = ?
                 ", $borgVer2
@@ -677,11 +689,30 @@ class AgentApiController extends Controller
                     'message' => "File catalog imported: " . number_format($count) . " entries in {$elapsed}s",
                 ]);
             } catch (\Exception $e) {
+                $diagInfo = '';
+                $catPath = $catalogImport['path'];
+                if (file_exists($catPath)) {
+                    $perms = substr(sprintf('%o', fileperms($catPath)), -4);
+                    $owner = function_exists('posix_getpwuid') ? (posix_getpwuid(fileowner($catPath))['name'] ?? fileowner($catPath)) : fileowner($catPath);
+                    $group = function_exists('posix_getgrgid') ? (posix_getgrgid(filegroup($catPath))['name'] ?? filegroup($catPath)) : filegroup($catPath);
+                    $size = filesize($catPath);
+                    $diagInfo = " [file: {$perms} {$owner}:{$group} {$size}b, www-data readable: " . (is_readable($catPath) ? 'yes' : 'NO') . ']';
+                } else {
+                    $diagInfo = ' [file does not exist at import time]';
+                }
+                // Check if the gate's diagnostic log exists
+                $diagLog = dirname($catPath) . '/.catalog-diag.log';
+                $gateDiag = '';
+                if (file_exists($diagLog)) {
+                    $tail = file_get_contents($diagLog);
+                    $lines = explode("\n", trim($tail));
+                    $gateDiag = ' | gate-diag: ' . implode(' / ', array_slice($lines, -6));
+                }
                 $this->db->insert('server_log', [
                     'agent_id' => $catalogImport['agent_id'],
                     'backup_job_id' => $catalogImport['job_id'],
                     'level' => 'error',
-                    'message' => "Catalog import failed: " . $e->getMessage(),
+                    'message' => "Catalog import failed: " . $e->getMessage() . $diagInfo . $gateDiag,
                 ]);
             }
             @unlink($catalogImport['path']);
@@ -882,11 +913,48 @@ class AgentApiController extends Controller
     public function heartbeat(): void
     {
         $agent = $this->authenticateAgent();
-        $this->json([
+
+        $response = [
             'status' => 'ok',
             'agent_id' => $agent['id'],
             'server_time' => date('Y-m-d H:i:s'),
-        ]);
+        ];
+
+        // Check for stalled jobs on this agent. The main poll loop is blocked
+        // during task execution so the stall check in tasks() never fires.
+        // The heartbeat is the only channel active during a running task.
+        $stallSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'stall_timeout_minutes'");
+        $stallMinutes = max(10, (int) ($stallSetting['value'] ?? 120));
+
+        $stalledJobs = $this->db->fetchAll("
+            SELECT bj.id FROM backup_jobs bj
+            WHERE bj.agent_id = ?
+              AND bj.status = 'running'
+              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+              AND (
+                  (bj.last_progress_at IS NOT NULL AND bj.last_progress_at < DATE_SUB(NOW(), INTERVAL {$stallMinutes} MINUTE))
+                  OR
+                  (bj.last_progress_at IS NULL AND bj.started_at IS NOT NULL AND bj.started_at < DATE_SUB(NOW(), INTERVAL {$stallMinutes} MINUTE))
+              )
+        ", [$agent['id']]);
+
+        if (!empty($stalledJobs)) {
+            $response['check_jobs'] = array_map(fn($j) => (int) $j['id'], $stalledJobs);
+        }
+
+        // Also relay cancel signals for the currently running job
+        $cancelledJob = $this->db->fetchOne("
+            SELECT id FROM backup_jobs
+            WHERE agent_id = ? AND status = 'cancelled'
+              AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+              AND completed_at IS NULL
+            LIMIT 1
+        ", [$agent['id']]);
+        if ($cancelledJob) {
+            $response['cancel_job'] = (int) $cancelledJob['id'];
+        }
+
+        $this->json($response);
     }
 
     /**
@@ -961,6 +1029,7 @@ class AgentApiController extends Controller
         $allowed = [
             'install.sh' => 'agent/install.sh',
             'bbs-agent.py' => 'agent/bbs-agent.py',
+            'bbs-agent-start.sh' => 'agent/bbs-agent-start.sh',
             'com.borgbackupserver.agent.plist' => 'agent/com.borgbackupserver.agent.plist',
             'install-windows.ps1' => 'agent/install-windows.ps1',
             'uninstall-windows.ps1' => 'agent/uninstall-windows.ps1',

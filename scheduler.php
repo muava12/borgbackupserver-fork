@@ -44,7 +44,7 @@ if ($stale->rowCount() > 0) {
         [$cutoff]
     );
     foreach ($offlineAgents as $offAgent) {
-        $notificationService->notify('agent_offline', $offAgent['id'], null, "Client \"{$offAgent['name']}\" is offline (no heartbeat in {$threshold}s)", 'critical');
+        $notificationService->notify('agent_offline', $offAgent['id'], null, "Client \"{$offAgent['name']}\" is offline (no heartbeat in {$threshold}s)", 'warning');
     }
 }
 
@@ -70,7 +70,7 @@ foreach ($staleJobs as $sj) {
     $db->insert('server_log', [
         'agent_id' => $sj['agent_id'],
         'backup_job_id' => $sj['id'],
-        'level' => 'error',
+        'level' => 'warning',
         'message' => "Job #{$sj['id']} ({$sj['task_type']}) failed — agent \"{$sj['agent_name']}\" went offline",
     ]);
 
@@ -648,6 +648,7 @@ foreach ($serverJobs as $sj) {
                 $createdAt = isset($ar['start']) ? date('Y-m-d H:i:s', strtotime($ar['start'])) : $csNow;
                 $originalSize = 0;
                 $deduplicatedSize = 0;
+                $fileCount = 0;
 
                 // Run borg info to get archive sizes
                 if ($isRemoteSsh && isset($remoteConfig)) {
@@ -658,6 +659,7 @@ foreach ($serverJobs as $sj) {
                         $stats = $archiveInfo['stats'] ?? [];
                         $originalSize = (int) ($stats['original_size'] ?? 0);
                         $deduplicatedSize = (int) ($stats['deduplicated_size'] ?? 0);
+                        $fileCount = (int) ($stats['nfiles'] ?? 0);
                     }
                 } else {
                     $archivePath = "{$csArchivePath}::{$archiveName}";
@@ -700,6 +702,7 @@ foreach ($serverJobs as $sj) {
                             $stats = $archiveInfo['stats'] ?? [];
                             $originalSize = (int) ($stats['original_size'] ?? 0);
                             $deduplicatedSize = (int) ($stats['deduplicated_size'] ?? 0);
+                            $fileCount = (int) ($stats['nfiles'] ?? 0);
                         }
                     }
                 }
@@ -708,6 +711,7 @@ foreach ($serverJobs as $sj) {
                     'repository_id' => $csRepo['id'],
                     'archive_name' => $archiveName,
                     'created_at' => $createdAt,
+                    'file_count' => $fileCount,
                     'original_size' => $originalSize,
                     'deduplicated_size' => $deduplicatedSize,
                 ]);
@@ -1160,6 +1164,19 @@ foreach ($serverJobs as $sj) {
                     } catch (\Exception $e) { /* non-fatal */ }
                     @unlink($dirsTsv);
                 }
+            } else {
+                // Archive genuinely has 0 indexable files (only directories or
+                // truly empty). Insert a sentinel row so the auto-rebuild check
+                // in step 3b sees this archive_id in ClickHouse and stops
+                // re-triggering a rebuild every 24 hours.
+                try {
+                    $sentinelTsv = sys_get_temp_dir() . "/catalog_sentinel_{$agentId}_{$crArchive['id']}_" . getmypid() . '.tsv';
+                    file_put_contents($sentinelTsv, "{$agentId}\t{$crArchive['id']}\t\t\t\t0\tE\t\\N\n");
+                    $ch->insertTsv('file_catalog', $sentinelTsv, [
+                        'agent_id', 'archive_id', 'path', 'file_name', 'parent_dir', 'file_size', 'status', 'mtime'
+                    ]);
+                    @unlink($sentinelTsv);
+                } catch (\Exception $e) { /* non-fatal — worst case is a repeat rebuild */ }
             }
             @unlink($tsvFile);
 
@@ -1225,7 +1242,13 @@ foreach ($serverJobs as $sj) {
     // Build borg command arguments — use repo path (remote SSH or local)
     $repoPath = $isRemoteSsh ? $repo['path'] : $localPath;
     if ($sj['task_type'] === 'prune') {
-        $archivePrefix = $sj['backup_plan_id'] ? 'plan' . $sj['backup_plan_id'] : null;
+        // Only scope prune to this plan's archives if the repo has multiple plans.
+        // Single-plan repos prune everything (including imported/orphaned archives).
+        $planCount = (int) ($db->fetchOne(
+            "SELECT COUNT(*) as cnt FROM backup_plans WHERE repository_id = ? AND enabled = 1",
+            [$sj['repository_id']]
+        )['cnt'] ?? 0);
+        $archivePrefix = ($planCount > 1 && $sj['backup_plan_id']) ? 'plan' . $sj['backup_plan_id'] : null;
         $borgArgs = \BBS\Services\BorgCommandBuilder::buildPruneCommand($plan, $localRepo, $archivePrefix);
         // Remove 'borg' from the front since we'll add it back
         if ($borgArgs[0] === 'borg') {
@@ -1491,6 +1514,20 @@ foreach ($serverJobs as $sj) {
                     'message' => "Prune completed — all " . count($borgArchives) . " recovery point(s) retained, none removed",
                 ]);
             }
+            // Refresh cached repo stats. size_bytes only updated from SUM for
+            // remote SSH repos (no du possible) or when currently 0 — for
+            // local repos the 5-min du scan is the source of truth.
+            $db->query("
+                UPDATE repositories SET
+                    archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
+                    size_bytes = CASE
+                        WHEN storage_type = 'remote_ssh' OR size_bytes = 0
+                        THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
+                        ELSE size_bytes
+                    END
+                WHERE id = ?
+            ", [$repoId, $repoId, $repoId]);
+
             } // end JSON validation else
         }
     }
@@ -1513,6 +1550,19 @@ foreach ($serverJobs as $sj) {
             } catch (\Exception $e) { /* ClickHouse may not be available */ }
 
             $db->delete('archives', 'id = ?', [$deletedArchive['id']]);
+
+            // Refresh cached repo stats (see note above on size_bytes rules)
+            $db->query("
+                UPDATE repositories SET
+                    archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
+                    size_bytes = CASE
+                        WHEN storage_type = 'remote_ssh' OR size_bytes = 0
+                        THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
+                        ELSE size_bytes
+                    END
+                WHERE id = ?
+            ", [$sj['repository_id'], $sj['repository_id'], $sj['repository_id']]);
+
             echo date('Y-m-d H:i:s') . " Removed archive \"{$archiveName}\" from DB for repo #{$sj['repository_id']}\n";
         }
     }
@@ -1731,9 +1781,9 @@ try {
     echo date('Y-m-d H:i:s') . " Daily report error: {$e->getMessage()}\n";
 }
 
-// Step 10b: Email daily report to subscribers at their preferred local hour
+// Step 10b: Email report to subscribers at their preferred local hour/frequency
 $subscribers = $db->fetchAll(
-    "SELECT id, email, timezone, daily_report_hour FROM users WHERE daily_report_email = 1 AND email != ''"
+    "SELECT id, email, timezone, daily_report_hour, report_frequency, report_day FROM users WHERE daily_report_email = 1 AND email != ''"
 );
 if (!empty($subscribers)) {
     $todayReport = $db->fetchOne("SELECT id FROM daily_reports WHERE report_date = CURDATE() ORDER BY created_at DESC LIMIT 1");
@@ -1750,6 +1800,16 @@ if (!empty($subscribers)) {
             if ($userHour !== (int) $sub['daily_report_hour']) {
                 continue;
             }
+
+            // Weekly subscribers only receive on their chosen day (0=Sun, 6=Sat)
+            $frequency = $sub['report_frequency'] ?? 'daily';
+            if ($frequency === 'weekly') {
+                $userDow = (int) $userNow->format('w'); // 0=Sunday
+                if ($userDow !== (int) ($sub['report_day'] ?? 1)) {
+                    continue;
+                }
+            }
+
             // Dedup: only email once per user per calendar day (in their timezone)
             $userDate = $userNow->format('Y-m-d');
             $dedupKey = 'last_report_email_user_' . $sub['id'];
@@ -1759,7 +1819,8 @@ if (!empty($subscribers)) {
             }
             try {
                 $reportService->emailReport((int) $todayReport['id'], (int) $sub['id']);
-                echo date('Y-m-d H:i:s') . " Emailed daily report to {$sub['email']}\n";
+                $freqLabel = $frequency === 'weekly' ? 'weekly' : 'daily';
+                echo date('Y-m-d H:i:s') . " Emailed {$freqLabel} report to {$sub['email']}\n";
                 $db->query(
                     "INSERT INTO settings (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = ?",
                     [$dedupKey, $userDate, $userDate]
@@ -2110,4 +2171,41 @@ foreach ($agentHomeDirs as $ahd) {
 }
 if ($catalogCleaned > 0) {
     echo date('Y-m-d H:i:s') . " Cleaned up {$catalogCleaned} imported catalog log file(s)\n";
+}
+
+// Step 10: Prune old server_log and backup_jobs entries
+// Run once per hour (minute 30) to avoid running on every scheduler tick
+if ((int) date('i') === 30) {
+    $logDeleted = $db->delete('server_log', 'created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)');
+    if ($logDeleted > 0) {
+        echo date('Y-m-d H:i:s') . " Pruned {$logDeleted} server_log entries older than 30 days\n";
+    }
+
+    $jobsDeleted = $db->delete('backup_jobs', "status IN ('completed', 'failed', 'cancelled') AND completed_at < DATE_SUB(NOW(), INTERVAL 90 DAY)");
+    if ($jobsDeleted > 0) {
+        echo date('Y-m-d H:i:s') . " Pruned {$jobsDeleted} backup_jobs older than 90 days\n";
+    }
+
+    // Prune orphaned PHP session files. On Docker installs where PHP writes
+    // sessions into $TMPDIR (/var/bbs/tmp), there's no systemd timer or cron
+    // to clean them up, so files accumulate unboundedly.
+    $sessionDirs = array_unique(array_filter([
+        ini_get('session.save_path') ?: null,
+        sys_get_temp_dir(),
+        '/var/bbs/tmp',
+        '/var/lib/php/sessions',
+    ]));
+    $cutoff = time() - (30 * 86400);
+    $sessionDeleted = 0;
+    foreach ($sessionDirs as $dir) {
+        if (!is_dir($dir)) continue;
+        foreach (glob($dir . '/sess_*') ?: [] as $file) {
+            if (is_file($file) && @filemtime($file) < $cutoff) {
+                if (@unlink($file)) $sessionDeleted++;
+            }
+        }
+    }
+    if ($sessionDeleted > 0) {
+        echo date('Y-m-d H:i:s') . " Pruned {$sessionDeleted} PHP session files older than 30 days\n";
+    }
 }

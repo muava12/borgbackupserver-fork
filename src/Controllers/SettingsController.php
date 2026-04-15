@@ -90,7 +90,7 @@ class SettingsController extends Controller
         $this->requireAdmin();
         $this->verifyCsrf();
 
-        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'session_timeout_hours', 'default_theme', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention'];
+        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'stall_timeout_minutes', 'session_timeout_hours', 'default_theme', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention'];
 
         foreach ($allowed as $key) {
             if (isset($_POST[$key])) {
@@ -205,7 +205,7 @@ class SettingsController extends Controller
         $this->verifyCsrf();
 
         // Plain text settings
-        $fields = ['oidc_provider_url', 'oidc_client_id', 'oidc_button_label', 'oidc_scopes', 'oidc_new_user_policy', 'oidc_template_user_id'];
+        $fields = ['oidc_provider_url', 'oidc_client_id', 'oidc_button_label', 'oidc_scopes', 'oidc_new_user_policy', 'oidc_template_user_id', 'oidc_redirect_url'];
         foreach ($fields as $key) {
             if (isset($_POST[$key])) {
                 $this->saveSetting($key, trim($_POST[$key]));

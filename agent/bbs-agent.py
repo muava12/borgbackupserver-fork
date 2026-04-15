@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import platform
+import shlex
 import signal
 import socket
 import subprocess
@@ -44,7 +45,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.23.0"
+AGENT_VERSION = "2.25.0"
 BORG_PATH = None  # Resolved in get_system_info()
 IS_WINDOWS = sys.platform == "win32"
 
@@ -75,6 +76,7 @@ if IS_WINDOWS:
     BORG_SOURCE_PATH = os.path.join(_AGENT_DIR, "borg_source")
     SSH_INFO_PATH    = os.path.join(_AGENT_DIR, "ssh_info.json")
     REMOTE_KEY_PATH  = os.path.join(os.environ.get("TEMP", "."), "bbs-remote-ssh-key")
+    _SSH_PATH_FILE   = os.path.join(_AGENT_DIR, "ssh-path")
 else:
     CONFIG_PATH      = "/etc/bbs-agent/config.ini"
     LOG_PATH         = "/var/log/bbs-agent.log"
@@ -93,7 +95,20 @@ logger = logging.getLogger("bbs-agent")
 running = True
 task_running = False  # Set True while executing a task, enables heartbeat thread
 current_job_id = None  # Job ID of currently executing task (for stall check response)
-current_proc = None  # Track active borg subprocess for clean shutdown
+current_borg_proc = None  # The running borg subprocess, set by execute_task for stall-kill
+
+# Resolve the SSH executable for Windows. The built-in Windows OpenSSH client
+# has a stdin forwarding bug that hangs borg over ssh:// repos. The installer
+# writes the path to a known-good ssh.exe (Git for Windows or bundled MinGit)
+# to a file; we read it once at import time.
+SSH_CMD = "ssh"
+if IS_WINDOWS:
+    try:
+        _ssh_path = open(_SSH_PATH_FILE).read().strip()
+        if _ssh_path and os.path.isfile(_ssh_path):
+            SSH_CMD = _ssh_path.replace("\\", "/")
+    except (FileNotFoundError, OSError):
+        pass
 
 
 def _lockdown_key_windows(path):
@@ -519,7 +534,7 @@ def test_ssh_connection(config):
             known_hosts_null = "NUL" if IS_WINDOWS else "/dev/null"
             proc = subprocess.Popen(
                 [
-                    "ssh",
+                    SSH_CMD,
                     "-i", SSH_KEY_PATH,
                     "-p", ssh_port,
                     "-o", "StrictHostKeyChecking=no",
@@ -578,17 +593,34 @@ def test_ssh_connection(config):
         logger.error("SSH connectivity test still failing after key re-download: {}".format(err))
 
 
-def count_files(directories):
-    """Pre-count files in directories for progress tracking."""
+def count_files(directories, one_file_system=False):
+    """Pre-count files in directories for progress tracking.
+
+    When one_file_system is True, stays on the same filesystem as the
+    top-level directory (mirrors borg's --one-file-system behavior).
+    This prevents descending into /proc, /sys, NFS mounts, etc. when
+    backing up /.
+    """
     total = 0
     for dir_path in directories.splitlines():
         dir_path = dir_path.strip()
-        if not os.path.exists(dir_path):
+        if not dir_path or not os.path.exists(dir_path):
             continue
         try:
-            for root, dirs, files in os.walk(dir_path):
+            root_dev = os.lstat(dir_path).st_dev if one_file_system else None
+            for root, dirs, files in os.walk(dir_path, followlinks=False):
+                if one_file_system:
+                    # Remove subdirs on different filesystems so os.walk skips them
+                    kept = []
+                    for d in dirs:
+                        try:
+                            if os.lstat(os.path.join(root, d)).st_dev == root_dev:
+                                kept.append(d)
+                        except OSError:
+                            pass
+                    dirs[:] = kept
                 total += len(files)
-        except PermissionError:
+        except (PermissionError, OSError):
             continue
     return total
 
@@ -880,10 +912,19 @@ def _install_borg_pip(target_version):
     # Use pip3 if available, fall back to pip (FreeBSD uses pip, not pip3)
     pip_cmd = "pip3"
     try:
-        subprocess.run(["pip3", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pip_check = subprocess.run(["pip3", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        if pip_check.returncode != 0:
+            pip_stderr = pip_check.stderr.decode("utf-8", errors="replace").strip()
+            # pip3 exists but is broken (e.g. Python library issue)
+            return "failed", "", "pip3 is installed but broken (exit {}): {}".format(
+                pip_check.returncode, pip_stderr[:500] if pip_stderr else "unknown error")
     except FileNotFoundError:
         pip_cmd = "pip"
-    cmd = [pip_cmd, "install", "--upgrade", version_spec]
+    except subprocess.TimeoutExpired:
+        return "failed", "", "pip3 --version timed out"
+    except Exception as e:
+        return "failed", "", "pip3 check failed: {}".format(e)
+    cmd = [pip_cmd, "install", "--upgrade", "--break-system-packages", version_spec]
     logger.info("Installing borg via pip: {}".format(' '.join(cmd)))
 
     try:
@@ -920,8 +961,16 @@ def _install_borg_pip(target_version):
                     logger.info("Restored backup binary after pip failure")
                 except Exception:
                     pass
-            error = stderr_text or stdout_text or "Exit code {}".format(proc.returncode)
-            logger.error("pip install failed: {}".format(error))
+            combined = (stderr_text + "\n" + stdout_text).strip()
+            # Extract the most useful line instead of dumping a full traceback
+            last_error = ""
+            for line in reversed(combined.split("\n")):
+                line = line.strip()
+                if line and not line.startswith("File ") and not line.startswith("from ") and not line.startswith("import "):
+                    last_error = line
+                    break
+            error = "pip install failed (exit {}): {}".format(proc.returncode, last_error or combined[:500])
+            logger.error(error)
             return "failed", "", error
     except subprocess.TimeoutExpired:
         return "failed", "", "pip install timed out"
@@ -1043,6 +1092,19 @@ def execute_update_agent(config, task):
             error_output = "Downloaded script failed validation"
             logger.error(error_output)
         else:
+            # Syntax-check the new script BEFORE replacing — a SyntaxError
+            # here (e.g. from Python version incompatibility) would brick the
+            # agent with no auto-recovery path.
+            try:
+                import ast
+                ast.parse(new_script)
+            except SyntaxError as syn_err:
+                error_output = "Downloaded script has syntax error on line {}: {} — keeping current version".format(
+                    syn_err.lineno, syn_err.msg)
+                logger.error(error_output)
+                report_status(config, {"job_id": job_id, "result": "failed", "error_log": error_output})
+                return
+
             # On Windows (launcher pattern): update bbs-agent-run.py in the agent dir
             # On Unix: replace the running script in-place
             if IS_WINDOWS:
@@ -1050,6 +1112,14 @@ def execute_update_agent(config, task):
             else:
                 script_path = os.path.abspath(__file__)
             logger.info("Replacing agent at: {}".format(script_path))
+
+            # Save a backup of the current working script before replacing
+            backup_path = script_path + ".bak"
+            try:
+                import shutil
+                shutil.copy2(script_path, backup_path)
+            except Exception as bak_err:
+                logger.warning("Could not create backup: {}".format(bak_err))
 
             # Write new script to temp file first, then move
             tmp_path = script_path + ".tmp"
@@ -1070,6 +1140,24 @@ def execute_update_agent(config, task):
             result = "completed"
             update_output = "Agent updated to v{}".format(new_version)
             logger.info(update_output)
+
+            # Also download the startup wrapper (provides auto-recovery from
+            # bad updates). Non-fatal if it fails — the wrapper is a safety
+            # net, not required for normal operation.
+            if not IS_WINDOWS:
+                try:
+                    wrapper_url = "{}/api/agent/download?file=bbs-agent-start.sh".format(config['server_url'])
+                    wrapper_req = urllib.request.Request(wrapper_url, headers=headers, method="GET")
+                    with urllib.request.urlopen(wrapper_req, timeout=30) as wresp:
+                        wrapper_script = wresp.read()
+                    wrapper_dir = os.path.dirname(script_path)
+                    wrapper_path = os.path.join(wrapper_dir, "bbs-agent-start.sh")
+                    with open(wrapper_path, "wb") as wf:
+                        wf.write(wrapper_script)
+                    os.chmod(wrapper_path, 0o755)
+                    logger.info("Updated startup wrapper at {}".format(wrapper_path))
+                except Exception as we:
+                    logger.debug("Could not update startup wrapper: {}".format(we))
 
     except urllib.error.HTTPError as e:
         error_output = "Download failed: HTTP {}".format(e.code)
@@ -1836,6 +1924,78 @@ def test_plugin_interworx(config):
     return "InterWorx backup tool found at {}. Output directory {} is ready.".format(backup_pex, output_dir)
 
 
+def _popen_new_group_kwargs():
+    """Return Popen kwargs that put the child into its own process group/session.
+
+    This is required so we can kill the entire borg subtree (including the
+    orphaned ssh transport child borg spawns for ssh:// repos) on cancel,
+    instead of just killing borg and leaving ssh holding our stdout pipe.
+    """
+    if IS_WINDOWS:
+        flags = 0
+        for attr in ("CREATE_NEW_PROCESS_GROUP", "CREATE_NEW_CONSOLE"):
+            flags |= getattr(subprocess, attr, 0)
+        return {"creationflags": flags} if flags else {}
+    return {"start_new_session": True}
+
+
+def _kill_process_tree(proc):
+    """Force-kill a child process and any descendants.
+
+    Linux/macOS: kill the whole process group via SIGKILL.
+    Windows: terminate via TerminateProcess (CREATE_NEW_PROCESS_GROUP keeps the
+    tree together so child handles get cleaned up).
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if IS_WINDOWS:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        else:
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                pgid = proc.pid
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                # Fall back to killing just the immediate child
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("Failed to kill process tree for pid {}: {}".format(proc.pid, e))
+
+
+def _parse_script_command(value):
+    """Split a script field into [executable, *args] using shell-style parsing.
+
+    Allows users to pass arguments in the script path field, e.g.:
+        /path/to/script.sh before
+        /path/with\\ spaces/script.sh "arg with spaces"
+    Returns ([], "") if value is empty. Returns (argv, executable_path).
+    """
+    value = (value or "").strip()
+    if not value:
+        return [], ""
+    try:
+        argv = shlex.split(value, posix=(os.name != "nt"))
+    except ValueError:
+        # Unbalanced quotes — fall back to treating the whole string as a path
+        argv = [value]
+    if not argv:
+        return [], ""
+    return argv, argv[0]
+
+
 def execute_plugin_shell_hook(config):
     """Run pre-backup shell script hook."""
     pre_script = config.get("pre_script", "").strip()
@@ -1854,15 +2014,17 @@ def execute_plugin_shell_hook(config):
         logger.info("Shell hook: no pre-script configured, skipping")
         return result
 
-    if not os.path.isfile(pre_script):
-        msg = "Pre-script not found: {}".format(pre_script)
+    pre_argv, pre_exe = _parse_script_command(pre_script)
+
+    if not os.path.isfile(pre_exe):
+        msg = "Pre-script not found: {}".format(pre_exe)
         if abort_on_failure:
             raise Exception(msg)
         logger.warning(msg)
         return result
 
-    if not os.access(pre_script, os.X_OK):
-        msg = "Pre-script not executable: {}".format(pre_script)
+    if not os.access(pre_exe, os.X_OK):
+        msg = "Pre-script not executable: {}".format(pre_exe)
         if abort_on_failure:
             raise Exception(msg)
         logger.warning(msg)
@@ -1871,7 +2033,7 @@ def execute_plugin_shell_hook(config):
     logger.info("Shell hook: running pre-script {}".format(pre_script))
     try:
         proc = subprocess.run(
-            [pre_script],
+            pre_argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
@@ -1905,18 +2067,20 @@ def cleanup_plugin_shell_hook(config, plugin_result):
     if not post_script:
         return None
 
-    if not os.path.isfile(post_script):
-        logger.warning("Post-script not found: {}".format(post_script))
-        return "{} not found".format(post_script)
+    post_argv, post_exe = _parse_script_command(post_script)
 
-    if not os.access(post_script, os.X_OK):
-        logger.warning("Post-script not executable: {}".format(post_script))
-        return "{} not executable".format(post_script)
+    if not os.path.isfile(post_exe):
+        logger.warning("Post-script not found: {}".format(post_exe))
+        return "{} not found".format(post_exe)
+
+    if not os.access(post_exe, os.X_OK):
+        logger.warning("Post-script not executable: {}".format(post_exe))
+        return "{} not executable".format(post_exe)
 
     logger.info("Shell hook: running post-script {}".format(post_script))
     try:
         proc = subprocess.run(
-            [post_script],
+            post_argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
@@ -1944,18 +2108,19 @@ def test_plugin_shell_hook(config):
     if not pre_script and not post_script:
         raise Exception("No scripts configured. Set at least a pre-script or post-script path.")
 
-    for label, path in [("Pre-script", pre_script), ("Post-script", post_script)]:
-        if not path:
+    for label, value in [("Pre-script", pre_script), ("Post-script", post_script)]:
+        if not value:
             results.append("{}: not configured (skipped)".format(label))
             continue
-        if not os.path.isfile(path):
-            raise Exception("{} not found: {}".format(label, path))
-        if not os.access(path, os.X_OK):
-            raise Exception("{} not executable: {} - run: chmod +x {}".format(label, path, path))
+        argv, exe = _parse_script_command(value)
+        if not os.path.isfile(exe):
+            raise Exception("{} not found: {}".format(label, exe))
+        if not os.access(exe, os.X_OK):
+            raise Exception("{} not executable: {} - run: chmod +x {}".format(label, exe, exe))
         # Actually run the script to verify it works under the agent's context
         try:
             proc = subprocess.run(
-                [path],
+                argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
@@ -1964,9 +2129,9 @@ def test_plugin_shell_hook(config):
             output = (proc.stdout or "").strip()[:500]
             if proc.returncode != 0:
                 raise Exception("{} exited with code {}: {}".format(label, proc.returncode, output))
-            results.append("{}: {} exit 0{}".format(label, path, " — {}".format(output) if output else ""))
+            results.append("{}: {} exit 0{}".format(label, value, " — {}".format(output) if output else ""))
         except subprocess.TimeoutExpired:
-            raise Exception("{} timed out after {}s: {}".format(label, timeout, path))
+            raise Exception("{} timed out after {}s: {}".format(label, timeout, value))
 
     return " | ".join(results)
 
@@ -2736,7 +2901,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             "job_id": job_id,
             "status_message": "Counting files...",
         })
-        files_total = count_files(directories)
+        one_fs = "--one-file-system" in command
+        files_total = count_files(directories, one_file_system=one_fs)
         logger.info("Pre-counted {} files to backup".format(files_total))
 
     # Report initial progress with file count
@@ -2762,6 +2928,10 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         ).replace(
             "/dev/null", "NUL"
         )
+        # Replace bare "ssh" command with our bundled ssh.exe to avoid the
+        # Windows built-in OpenSSH stdin forwarding bug that hangs borg.
+        if SSH_CMD != "ssh" and env["BORG_RSH"].startswith("ssh "):
+            env["BORG_RSH"] = '"' + SSH_CMD + '"' + env["BORG_RSH"][3:]
 
     # Always allow relocated repos - common after S3 restore or copying repositories
     # This prevents "repository was previously located at X" interactive prompts
@@ -2818,7 +2988,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                 known_hosts_null = "NUL" if IS_WINDOWS else "/dev/null"
                 catalog_ssh = subprocess.Popen(
                     [
-                        "ssh",
+                        SSH_CMD,
                         "-i", SSH_KEY_PATH,
                         "-p", str(ssh_info.get("ssh_port", 22)),
                         "-o", "StrictHostKeyChecking=no",
@@ -2864,16 +3034,17 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             })
             return
 
-    global current_proc
+    global current_borg_proc
     try:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            cwd=cwd,
-        )
-        current_proc = proc
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": env,
+            "cwd": cwd,
+        }
+        popen_kwargs.update(_popen_new_group_kwargs())
+        proc = subprocess.Popen(command, **popen_kwargs)
+        current_borg_proc = proc
 
         # Read stderr for JSON log output (borg writes progress to stderr)
         for raw_line in proc.stderr:
@@ -2910,18 +3081,25 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
 
                         # Check for server-side cancellation
                         if isinstance(progress_resp, dict) and progress_resp.get("cancel"):
-                            logger.warning("Job #{} cancelled by server — killing borg process".format(job_id))
-                            proc.kill()
-                            proc.wait()
+                            logger.warning("Job #{} cancelled by server — killing borg process tree".format(job_id))
+                            # Kill the whole process group so borg's ssh transport
+                            # child gets reaped too — otherwise it stays alive
+                            # holding our stdout pipe and the next read() blocks
+                            # the agent main loop indefinitely.
+                            _kill_process_tree(proc)
+                            try:
+                                proc.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                logger.warning("borg did not exit after kill, continuing anyway")
                             result = "failed"
                             error_output = "Cancelled by user"
                             # Close catalog SSH pipe if open
                             if catalog_ssh:
                                 try:
                                     catalog_ssh.stdin.close()
-                                    catalog_ssh.terminate()
                                 except Exception:
                                     pass
+                                _kill_process_tree(catalog_ssh)
                                 catalog_ssh = None
                             break
 
@@ -2978,9 +3156,35 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         job_cancelled = (error_output == "Cancelled by user")
         if not job_cancelled:
             proc.wait(timeout=86400)  # 24h timeout
+            # Safe to read here — borg exited normally so all pipe writers are gone.
+            stdout_output = proc.stdout.read().decode("utf-8", errors="replace")
         else:
-            proc.wait(timeout=10)  # Brief wait for cleanup
-        stdout_output = proc.stdout.read().decode("utf-8", errors="replace")
+            # After a cancel kill, never block on stdout.read(): if borg's ssh
+            # transport child somehow survived the group kill it would still
+            # hold the pipe writer end and read() would hang the agent forever
+            # (hangs were observed pre-2.24.1 leaving the agent stuck until
+            # service restart). Drain via communicate() with a hard timeout.
+            try:
+                drained_stdout, _ = proc.communicate(timeout=10)
+                if isinstance(drained_stdout, bytes):
+                    stdout_output = drained_stdout.decode("utf-8", errors="replace")
+                else:
+                    stdout_output = drained_stdout or ""
+            except subprocess.TimeoutExpired:
+                logger.warning("Job #{}: stdout drain timed out after cancel — re-killing tree".format(job_id))
+                _kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                # Close pipes manually so the agent loop doesn't get stuck
+                for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                    try:
+                        if pipe is not None:
+                            pipe.close()
+                    except Exception:
+                        pass
+                stdout_output = ""
 
         # Parse borg info from stdout if available
         if stdout_output:
@@ -3028,7 +3232,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         error_output = str(e)
         logger.error("Job #{} error: {}".format(job_id, e))
     finally:
-        current_proc = None
+        current_borg_proc = None
+
         # Close the catalog SSH pipe
         catalog_ssh_error = ""
         if catalog_ssh:
@@ -3149,19 +3354,19 @@ def clear_stale_cache_locks():
 
 
 def signal_handler(signum, frame):
-    global running, current_proc
+    global running, current_borg_proc
     logger.info("Shutdown signal received")
     running = False
     # Gracefully terminate active borg subprocess so it can release locks
-    if current_proc and current_proc.poll() is None:
-        logger.info("Terminating active borg process (PID {})".format(current_proc.pid))
+    if current_borg_proc and current_borg_proc.poll() is None:
+        logger.info("Terminating active borg process (PID {})".format(current_borg_proc.pid))
         try:
-            current_proc.terminate()  # SIGTERM -> borg cleans up & releases lock
-            current_proc.wait(timeout=15)
+            current_borg_proc.terminate()  # SIGTERM -> borg cleans up & releases lock
+            current_borg_proc.wait(timeout=15)
             logger.info("Borg process terminated cleanly")
         except subprocess.TimeoutExpired:
             logger.warning("Borg did not exit in 15s, sending SIGKILL")
-            current_proc.kill()
+            current_borg_proc.kill()
         except Exception as e:
             logger.warning("Error terminating borg: {}".format(e))
 
@@ -3172,15 +3377,33 @@ def heartbeat_thread(config):
     This prevents the agent from appearing offline during long-running
     backup operations. The thread only sends heartbeats when task_running
     is True, and exits when running becomes False.
+
+    Also processes stall-detection signals from the server: if the server
+    sees a job with no progress for >10 minutes, the heartbeat response
+    includes a check_jobs list. If the stalled job matches the currently
+    running borg process, we kill it so the agent can recover.
     """
-    global running, task_running
+    global running, task_running, current_job_id, current_borg_proc
     heartbeat_interval = max(config.get("poll_interval", 30), 10)
 
     while running:
         if task_running:
             try:
-                # Send a lightweight heartbeat ping
-                api_request(config, "/api/agent/heartbeat", method="POST", data={})
+                resp = api_request(config, "/api/agent/heartbeat", method="POST", data={})
+
+                if isinstance(resp, dict):
+                    # Handle stall check — server says these jobs have no progress
+                    stalled_ids = resp.get("check_jobs", [])
+                    if stalled_ids and current_job_id in stalled_ids and current_borg_proc is not None:
+                        logger.warning("Server reports job #{} stalled (no progress >10min) — killing borg".format(current_job_id))
+                        _kill_process_tree(current_borg_proc)
+
+                    # Handle cancel signal relayed through heartbeat
+                    cancel_id = resp.get("cancel_job")
+                    if cancel_id and cancel_id == current_job_id and current_borg_proc is not None:
+                        logger.warning("Job #{} cancelled by server (via heartbeat) — killing borg".format(current_job_id))
+                        _kill_process_tree(current_borg_proc)
+
             except Exception as e:
                 logger.debug("Heartbeat failed: {}".format(e))
 
@@ -3196,6 +3419,8 @@ def main():
 
     setup_logging()
     logger.info("BBS Agent v{} starting".format(AGENT_VERSION))
+    if IS_WINDOWS and SSH_CMD != "ssh":
+        logger.info("Using bundled SSH: {}".format(SSH_CMD))
 
     signal.signal(signal.SIGINT, signal_handler)
     if IS_WINDOWS:

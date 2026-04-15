@@ -133,6 +133,11 @@ $updateAvailable = $updateService->isUpdateAvailable();
                         <input type="number" class="form-control" name="agent_poll_interval" value="<?= htmlspecialchars($settings['agent_poll_interval'] ?? '30') ?>" min="5" max="300">
                         <div class="form-text">How often agents check for new tasks.</div>
                     </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Stall Detection Timeout (minutes)</label>
+                        <input type="number" class="form-control" name="stall_timeout_minutes" value="<?= htmlspecialchars($settings['stall_timeout_minutes'] ?? '120') ?>" min="10" max="1440">
+                        <div class="form-text">Kill backup jobs with no progress after this many minutes. Set higher for large files. Default: 120 (2 hours).</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1421,6 +1426,14 @@ function updateBuiltUrl(containerId, schema, prefix) {
                 </div>
             </div>
 
+            <div class="row g-3 mb-3">
+                <div class="col-12">
+                    <label class="form-label fw-semibold">Redirect URL Override <span class="text-muted fw-normal small">(optional)</span></label>
+                    <input type="url" class="form-control" name="oidc_redirect_url" value="<?= htmlspecialchars($settings['oidc_redirect_url'] ?? '') ?>" placeholder="https://bbs.example.com/login/oidc/callback">
+                    <div class="form-text">Leave blank to auto-detect from the request. Set this if BBS sits behind a reverse proxy but your OIDC provider needs a different URL than what the request headers show (e.g. your agents use an internal URL but SSO must use the public hostname).</div>
+                </div>
+            </div>
+
             <hr>
 
             <h6 class="mb-3">New User Handling</h6>
@@ -1955,9 +1968,7 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
                                         <?= htmlspecialchars($agent['name']) ?>
                                     </a>
                                     <?php if ($updateMode === 'server' && !$isCompatible): ?>
-                                        <span class="badge bg-danger ms-1" title="No compatible binary for glibc <?= htmlspecialchars($glibcDisplay ?: 'unknown') ?>">
-                                            <i class="bi bi-exclamation-triangle"></i>
-                                        </span>
+                                        <small class="text-muted ms-1" title="No server binary available for this agent's platform. The current borg version works fine — this agent just can't be updated via server push."><i class="bi bi-info-circle"></i></small>
                                     <?php endif; ?>
                                 </td>
                                 <td class="text-muted"><?= htmlspecialchars($osDisplay ?: '-') ?></td>
@@ -2050,7 +2061,7 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
                         html += '<td><i class="bi bi-pc-display me-1 text-muted"></i>';
                         html += '<a href="/clients/' + agent.id + '" class="text-decoration-none fw-semibold">' + agent.name.replace(/</g, '&lt;') + '</a>';
                         if (data.update_mode === 'server' && !agent.is_compatible) {
-                            html += ' <span class="badge bg-danger ms-1" title="No compatible binary"><i class="bi bi-exclamation-triangle"></i></span>';
+                            html += ' <small class="text-muted ms-1" title="No server binary available for this agent\'s platform. The current borg version works fine — this agent just can\'t be updated via server push."><i class="bi bi-info-circle"></i></small>';
                         }
                         html += '</td>';
                         html += '<td class="text-muted">' + agent.os_display.replace(/</g, '&lt;') + '</td>';

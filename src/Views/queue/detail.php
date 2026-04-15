@@ -33,6 +33,26 @@ $isServerSide = in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_
 $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 ?>
 
+<style>
+    /* Force long paths and command lines to wrap inside table cells / log entries */
+    .job-detail-wrap {
+        word-break: break-all;
+        overflow-wrap: anywhere;
+        white-space: normal;
+        display: inline-block;
+        max-width: 100%;
+    }
+    #log-section .list-group-item .small {
+        word-break: break-all;
+        overflow-wrap: anywhere;
+        min-width: 0;
+    }
+    #log-section .list-group-item .flex-grow-1,
+    #log-section .list-group-item .flex-grow-1 > .d-flex {
+        min-width: 0;
+    }
+</style>
+
 <div class="d-flex align-items-center mb-4">
     <a href="/queue" class="btn btn-sm btn-outline-secondary me-3"><i class="bi bi-arrow-left"></i> Queue</a>
     <h4 class="mb-0">
@@ -65,17 +85,17 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             </div>
             <div class="text-white-50 small">This <?= $job['task_type'] ?> job runs server-side and will be picked up by the scheduler within 60 seconds</div>
         <?php elseif ($job['status'] === 'running' && $pct > 0): ?>
-            <div class="text-white fw-semibold mb-1"><?= $taskLabel ?>... <?= $pct ?>%</div>
+            <div class="d-flex justify-content-between text-white mb-1">
+                <span class="fw-semibold"><?= $taskLabel ?>... <?= $pct ?>%</span>
+                <span class="small text-white-50"><?= formatBytes($job['bytes_processed']) ?><?= ($job['bytes_total'] ?? 0) > 0 ? ' of ' . formatBytes($job['bytes_total']) : '' ?> processed</span>
+            </div>
             <div class="progress mb-1" style="height: 22px; background-color: rgba(255,255,255,0.15);">
                 <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar"
                      style="width: <?= $pct ?>%; background-color: #5b9bd5;" aria-valuenow="<?= $pct ?>" aria-valuemin="0" aria-valuemax="100">
                     <?= number_format($job['files_processed']) ?> / <?= number_format($job['files_total']) ?> files
                 </div>
             </div>
-            <div class="d-flex justify-content-between text-white-50 small">
-                <span><?= formatBytes($job['bytes_processed']) ?><?= ($job['bytes_total'] ?? 0) > 0 ? ' of ' . formatBytes($job['bytes_total']) : '' ?> processed</span>
-                <span class="text-truncate ms-3" style="max-width: 60%; direction: rtl; text-align: right;" id="currentFile"></span>
-            </div>
+            <div class="text-white-50 small text-truncate" id="currentFile" style="max-width: 100%;"></div>
         <?php elseif ($job['status'] === 'running'): ?>
             <div class="text-white fw-semibold mb-1"><?= !empty($job['status_message']) ? htmlspecialchars($job['status_message']) : $taskLabel . ' in progress...' ?></div>
             <div class="progress mb-1" style="height: 22px; background-color: rgba(255,255,255,0.15);">
@@ -270,6 +290,55 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 
     <div class="col-lg-5">
         <div class="card border-0 shadow-sm h-100">
+            <?php if ($job['task_type'] === 'prune' && !empty($pruneStats)): ?>
+            <div class="card-header bg-body fw-semibold">
+                <i class="bi bi-scissors me-1"></i> Prune Stats
+            </div>
+            <div class="card-body p-0">
+                <table class="table table-borderless mb-0">
+                    <tbody>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3" style="width: 160px;">Recovery Points Before</td>
+                            <td><?= $pruneStats['existing'] !== null ? number_format($pruneStats['existing']) : '--' ?></td>
+                        </tr>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3">Kept</td>
+                            <td class="text-success fw-semibold"><?= $pruneStats['kept'] !== null ? number_format($pruneStats['kept']) : '--' ?></td>
+                        </tr>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3">Deleted</td>
+                            <td class="<?= ($pruneStats['deleted'] ?? 0) > 0 ? 'text-danger fw-semibold' : '' ?>">
+                                <?= $pruneStats['deleted'] !== null ? number_format($pruneStats['deleted']) : '--' ?>
+                            </td>
+                        </tr>
+                        <?php if (!empty($pruneStats['keep_rules'])): ?>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3">Keep Rules</td>
+                            <td>
+                                <?php foreach ($pruneStats['keep_rules'] as $rule => $n): ?>
+                                    <?php $short = ['hourly'=>'h','daily'=>'d','weekly'=>'w','monthly'=>'m','yearly'=>'y','minutely'=>'min','secondly'=>'s'][$rule] ?? $rule; ?>
+                                    <span class="badge bg-body-secondary text-body border me-1" title="<?= $n ?> <?= $rule ?>"><?= $n ?><?= $short ?></span>
+                                <?php endforeach; ?>
+                            </td>
+                        </tr>
+                        <?php endif; ?>
+                        <?php if (!empty($pruneStats['deleted_names'])): ?>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3 align-top pt-3">Pruned Archives</td>
+                            <td class="small">
+                                <?php foreach (array_slice($pruneStats['deleted_names'], 0, 20) as $name): ?>
+                                <div><code class="small text-danger"><?= htmlspecialchars($name) ?></code></div>
+                                <?php endforeach; ?>
+                                <?php if (count($pruneStats['deleted_names']) > 20): ?>
+                                <div class="text-muted">(and <?= count($pruneStats['deleted_names']) - 20 ?> more)</div>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php else: ?>
             <div class="card-header bg-body fw-semibold">
                 <i class="bi bi-bar-chart me-1"></i> Stats
             </div>
@@ -295,18 +364,19 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                         <?php if ($job['directories']): ?>
                         <tr>
                             <td class="text-muted fw-semibold ps-3">Directories</td>
-                            <td><code class="small"><?= htmlspecialchars(str_replace("\n", ', ', $job['directories'])) ?></code></td>
+                            <td><code class="small job-detail-wrap"><?= htmlspecialchars(str_replace("\n", ', ', $job['directories'])) ?></code></td>
                         </tr>
                         <?php endif; ?>
                         <?php if ($job['advanced_options']): ?>
                         <tr>
                             <td class="text-muted fw-semibold ps-3">Borg Options</td>
-                            <td><code class="small"><?= htmlspecialchars($job['advanced_options']) ?></code></td>
+                            <td><code class="small job-detail-wrap"><?= htmlspecialchars($job['advanced_options']) ?></code></td>
                         </tr>
                         <?php endif; ?>
                     </tbody>
                 </table>
             </div>
+            <?php endif; ?>
         </div>
     </div>
 </div>
@@ -318,7 +388,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
         <i class="bi bi-exclamation-triangle me-1"></i> Error Log
     </div>
     <div class="card-body">
-        <pre class="mb-0 small text-danger" style="white-space: pre-wrap;"><?= htmlspecialchars($job['error_log']) ?></pre>
+        <pre class="mb-0 small text-danger" style="white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;"><?= htmlspecialchars($job['error_log']) ?></pre>
     </div>
 </div>
 <?php endif; ?>
@@ -443,21 +513,26 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
         } else if (isJobActive && job.status === 'running' && pct > 0) {
             var taskLabel = (job.task_type || 'backup').replace('_',' ').replace(/^\w/, c => c.toUpperCase());
             var bytesText = fmtBytes(job.bytes_processed) + (job.bytes_total > 0 ? ' of ' + fmtBytes(job.bytes_total) : '') + ' processed';
-            var fileText = data.currentFile ? '<span class="text-truncate ms-3" style="max-width:60%;direction:rtl;text-align:right;" title="' + esc(data.currentFile) + '">' + esc(data.currentFile) + '</span>' : '';
-            var subRow = container.querySelector('.d-flex.justify-content-between');
-            if (subRow) {
+            var currentFile = data.currentFile ? data.currentFile.replace(/\/+$/, '') : '';
+            var fileHtml = currentFile ? '<div class="text-white-50 small text-truncate" style="max-width:100%;" title="' + esc(currentFile) + '">' + esc(currentFile) + '</div>' : '';
+            var headerRow = container.querySelector('.d-flex.justify-content-between');
+            if (headerRow) {
                 // In-place update
                 const bar = container.querySelector('.progress-bar');
-                const label = container.querySelector('.fw-semibold');
+                const label = headerRow.querySelector('.fw-semibold');
+                const bytesEl = headerRow.querySelector('.text-white-50');
                 if (bar) { bar.style.width = pct + '%'; bar.textContent = Number(job.files_processed).toLocaleString() + ' / ' + Number(job.files_total).toLocaleString() + ' files'; }
                 if (label) label.textContent = taskLabel + '... ' + pct + '%';
-                subRow.innerHTML = '<span>' + bytesText + '</span>' + fileText;
+                if (bytesEl) bytesEl.textContent = bytesText;
+                var fileEl = container.querySelector('.text-truncate');
+                if (fileEl && currentFile) { fileEl.textContent = currentFile; fileEl.title = currentFile; }
+                else if (fileEl && !currentFile) { fileEl.textContent = ''; }
             } else {
                 // Full replace (transitioning from pre-progress state)
                 container.innerHTML = '<div class="card border-0 shadow-sm mb-4" style="background-color:#2c3e50"><div class="card-body py-3">' +
-                    '<div class="text-white fw-semibold mb-1">' + esc(taskLabel) + '... ' + pct + '%</div>' +
+                    '<div class="d-flex justify-content-between text-white mb-1"><span class="fw-semibold">' + esc(taskLabel) + '... ' + pct + '%</span><span class="small text-white-50">' + bytesText + '</span></div>' +
                     '<div class="progress mb-1" style="height:22px;background-color:rgba(255,255,255,0.15)"><div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:' + pct + '%;background-color:#5b9bd5">' + Number(job.files_processed).toLocaleString() + ' / ' + Number(job.files_total).toLocaleString() + ' files</div></div>' +
-                    '<div class="d-flex justify-content-between text-white-50 small"><span>' + bytesText + '</span>' + fileText + '</div></div></div>';
+                    fileHtml + '</div></div>';
             }
         } else if (isJobActive && job.status === 'running') {
             // Full replace when transitioning from queued/sent to running (pre-progress phase)
@@ -556,7 +631,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                         const logEl = document.getElementById('log-section');
                         if (logEl) logEl.parentNode.insertBefore(errSection, logEl);
                     }
-                    errSection.innerHTML = '<div class="card border-0 shadow-sm mb-4 border-danger"><div class="card-header bg-body fw-semibold text-danger"><i class="bi bi-exclamation-triangle me-1"></i> Error Log</div><div class="card-body"><pre class="mb-0 small text-danger" style="white-space:pre-wrap;">' + esc(job.error_log) + '</pre></div></div>';
+                    errSection.innerHTML = '<div class="card border-0 shadow-sm mb-4 border-danger"><div class="card-header bg-body fw-semibold text-danger"><i class="bi bi-exclamation-triangle me-1"></i> Error Log</div><div class="card-body"><pre class="mb-0 small text-danger" style="white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;">' + esc(job.error_log) + '</pre></div></div>';
                 }
 
                 // Decide whether to keep polling

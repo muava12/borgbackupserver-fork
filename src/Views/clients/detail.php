@@ -147,7 +147,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                         <i class="bi bi-<?= $lastBackupIcon ?>"></i>
                     </div>
                     <div>
-                        <div class="fw-bold" style="font-size: 0.85rem;" id="stat-lastbackup"><?= $lastBackupLabel ?></div>
+                        <div class="fw-bold" id="stat-lastbackup"><?= $lastBackupLabel ?></div>
                         <div class="text-muted" style="font-size: 0.7rem;">Last Backup</div>
                     </div>
                 </div>
@@ -469,8 +469,12 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             <?php endif; ?>
                             &middot; <?= $durStr ?>
                             <?php if ($job['status'] === 'failed' && $job['error_log']): ?>
-                                <span class="text-danger ms-1" title="<?= htmlspecialchars(substr($job['error_log'], 0, 200)) ?>">
-                                    &middot; <i class="bi bi-exclamation-triangle"></i> <?= htmlspecialchars(substr($job['error_log'], 0, 80)) ?>
+                                <?php
+                                $errFull = $job['error_log'];
+                                $errShort = mb_strlen($errFull) > 80 ? mb_substr($errFull, 0, 80) . '…' : $errFull;
+                                ?>
+                                <span class="text-danger ms-1" title="<?= htmlspecialchars(mb_substr($errFull, 0, 500)) ?>">
+                                    &middot; <i class="bi bi-exclamation-triangle"></i> <?= htmlspecialchars($errShort) ?>
                                 </span>
                             <?php endif; ?>
                         </div>
