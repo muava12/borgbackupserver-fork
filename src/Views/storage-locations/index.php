@@ -5,8 +5,27 @@ function formatStorageBytes(int $bytes): string {
     return ServerStats::formatBytes($bytes);
 }
 
+function formatStorageBytesDecimal(int $bytes): string {
+    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    $i = 0;
+    $size = (float) $bytes;
+    while ($size >= 1000 && $i < count($units) - 1) {
+        $size /= 1000;
+        $i++;
+    }
+    return round($size, 1) . "\u{00A0}" . $units[$i];
+}
+
 $section = $_GET['section'] ?? '';
 ?>
+
+<script>
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, function(ch) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch];
+    });
+}
+</script>
 
 <?php if ($section === 's3'): ?>
 <!-- ==================== S3 Sync Settings ==================== -->
@@ -23,7 +42,7 @@ $section = $_GET['section'] ?? '';
     <div class="row g-4">
         <div class="col-lg-6">
             <div class="card border-0 shadow-sm">
-                <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-cloud-arrow-up me-1"></i> Global S3 Settings
                 </div>
                 <div class="card-body">
@@ -117,7 +136,7 @@ $section = $_GET['section'] ?? '';
                         <label class="form-check-label" for="s3_sync_server_backups">
                             Sync server backups to off-site storage daily
                         </label>
-                        <div class="form-text">Uploads the 7 most recent server backups from <code>/var/bbs/backups/</code> and removes older ones from S3.</div>
+                        <div class="form-text">Uploads the server backups from <code>/var/bbs/backups/</code> and removes deleted ones from S3.</div>
                     </div>
 
                     <div class="d-flex gap-2">
@@ -135,7 +154,7 @@ $section = $_GET['section'] ?? '';
 
         <div class="col-lg-6">
             <div class="card border-0 shadow-sm">
-                <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-info-circle me-1"></i> How It Works
                 </div>
                 <div class="card-body">
@@ -299,6 +318,31 @@ document.getElementById('btnTestS3')?.addEventListener('click', function() {
                     <label class="form-label fw-semibold">SSH Private Key</label>
                     <textarea class="form-control font-monospace" name="ssh_private_key" id="bbSshKey" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..." required></textarea>
                     <div class="form-text">Paste the private key that matches the public key you added to BorgBase.</div>
+                </div>
+
+                <div class="border rounded p-3 mb-3">
+                    <div class="fw-semibold mb-2">Manual Quota</div>
+                    <label class="form-label fw-semibold">Quota <span class="text-muted fw-normal">(GB, optional)</span></label>
+                    <input type="number" class="form-control" name="borgbase_manual_quota_gb" id="bbManualQuota" min="0" step="0.001" placeholder="e.g., 10">
+                    <div class="form-text">Use this when you do not want to connect the BorgBase API.</div>
+                </div>
+
+                <div class="border rounded p-3 mb-3">
+                    <div class="fw-semibold mb-2">BorgBase API</div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold" for="bbApiKey">API Key <span class="text-muted fw-normal">(optional)</span></label>
+                        <input type="text" class="form-control" name="borgbase_api_key" id="bbApiKey" value="" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" spellcheck="false" placeholder="Used only to sync quota and current usage">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold" for="bbRepoName">BorgBase Repo Name <span class="text-danger d-none" id="bbRepoNameRequired">*</span></label>
+                        <input type="text" class="form-control" name="borgbase_repo_name" id="bbRepoName">
+                        <div class="invalid-feedback">Repository name is required when an API key is provided.</div>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-primary" id="bbApiTestBtn" onclick="testBorgbaseApiFromWizard()" disabled>
+                        <i class="bi bi-shield-check me-1"></i> Verify API
+                    </button>
+                    <div class="form-text mt-2">The API key is encrypted before storage. The API repository id is matched to the SSH username from the connection string, and the API name must match the repo name above.</div>
+                    <div id="bbApiTestResult" style="display:none" class="mt-2"></div>
                 </div>
 
                 <div class="mb-3">
@@ -493,6 +537,7 @@ scp ~/.ssh/rsyncnet.pub <span class="text-warning" id="rsnScpUser">USERNAME</spa
         <div class="modal-content">
             <form method="POST" action="/remote-ssh-configs/create">
                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                <input type="hidden" name="provider" value="">
                 <div class="modal-header">
                     <h5 class="modal-title">Add Remote SSH Host</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
@@ -559,6 +604,12 @@ scp ~/.ssh/rsyncnet.pub <span class="text-warning" id="rsnScpUser">USERNAME</spa
 function showWizardForm(provider) {
     document.getElementById('wizardProviders').style.display = 'none';
     document.getElementById('wizard' + provider.charAt(0).toUpperCase() + provider.slice(1)).style.display = 'block';
+    if (provider === 'borgbase') {
+        setTimeout(function() {
+            document.getElementById('bbApiKey').value = '';
+            updateBbSubmit();
+        }, 0);
+    }
 }
 function hideWizardForm() {
     document.querySelectorAll('[id^="wizard"]').forEach(function(el) {
@@ -571,8 +622,11 @@ function hideWizardForm() {
     document.getElementById('bbParsedDetails').style.display = 'none';
     document.getElementById('bbParseError').style.display = 'none';
     document.getElementById('bbTestBtn').disabled = true;
+    document.getElementById('bbApiKey').value = '';
+    document.getElementById('bbApiTestBtn').disabled = true;
     document.getElementById('bbSubmitBtn').style.display = 'none';
     document.getElementById('bbTestResult').style.display = 'none';
+    document.getElementById('bbApiTestResult').style.display = 'none';
     // Reset Hetzner form
     document.getElementById('hetznerWizardForm').reset();
     hzTestPassed = false;
@@ -649,8 +703,16 @@ function updateBbSubmit() {
     var host = document.getElementById('bbFieldHost').value;
     var key = document.getElementById('bbSshKey').value.trim();
     var name = document.getElementById('bbName').value.trim();
+    var apiKey = document.getElementById('bbApiKey').value.trim();
+    var repoName = document.getElementById('bbRepoName').value.trim();
+    var repoInput = document.getElementById('bbRepoName');
+    var repoRequired = document.getElementById('bbRepoNameRequired');
     var canTest = !!(host && key);
     document.getElementById('bbTestBtn').disabled = !canTest;
+    document.getElementById('bbApiTestBtn').disabled = !(apiKey && repoName && document.getElementById('bbFieldUser').value);
+    repoInput.required = !!apiKey;
+    repoInput.classList.toggle('is-invalid', !!apiKey && !repoName);
+    repoRequired.classList.toggle('d-none', !apiKey);
     if (!bbTestPassed) {
         document.getElementById('bbSubmitBtn').style.display = 'none';
         document.getElementById('bbTestResult').style.display = 'none';
@@ -660,6 +722,8 @@ function updateBbSubmit() {
 }
 document.getElementById('bbSshKey').addEventListener('input', function() { bbTestPassed = false; updateBbSubmit(); });
 document.getElementById('bbName').addEventListener('input', updateBbSubmit);
+document.getElementById('bbApiKey').addEventListener('input', updateBbSubmit);
+document.getElementById('bbRepoName').addEventListener('input', updateBbSubmit);
 
 function testBorgbaseConnection() {
     var btn = document.getElementById('bbTestBtn');
@@ -706,6 +770,45 @@ function testBorgbaseConnection() {
     .finally(function() {
         btn.disabled = false;
         btn.innerHTML = '<i class="bi bi-plug me-1"></i> Test Connection';
+    });
+}
+
+function testBorgbaseApiFromWizard() {
+    var btn = document.getElementById('bbApiTestBtn');
+    var resultDiv = document.getElementById('bbApiTestResult');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Checking...';
+    resultDiv.style.display = 'none';
+
+    var formData = new URLSearchParams();
+    formData.append('csrf_token', document.querySelector('#borgbaseWizardForm [name=csrf_token]').value);
+    formData.append('remote_user', document.getElementById('bbFieldUser').value);
+    formData.append('borgbase_repo_name', document.getElementById('bbRepoName').value.trim());
+    formData.append('borgbase_api_key', document.getElementById('bbApiKey').value);
+
+    fetch('/remote-ssh-configs/borgbase-api-test', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: formData.toString()
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        resultDiv.style.display = 'block';
+        if (data.status === 'ok') {
+            var repo = data.repo || {};
+            resultDiv.innerHTML = '<div class="alert alert-success small py-2 px-3 mb-0"><i class="bi bi-check-circle me-1"></i> Verified — quota ' + escapeHtml(String(repo.quota_gb)) + ' GB, current usage ' + escapeHtml(String(repo.current_usage_mb)) + ' MB</div>';
+        } else {
+            resultDiv.innerHTML = '<div class="alert alert-danger small py-2 px-3 mb-0"><i class="bi bi-x-circle me-1"></i> ' + escapeHtml(data.error || 'BorgBase API check failed') + '</div>';
+        }
+    })
+    .catch(function() {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '<div class="alert alert-danger small py-2 px-3 mb-0"><i class="bi bi-x-circle me-1"></i> Request failed</div>';
+    })
+    .finally(function() {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-shield-check me-1"></i> Verify API';
+        updateBbSubmit();
     });
 }
 
@@ -959,6 +1062,8 @@ function applyRemotePreset(select, form) {
     var basePathField = form.querySelector('[name=remote_base_path]');
     var borgPathField = form.querySelector('[name=borg_remote_path]');
     var appendField = form.querySelector('[name=append_repo_name]');
+    var providerField = form.querySelector('[name=provider]');
+    if (providerField) providerField.value = preset;
 
     switch (preset) {
         case 'rsync.net':
@@ -986,49 +1091,50 @@ function applyRemotePreset(select, form) {
 <?php else: ?>
 <!-- ==================== Storage Overview (main page) ==================== -->
 
-<div class="d-flex justify-content-between align-items-center mb-4">
-    <h5 class="mb-0"><i class="bi bi-hdd-stack me-2"></i>Storage Locations</h5>
-    <button class="btn btn-sm btn-success" data-bs-toggle="collapse" data-bs-target="#addLocationForm">
-        <i class="bi bi-plus-circle me-1"></i> Add Location
-    </button>
-</div>
-
-<!-- Add Location Form -->
-<div class="collapse mb-4" id="addLocationForm">
-    <div class="card border-0 shadow-sm">
-        <div class="card-body">
-            <form method="POST" action="/storage-locations">
-                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                <div class="row g-3">
-                    <div class="col-md-3">
-                        <label class="form-label fw-semibold">Label</label>
-                        <input type="text" class="form-control" name="label" placeholder="e.g. Secondary Disk" required>
-                    </div>
-                    <div class="col-md-5">
-                        <label class="form-label fw-semibold">Path</label>
-                        <input type="text" class="form-control" name="path" placeholder="/mnt/storage2" required>
-                        <div class="form-text">Absolute path to the storage directory. Must exist and be writable.</div>
-                    </div>
-                    <div class="col-md-2 d-flex align-items-center pt-4">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="is_default" id="newIsDefault">
-                            <label class="form-check-label" for="newIsDefault">Default</label>
-                        </div>
-                    </div>
-                    <div class="col-md-2 d-flex align-items-end">
-                        <button type="submit" class="btn btn-sm btn-success w-100">Create</button>
-                    </div>
-                </div>
-            </form>
-        </div>
+<!-- Local Storage Locations -->
+<div class="card border-0 shadow-sm mb-4">
+    <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-hdd me-2"></i>Local Storage</span>
+        <button class="btn btn-sm btn-success" data-bs-toggle="collapse" data-bs-target="#addLocationForm">
+            <i class="bi bi-plus-circle me-1"></i> Add Location
+        </button>
     </div>
-</div>
+    <div class="card-body">
+        <!-- Add Location Form -->
+        <div class="collapse mb-3" id="addLocationForm">
+            <div class="card border bg-body-tertiary">
+                <div class="card-body">
+                    <form method="POST" action="/storage-locations">
+                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                        <div class="row g-3">
+                            <div class="col-md-3">
+                                <label class="form-label fw-semibold">Label</label>
+                                <input type="text" class="form-control" name="label" placeholder="e.g. Secondary Disk" required>
+                            </div>
+                            <div class="col-md-5">
+                                <label class="form-label fw-semibold">Path</label>
+                                <input type="text" class="form-control" name="path" placeholder="/mnt/storage2" required>
+                                <div class="form-text">Absolute path to the storage directory. Must exist and be writable.</div>
+                            </div>
+                            <div class="col-md-2 d-flex align-items-center pt-4">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" name="is_default" id="newIsDefault">
+                                    <label class="form-check-label" for="newIsDefault">Default</label>
+                                </div>
+                            </div>
+                            <div class="col-md-2 d-flex align-items-end">
+                                <button type="submit" class="btn btn-sm btn-success w-100">Create</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
 
-<!-- Storage Locations -->
-<?php if (empty($locations)): ?>
-<div class="alert alert-info">No storage locations configured. Add one to get started.</div>
-<?php else: ?>
-<div class="row g-3">
+        <?php if (empty($locations)): ?>
+        <div class="alert alert-info mb-0">No storage locations configured. Click "Add Location" above to get started.</div>
+        <?php else: ?>
+        <div class="row g-3">
     <?php foreach ($locations as $loc): ?>
     <div class="col-xl-4 col-lg-6">
         <div class="card border-0 shadow-sm h-100">
@@ -1086,28 +1192,33 @@ function applyRemotePreset(select, form) {
         </div>
     </div>
     <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+    </div>
 </div>
-<?php endif; ?>
 
 <!-- Remote Storage (SSH) -->
-<div class="d-flex justify-content-between align-items-center mb-3 mt-5">
-    <h5 class="mb-0"><i class="bi bi-hdd-network me-2"></i>Remote Storage (SSH)</h5>
-    <a href="/storage-locations?section=wizard" class="btn btn-sm btn-success">
-        <i class="bi bi-plus-circle me-1"></i> Add SSH Host
-    </a>
-</div>
+<div class="card border-0 shadow-sm mb-4">
+    <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-hdd-network me-2"></i>Remote Storage (SSH)</span>
+        <a href="/storage-locations?section=wizard" class="btn btn-sm btn-success">
+            <i class="bi bi-plus-circle me-1"></i> Add SSH Host
+        </a>
+    </div>
+    <div class="card-body">
 
 <?php if (empty($remoteSshConfigs)): ?>
-<div class="alert alert-info">No remote SSH hosts configured. <a href="/storage-locations?section=wizard">Add one</a> to get started.</div>
+<div class="alert alert-info mb-0">No remote SSH hosts configured. <a href="/storage-locations?section=wizard">Add one</a> to get started.</div>
 <?php else: ?>
 <div class="row g-3">
     <?php foreach ($remoteSshConfigs as $rsc): ?>
+    <?php $isBorgBase = (($rsc['provider'] ?? '') === 'borgbase') || str_contains((string)($rsc['remote_host'] ?? ''), '.repo.borgbase.com'); ?>
     <div class="col-xl-4 col-lg-6">
         <div class="card border-0 shadow-sm h-100">
             <div class="card-body">
                 <div class="d-flex align-items-start gap-2 mb-2">
                     <div class="flex-shrink-0 mt-1" style="font-size: 1.4rem;">
-                        <?php if (($rsc['provider'] ?? '') === 'borgbase'): ?>
+                        <?php if ($isBorgBase): ?>
                         <img src="/images/borgbase.svg" alt="" style="width:24px;height:24px;border-radius:50%">
                         <?php elseif (($rsc['provider'] ?? '') === 'hetzner'): ?>
                         <img src="/images/hetzner-h.png" alt="" style="width:24px;height:24px;border-radius:50%">
@@ -1163,18 +1274,25 @@ function applyRemotePreset(select, form) {
                     $rscFree = (int)$rsc['disk_free_bytes'];
                     $rscPct = $rscTotal > 0 ? round(($rscUsed / $rscTotal) * 100, 1) : 0;
                     $rscBarColor = $rscPct >= 90 ? 'danger' : ($rscPct >= 75 ? 'warning' : 'success');
+                    $useDecimalRemoteBytes = $isBorgBase && ($rsc['borgbase_usage_source'] ?? '') === 'borgbase_api';
+                    $formatRemoteBytes = fn(int $bytes): string => $useDecimalRemoteBytes
+                        ? formatStorageBytesDecimal($bytes)
+                        : \BBS\Services\ServerStats::formatBytes($bytes);
                     ?>
                     <div class="d-flex justify-content-between small text-muted mb-1">
-                        <span><?= \BBS\Services\ServerStats::formatBytes($rscUsed) ?> used</span>
-                        <span><?= \BBS\Services\ServerStats::formatBytes($rscFree) ?> free</span>
+                        <span><?= $formatRemoteBytes($rscUsed) ?> used</span>
+                        <span><?= $formatRemoteBytes($rscFree) ?> free</span>
                     </div>
                     <div class="progress" style="height: 6px;">
                         <div class="progress-bar bg-<?= $rscBarColor ?>" style="width: <?= $rscPct ?>%"></div>
                     </div>
-                    <div class="text-muted small mt-1"><?= \BBS\Services\ServerStats::formatBytes($rscTotal) ?> total &middot; <?= $rscPct ?>% used &middot; checked <?= \BBS\Core\TimeHelper::ago($rsc['disk_checked_at']) ?></div>
+                    <div class="text-muted small mt-1"><?= $formatRemoteBytes($rscTotal) ?> total &middot; <?= $rscPct ?>% used &middot; checked <?= \BBS\Core\TimeHelper::ago($rsc['disk_checked_at']) ?></div>
+                    <?php if ($isBorgBase && !empty($rsc['borgbase_usage_source'])): ?>
+                    <div class="text-muted small mt-1">Source: <?= $rsc['borgbase_usage_source'] === 'borgbase_api' ? 'BorgBase API' : 'manual quota' ?></div>
+                    <?php endif; ?>
                 </div>
                 <?php elseif ($wasChecked): ?>
-                <div class="mt-2 small text-muted"><i class="bi bi-exclamation-triangle me-1"></i>Quota unavailable — provider does not support disk usage queries</div>
+                <div class="mt-2 small text-muted"><i class="bi bi-exclamation-triangle me-1"></i><?= $isBorgBase ? 'Set quota manually or use API' : 'Quota unavailable — provider does not support disk usage queries' ?></div>
                 <?php endif; ?>
                 <div id="remoteSshTestResult<?= $rsc['id'] ?>" class="mt-2"></div>
             </div>
@@ -1230,6 +1348,38 @@ function applyRemotePreset(select, form) {
                             <label class="form-check-label" for="editAppendRepoName<?= $rsc['id'] ?>">Append repository name to base path</label>
                             <div class="form-text">Uncheck for providers like BorgBase where each SSH user maps to a single fixed repo path.</div>
                         </div>
+                        <?php if ($isBorgBase): ?>
+                        <hr>
+                        <div class="border rounded p-3 mb-3">
+                            <div class="fw-semibold mb-2">Manual Quota</div>
+                            <label class="form-label fw-semibold">Quota <span class="text-muted fw-normal">(GB, optional)</span></label>
+                            <input type="number" class="form-control" name="borgbase_manual_quota_gb" min="0" step="0.001" value="<?= htmlspecialchars((string)($rsc['borgbase_manual_quota_gb'] ?? '')) ?>">
+                            <div class="form-text">Use this when you do not want to connect the BorgBase API.</div>
+                        </div>
+                        <div class="border rounded p-3 mb-3">
+                            <div class="fw-semibold mb-2">BorgBase API</div>
+                            <div class="mb-3">
+                                <label class="form-label fw-semibold" for="editBbApiKey<?= $rsc['id'] ?>">API Key <span class="text-muted fw-normal">(optional)</span></label>
+                                <input type="password" class="form-control" name="borgbase_api_key" id="editBbApiKey<?= $rsc['id'] ?>" autocomplete="off" data-has-saved-key="<?= !empty($rsc['borgbase_api_key_encrypted']) ? '1' : '0' ?>" placeholder="<?= !empty($rsc['borgbase_api_key_encrypted']) ? 'Leave blank to keep existing key' : 'Paste API key' ?>" oninput="updateEditBorgbaseApiRequirement(<?= $rsc['id'] ?>)">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-semibold" for="editBbRepoName<?= $rsc['id'] ?>">BorgBase Repo Name <span class="text-danger d-none" id="editBbRepoNameRequired<?= $rsc['id'] ?>">*</span></label>
+                                <input type="text" class="form-control" name="borgbase_repo_name" id="editBbRepoName<?= $rsc['id'] ?>" value="<?= htmlspecialchars($rsc['borgbase_repo_name'] ?? '') ?>" oninput="updateEditBorgbaseApiRequirement(<?= $rsc['id'] ?>)">
+                                <div class="invalid-feedback">Repository name is required when an API key is provided.</div>
+                            </div>
+                            <button type="button" class="btn btn-sm btn-outline-primary" onclick="testBorgbaseApiExisting(<?= $rsc['id'] ?>)">
+                                <i class="bi bi-shield-check me-1"></i> Verify API
+                            </button>
+                            <?php if (!empty($rsc['borgbase_api_key_encrypted'])): ?>
+                            <div class="form-check mt-2">
+                                <input class="form-check-input" type="checkbox" name="borgbase_clear_api_key" value="1" id="clearBbApi<?= $rsc['id'] ?>">
+                                <label class="form-check-label" for="clearBbApi<?= $rsc['id'] ?>">Remove saved API key</label>
+                            </div>
+                            <?php endif; ?>
+                            <div class="form-text mt-2">The key is encrypted before storage and never shown again.</div>
+                            <div id="editBbApiTestResult<?= $rsc['id'] ?>" style="display:none" class="mt-2"></div>
+                        </div>
+                        <?php endif; ?>
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -1242,22 +1392,27 @@ function applyRemotePreset(select, form) {
     <?php endforeach; ?>
 </div>
 <?php endif; ?>
+    </div>
+</div>
 
 <!-- S3 Offsite Sync -->
 <?php
 $s3Configured = !empty($settings['s3_endpoint']) && !empty($settings['s3_bucket']);
 $s3SyncServerBackups = ($settings['s3_sync_server_backups'] ?? '0') === '1';
 ?>
-<div class="mb-3 mt-5">
-    <h5 class="mb-0"><i class="bi bi-bucket me-2"></i>S3 Offsite Sync</h5>
-</div>
+<div class="card border-0 shadow-sm mb-4">
+    <div class="card-header fw-semibold">
+        <i class="bi bi-bucket me-2"></i>S3 Offsite Sync
+    </div>
+    <div class="card-body">
 
-<?php if (!$s3Configured): ?>
-<div class="alert alert-info">S3 offsite sync is not configured. <a href="/storage-locations?section=s3">Configure it</a> to replicate local repos to S3-compatible storage.</div>
+<?php if (!$s3Configured && empty($s3Destinations)): ?>
+<div class="alert alert-info mb-0">S3 offsite sync is not configured. <a href="/storage-locations?section=s3">Configure it</a> to replicate local repos to S3-compatible storage.</div>
 <?php else: ?>
 <div class="row g-3">
+    <?php if ($s3Configured): ?>
     <div class="col-xl-4 col-lg-6">
-        <div class="card border-0 shadow-sm">
+        <div class="card border-0 shadow-sm h-100">
             <div class="card-body">
                 <div class="d-flex justify-content-between align-items-start mb-2">
                     <h6 class="mb-0"><i class="bi bi-cloud-arrow-up me-1 text-primary"></i> Global S3</h6>
@@ -1293,11 +1448,68 @@ $s3SyncServerBackups = ($settings['s3_sync_server_backups'] ?? '0') === '1';
                     </div>
                 </div>
                 <span class="badge bg-success"><i class="bi bi-check-circle me-1"></i>Configured</span>
+                <div class="form-text mt-1">Shared credentials — S3 configs below can reference these.</div>
             </div>
         </div>
     </div>
+    <?php endif; ?>
+
+</div>
+
+<?php if (!empty($s3Destinations)): ?>
+<!-- Sync configurations — a flat list, not location cards: several of
+     these can point at the same S3 (Global credentials), and one repo
+     can sync to several of them. -->
+<h6 class="fw-semibold mt-4 mb-2">S3 Sync Configurations</h6>
+<div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Client</th>
+                <th>Destination</th>
+                <th class="text-end">Repositories Syncing</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            <?php foreach ($s3Destinations as $dest):
+                $destCfg = json_decode($dest['config'] ?? '{}', true) ?: [];
+                $usesGlobal = ($destCfg['credential_source'] ?? (empty($destCfg['endpoint']) ? 'global' : 'custom')) === 'global';
+            ?>
+            <tr>
+                <td class="fw-semibold"><i class="bi bi-bucket me-1 text-info"></i><?= htmlspecialchars($dest['name']) ?></td>
+                <td><a href="/clients/<?= $dest['agent_id'] ?>"><?= htmlspecialchars($dest['agent_name']) ?></a></td>
+                <td class="text-truncate" style="max-width: 280px;">
+                    <?php if ($usesGlobal): ?>
+                    <span class="text-muted">Global S3</span><?php if (!empty($settings['s3_bucket'])): ?> <span class="small text-muted">(<?= htmlspecialchars($settings['s3_bucket']) ?>)</span><?php endif; ?>
+                    <?php else: ?>
+                    <?= htmlspecialchars($destCfg['endpoint'] ?? 'Custom') ?><?= !empty($destCfg['bucket']) ? ' / ' . htmlspecialchars($destCfg['bucket']) : '' ?>
+                    <?php endif; ?>
+                </td>
+                <td class="text-end"><?= (int) $dest['repo_count'] ?></td>
+                <td class="text-end">
+                    <a class="btn btn-sm btn-outline-secondary" href="/clients/<?= $dest['agent_id'] ?>?tab=plugins" title="Edit on the client's Plugins tab">
+                        <i class="bi bi-gear"></i>
+                    </a>
+                </td>
+            </tr>
+            <?php endforeach; ?>
+        </tbody>
+    </table>
 </div>
 <?php endif; ?>
+
+<div class="form-text mt-3">
+    <i class="bi bi-info-circle me-1"></i>
+    Repositories can replicate to <strong>multiple S3 destinations</strong>. To add one:
+    create an <em>S3 Offsite Sync</em> configuration on the client's Plugins tab (with custom
+    credentials for a second provider), then attach it on the repository's page under
+    <em>S3 Offsite Mirror &rarr; Add Destination</em>.
+</div>
+<?php endif; ?>
+    </div>
+</div>
 
 <script>
 function testRemoteSsh(id, triggerEl) {
@@ -1321,6 +1533,79 @@ function testRemoteSsh(id, triggerEl) {
     .catch(function() {
         resultDiv.innerHTML = '<span class="badge bg-danger"><i class="bi bi-x-circle me-1"></i>Request failed</span>';
     });
+}
+
+function testBorgbaseApiExisting(id) {
+    var resultDiv = document.getElementById('editBbApiTestResult' + id);
+    var repoInput = document.getElementById('editBbRepoName' + id);
+    var apiInput = document.getElementById('editBbApiKey' + id);
+    var modal = document.getElementById('editRemoteSshModal' + id);
+    var userInput = modal ? modal.querySelector('[name=remote_user]') : null;
+    var csrfInput = modal ? modal.querySelector('[name=csrf_token]') : null;
+    var fallbackCsrfInput = document.querySelector('input[name=csrf_token]');
+    var apiKey = apiInput ? apiInput.value.trim() : '';
+    var repoName = repoInput ? repoInput.value.trim() : '';
+    var hasSavedKey = apiInput && apiInput.dataset.hasSavedKey === '1';
+
+    if (!apiKey && !hasSavedKey) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '<div class="alert alert-danger small py-2 px-3 mb-0"><i class="bi bi-x-circle me-1"></i> Enter an API key to verify it before saving.</div>';
+        return;
+    }
+    if (!repoName) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '<div class="alert alert-danger small py-2 px-3 mb-0"><i class="bi bi-x-circle me-1"></i> Enter a BorgBase repository name to verify the API key.</div>';
+        updateEditBorgbaseApiRequirement(id);
+        return;
+    }
+
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '<div class="alert alert-secondary small py-2 px-3 mb-0"><span class="spinner-border spinner-border-sm me-1"></span>Checking BorgBase API...</div>';
+
+    var formData = new URLSearchParams();
+    formData.append('csrf_token', csrfInput ? csrfInput.value : (fallbackCsrfInput ? fallbackCsrfInput.value : ''));
+    formData.append('config_id', String(id));
+    formData.append('remote_user', userInput ? userInput.value.trim() : '');
+    formData.append('borgbase_repo_name', repoName);
+    formData.append('borgbase_api_key', apiKey);
+
+    fetch('/remote-ssh-configs/borgbase-api-test', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: formData.toString()
+    })
+    .then(function(r) {
+        return r.text().then(function(text) {
+            try {
+                return JSON.parse(text || '{}');
+            } catch (e) {
+                throw new Error(text ? text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180) : 'Invalid server response');
+            }
+        });
+    })
+    .then(function(data) {
+        if (data.status === 'ok') {
+            var repo = data.repo || {};
+            resultDiv.innerHTML = '<div class="alert alert-success small py-2 px-3 mb-0"><i class="bi bi-check-circle me-1"></i>Verified - quota ' + escapeHtml(String(repo.quota_gb)) + ' GB, current usage ' + escapeHtml(String(repo.current_usage_mb)) + ' MB</div>';
+        } else {
+            resultDiv.innerHTML = '<div class="alert alert-danger small py-2 px-3 mb-0"><i class="bi bi-x-circle me-1"></i> ' + escapeHtml(data.error || 'BorgBase API check failed') + '</div>';
+        }
+    })
+    .catch(function(error) {
+        resultDiv.innerHTML = '<div class="alert alert-danger small py-2 px-3 mb-0"><i class="bi bi-x-circle me-1"></i> ' + escapeHtml(error && error.message ? error.message : 'Request failed') + '</div>';
+    });
+}
+
+function updateEditBorgbaseApiRequirement(id) {
+    var repoInput = document.getElementById('editBbRepoName' + id);
+    var apiInput = document.getElementById('editBbApiKey' + id);
+    var requiredMark = document.getElementById('editBbRepoNameRequired' + id);
+    if (!repoInput || !apiInput || !requiredMark) return;
+    var apiPresent = apiInput.value.trim() !== '';
+    var repoMissing = repoInput.value.trim() === '';
+    repoInput.required = apiPresent;
+    repoInput.classList.toggle('is-invalid', apiPresent && repoMissing);
+    requiredMark.classList.toggle('d-none', !apiPresent);
 }
 
 function deleteRemoteSsh(id, name) {

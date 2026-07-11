@@ -1,324 +1,695 @@
-<!-- Stat Cards -->
-<div class="row g-3 mb-4">
-    <div class="col-xl-3 col-md-6">
-        <a href="/clients" class="text-decoration-none">
-            <div class="card border-0 shadow-sm h-100 metric-card-blue">
-                <div class="card-body d-flex align-items-center">
-                    <div class="stat-icon bg-primary bg-opacity-10 text-primary rounded-3 p-3 me-3">
-                        <i class="bi bi-display fs-3"></i>
-                    </div>
-                    <div>
-                        <div class="text-muted small">Clients</div>
-                        <div class="fs-4 fw-bold" id="stat-agents"><?= $agentCount ?></div>
-                        <div class="text-muted small"><span id="stat-online"><?= $onlineCount ?></span> online</div>
-                    </div>
-                </div>
-            </div>
-        </a>
-    </div>
-    <div class="col-xl-3 col-md-6">
-        <a href="/queue" class="text-decoration-none">
-            <div class="card border-0 shadow-sm h-100 metric-card-success">
-                <div class="card-body d-flex align-items-center">
-                    <div class="stat-icon bg-success bg-opacity-10 text-success rounded-3 p-3 me-3">
-                        <i class="bi bi-arrow-repeat fs-3"></i>
-                    </div>
-                    <div>
-                        <div class="text-muted small">Backups Running</div>
-                        <div class="fs-4 fw-bold" id="stat-running"><?= $runningJobs ?></div>
-                        <div class="text-muted small">active jobs</div>
-                    </div>
-                </div>
-            </div>
-        </a>
-    </div>
-    <div class="col-xl-3 col-md-6">
-        <a href="/queue" class="text-decoration-none">
-            <div class="card border-0 shadow-sm h-100 metric-card-warning">
-                <div class="card-body d-flex align-items-center">
-                    <div class="stat-icon bg-warning bg-opacity-10 text-warning rounded-3 p-3 me-3">
-                        <i class="bi bi-hourglass-split fs-3"></i>
-                    </div>
-                    <div>
-                        <div class="text-muted small">Queue Waiting</div>
-                        <div class="fs-4 fw-bold" id="stat-queued"><?= $queuedJobs ?></div>
-                        <div class="text-muted small">pending jobs</div>
-                    </div>
-                </div>
-            </div>
-        </a>
-    </div>
-    <div class="col-xl-3 col-md-6">
-        <a href="/log?level=error" class="text-decoration-none">
-            <div class="card border-0 shadow-sm h-100 metric-card-danger">
-                <div class="card-body d-flex align-items-center">
-                    <div class="stat-icon bg-danger bg-opacity-10 text-danger rounded-3 p-3 me-3">
-                        <i class="bi bi-exclamation-circle fs-3"></i>
-                    </div>
-                    <div>
-                        <div class="text-muted small">Errors (24h)</div>
-                        <div class="fs-4 fw-bold" id="stat-errors"><?= $errorCount ?></div>
-                        <div class="text-muted small">check logs</div>
-                    </div>
-                </div>
-            </div>
-        </a>
-    </div>
-</div>
+<?php
+use BBS\Services\ServerStats;
+use BBS\Core\TimeHelper;
 
-<!-- Row 2: Backups Chart | Server Stats | Server Partitions -->
-<div class="row g-4 mb-4">
-    <div class="<?= $isAdmin ? 'col-lg-4' : 'col-12' ?>">
-        <div class="card border-0 card-no-outline shadow-sm h-100">
-            <div class="card-header bg-body fw-semibold">
-                <i class="bi bi-bar-chart me-1"></i> Jobs (24h)
-            </div>
-            <div class="card-body py-2">
-                <canvas id="backupsChart" height="160"></canvas>
-            </div>
-        </div>
-    </div>
-    <?php if ($isAdmin): ?>
-    <div class="col-lg-3">
-        <div class="card border-0 card-no-outline shadow-sm h-100">
-            <div class="card-header bg-body fw-semibold">
-                <i class="bi bi-cpu me-1"></i> Server Stats
-            </div>
-            <div class="card-body">
-                <?php
-                    $cpuColor = $cpuLoad['percent'] > 80 ? '#dc3545' : ($cpuLoad['percent'] > 50 ? '#ffc107' : '#198754');
-                    $memColor = $memory['percent'] > 85 ? '#dc3545' : ($memory['percent'] > 60 ? '#ffc107' : '#0dcaf0');
-                    $arcLen = 212.06;
-                    $circum = 282.74;
-                    $cpuDash = $arcLen * $cpuLoad['percent'] / 100;
-                    $memDash = $arcLen * $memory['percent'] / 100;
-                ?>
-                <div class="d-flex justify-content-around">
-                    <div class="text-center" style="width:120px;">
-                        <svg viewBox="0 0 120 95" style="width:100%;height:auto;">
-                            <circle cx="60" cy="55" r="45" fill="none" class="gauge-track" stroke-width="8"
-                                stroke-dasharray="<?= $arcLen ?> <?= $circum ?>" stroke-linecap="round"
-                                transform="rotate(135 60 55)"/>
-                            <circle cx="60" cy="55" r="45" fill="none" stroke="<?= $cpuColor ?>" stroke-width="8"
-                                id="cpu-arc" stroke-dasharray="<?= $cpuDash ?> <?= $circum ?>" stroke-linecap="round"
-                                transform="rotate(135 60 55)" style="transition: stroke-dasharray .5s ease, stroke .5s ease;"/>
-                            <text x="60" y="48" text-anchor="middle" font-size="18" font-weight="bold" class="gauge-pct" id="cpu-pct"><?= $cpuLoad['percent'] ?>%</text>
-                            <text x="60" y="62" text-anchor="middle" font-size="8" class="gauge-detail" id="cpu-detail"><?= $cpuLoad['1min'] ?> / <?= $cpuLoad['cores'] ?> cores</text>
-                        </svg>
-                        <div class="text-muted" style="font-size:.75rem;margin-top:-8px;">CPU</div>
-                    </div>
-                    <div class="text-center" style="width:120px;">
-                        <svg viewBox="0 0 120 95" style="width:100%;height:auto;">
-                            <circle cx="60" cy="55" r="45" fill="none" class="gauge-track" stroke-width="8"
-                                stroke-dasharray="<?= $arcLen ?> <?= $circum ?>" stroke-linecap="round"
-                                transform="rotate(135 60 55)"/>
-                            <circle cx="60" cy="55" r="45" fill="none" stroke="<?= $memColor ?>" stroke-width="8"
-                                id="mem-arc" stroke-dasharray="<?= $memDash ?> <?= $circum ?>" stroke-linecap="round"
-                                transform="rotate(135 60 55)" style="transition: stroke-dasharray .5s ease, stroke .5s ease;"/>
-                            <text x="60" y="48" text-anchor="middle" font-size="18" font-weight="bold" class="gauge-pct" id="mem-pct"><?= $memory['percent'] ?>%</text>
-                            <text x="60" y="62" text-anchor="middle" font-size="8" class="gauge-detail" id="mem-detail"><?= \BBS\Services\ServerStats::formatBytes($memory['used']) ?> / <?= \BBS\Services\ServerStats::formatBytes($memory['total']) ?></text>
-                        </svg>
-                        <div class="text-muted" style="font-size:.75rem;margin-top:-8px;">Memory</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-    <div class="col-lg-5">
-        <div class="card border-0 card-no-outline shadow-sm h-100">
-            <div class="card-header bg-body fw-semibold">
-                <i class="bi bi-hdd-stack me-1"></i> Server Partitions
-            </div>
-            <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-sm align-middle mb-0 small">
-                        <thead class="table-light">
-                            <tr>
-                                <th>Partition</th>
-                                <th style="min-width: 100px;">% Used</th>
-                                <th class="d-th-md">Size</th>
-                                <th class="d-th-md">Free</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($partitions as $part): ?>
-                            <tr>
-                                <td><i class="bi bi-device-hdd text-muted me-1"></i> <?= htmlspecialchars($part['mount']) ?></td>
-                                <td>
-                                    <div class="progress" style="height: 18px;">
-                                        <div class="progress-bar progress-bar-striped <?= $part['percent'] > 90 ? 'bg-danger' : ($part['percent'] > 70 ? 'bg-warning' : '') ?>"
-                                             style="width: <?= $part['percent'] ?>%; <?= $part['percent'] <= 70 ? 'background-color:#8faabe;' : '' ?>">
-                                        </div>
-                                    </div>
-                                </td>
-                                <td class="d-table-cell-md"><?= $part['size'] ?></td>
-                                <td class="d-table-cell-md"><?= $part['free'] ?></td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
+$isAdmin = ($_SESSION['user_role'] ?? '') === 'admin';
+
+// ---- Helpers ----
+$compact = function (int $n): string {
+    if ($n >= 1_000_000) return round($n / 1_000_000, 1) . 'M';
+    if ($n >= 10_000)    return round($n / 1_000, 1) . 'K';
+    return number_format($n);
+};
+$fmtUptime = function (?int $s): string {
+    if ($s === null) return '—';
+    $d = intdiv($s, 86400); $s %= 86400;
+    $h = intdiv($s, 3600);  $s %= 3600;
+    $m = intdiv($s, 60);
+    if ($d > 0) return "{$d}d {$h}h";
+    if ($h > 0) return "{$h}h {$m}m";
+    return "{$m}m";
+};
+// Dedup savings % (original data vs actual disk footprint).
+// Clamp the displayed value at 99.9% when there's still bytes on disk —
+// round() lifts 99.95%+ to 100% which misrepresents a non-empty repo (#191).
+$dedupSavingsPct = $totalOriginalBytes > 0
+    ? round((1 - $totalDiskBytes / $totalOriginalBytes) * 100, 1)
+    : 0;
+if ($dedupSavingsPct >= 100 && $totalDiskBytes > 0) {
+    $dedupSavingsPct = 99.9;
+}
+
+// df output from the OS uses single-letter units ("100G"). Add a non-breaking
+// space + "B" suffix so it matches our standard "100 GB" format.
+$dfFix = function (string $s): string {
+    if (preg_match('/^([\d.]+)([TGMK])$/', $s, $m)) return $m[1] . "\u{00A0}" . $m[2] . 'B';
+    return $s;
+};
+?>
+
+<style>
+/* Server Health: CPU dial (with a compressed memory bar under it) and
+   network throughput meter on top row, disk strip below spanning the
+   full width. Single featured partition only — full disk list lives in
+   Storage Locations. */
+.v2 .health-tiles {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    align-items: stretch;
+}
+.v2 .health-tile {
+    background: var(--bs-tertiary-bg);
+    border-radius: 10px;
+    padding: 0 10px 5px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    overflow: hidden;
+}
+/* Header strip flush to the top of the tile. Matches the parent card
+   header (.card-head-gradient) so each gauge feels like its own card. */
+.v2 .health-tile .tile-header-bar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+    width: calc(100% + 20px);
+    margin: 0 -10px 8px;
+    padding: 5px 12px;
+    background: #f1f3f5;
+    border-bottom: 1px solid rgba(0,0,0,0.08);
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--bs-body-color);
+    letter-spacing: 0.02em;
+}
+[data-bs-theme="dark"] .v2 .health-tile .tile-header-bar {
+    background: #202b3f;
+    border-bottom-color: rgb(24 24 25);
+    color: #fff;
+}
+.v2 .health-tile .tile-header-bar i { font-size: 0.9rem; line-height: 1; }
+.v2 .health-tile.cpu .tile-header-bar i { color: #ef4444; }
+.v2 .health-tile.net .tile-header-bar i { color: #0dcaf0; }
+
+/* Legacy head (disk strip still uses it for its inline label). */
+.v2 .health-tile .tile-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 0.85rem;
+    color: var(--bs-body-color);
+    font-weight: 500;
+    max-width: 100%;
+}
+.v2 .health-tile .tile-head .icon {
+    display: inline-flex;
+    width: 28px; height: 28px;
+    border-radius: 7px;
+    align-items: center; justify-content: center;
+    font-size: 1rem;
+}
+.v2 .health-tile.disk .icon { background: rgba(245,158,11,0.18); color: #f59e0b; }
+
+/* CPU gauge. The dial group is vertically centered in the space between
+   the tile header and the memory bar. */
+.v2 .cpu-dial-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+}
+.v2 .cpu-gauge { width: 100%; max-width: 150px; height: auto; display: block; }
+.v2 .cpu-gauge .arc-bg { stroke: rgba(0,0,0,0.08); }
+.v2 .cpu-gauge .arc-fg { transition: stroke-dashoffset 0.6s ease, stroke 0.3s; }
+.v2 .cpu-gauge .ticks { stroke: rgba(0,0,0,0.30); }
+[data-bs-theme="dark"] .v2 .cpu-gauge .arc-bg { stroke: rgba(255,255,255,0.08); }
+[data-bs-theme="dark"] .v2 .cpu-gauge .ticks { stroke: rgba(255,255,255,0.22); }
+.v2 .cpu-pct { font-size: 1.3rem; font-weight: 700; line-height: 1; margin-top: -48px; }
+.v2 .cpu-pct .pct-suffix,
+.v2 .disk-pct .pct-suffix { font-size: 0.8rem; font-weight: 600; opacity: 0.75; margin-left: 1px; }
+.v2 .cpu-status { font-size: 0.7rem; margin-top: 4px; font-weight: 500; }
+
+/* Compressed memory meter under the CPU dial: label | bar | used/total.
+   Same track/overlay idiom as the disk strip, just smaller. */
+.v2 .cpu-mem-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin-top: 6px;
+    padding-top: 7px;
+    border-top: 1px solid var(--bs-border-color-translucent);
+}
+.v2 .cm-bar {
+    flex: 1;
+    height: 14px;
+    background: var(--bs-tertiary-bg);
+    border: 1px solid var(--bs-border-color-translucent);
+    border-radius: 7px;
+    position: relative;
+    min-width: 40px;
+}
+.v2 .cm-bar-fill { height: 100%; border-radius: 7px; transition: width 0.6s ease, background-color 0.3s; }
+.v2 .cm-bar-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 0.62rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.85), 0 1px 4px rgba(0,0,0,0.85);
+    pointer-events: none;
+}
+.v2 .cm-size {
+    font-size: 0.66rem;
+    color: var(--bs-secondary-color);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+/* Network throughput meter — one block per direction: a compact header
+   row (arrow | label | rate) over a full-width sparkline strip. Stacking
+   keeps every element inside the tile no matter how narrow it gets. */
+.v2 .net-rows {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 9px;
+    flex: 1;
+    width: 100%;
+    padding: 4px 0;
+}
+.v2 .net-block {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+    min-width: 0;
+}
+.v2 .net-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+}
+.v2 .net-row .net-dir {
+    display: inline-flex;
+    width: 20px; height: 20px;
+    border-radius: 6px;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.95rem;
+    background: rgba(13,202,240,0.14);
+    color: #0dcaf0;
+    flex-shrink: 0;
+}
+.v2 .net-row .net-lbl { font-size: 0.62rem; font-weight: 600; letter-spacing: 0.04em; color: var(--bs-secondary-color); }
+.v2 .net-row .net-val {
+    margin-left: auto;
+    font-size: 0.88rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.v2 .net-spark { width: 100%; height: 16px; display: block; }
+.v2 .net-spark .spark-line { fill: none; stroke: #0dcaf0; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.v2 .net-spark .spark-fill { fill: rgba(13,202,240,0.15); stroke: none; }
+
+/* Disk strip — full width across the bottom. Horizontal: head | numbers | bar */
+.v2 .health-tile.disk {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    align-items: center;
+    text-align: left;
+    min-height: 0;
+    padding: 12px 16px;
+    gap: 16px;
+}
+.v2 .health-tile.disk .tile-head { margin-bottom: 0; flex-shrink: 0; }
+.v2 .disk-size { font-size: 0.85rem; font-weight: 600; color: var(--bs-body-color); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.v2 .disk-bar {
+    flex: 1;
+    height: 18px;
+    background: var(--bs-tertiary-bg);
+    border: 1px solid var(--bs-border-color-translucent);
+    border-radius: 9px;
+    position: relative;
+    min-width: 80px;
+}
+.v2 .disk-bar-fill {
+    height: 100%;
+    border-radius: 9px;
+    transition: width 0.6s ease, background-color 0.3s;
+}
+/* Percentage label overlaid on the bar, centered and reverse-styled
+   (white with a heavy shadow) so it stays readable regardless of how
+   much of the bar is filled. */
+.v2 .disk-bar-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 0.78rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.85), 0 1px 4px rgba(0,0,0,0.85);
+    pointer-events: none;
+}
+
+/* Stack everything on narrow screens. */
+@media (max-width: 575px) {
+    .v2 .health-tiles { grid-template-columns: 1fr; }
+    .v2 .health-tile { min-height: auto; }
+    .v2 .health-tile.disk { flex-direction: column; align-items: stretch; text-align: center; }
+    .v2 .health-tile.disk .disk-bar { width: 100%; }
+}
+
+/* File Catalog card — stats table with hairline separators (no striped bg).
+   --bs-table-bg override strips the table's own background so the card's
+   background shows through instead of a darker block behind the rows. */
+.v2 .ch-stats-table {
+    --bs-table-bg: transparent;
+    background-color: transparent;
+}
+.v2 .ch-stats-table td {
+    background-color: transparent;
+    border-top: 0;
+    border-bottom: 1px solid var(--bs-border-color-translucent);
+}
+.v2 .ch-stats-table tr:last-child td { border-bottom: 0; }
+
+/* On mobile / narrow viewports the File Catalog flex container wraps. Let
+   the stats table use the full card width instead of staying pinned to
+   260px, and give it breathing room before the donut + top-repos block. */
+@media (max-width: 767.98px) {
+    .v2 .ch-stats-wrap {
+        max-width: none !important;
+        margin-right: 0 !important;
+        margin-bottom: 12px !important;
+        width: 100%;
+    }
+}
+
+/* Recently Completed — smaller column headers per user feedback */
+.v2 .recent-jobs-table thead th {
+    font-size: 75%;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+/* File Catalog card — Top Repositories rows, tighter line-height */
+.v2 .top-repo-row {
+    padding: 2px 4px;
+    line-height: 1.25;
+}
+
+.v2 .storage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+    max-width: 100%;
+}
+/* On large screens, fit exactly N columns (set via inline CSS var).
+   Falls back to auto-fill below 1200px or when cards are > 5. */
+@media (min-width: 1200px) {
+    .v2 .storage-grid.exact-cols {
+        grid-template-columns: repeat(var(--storage-cols), 1fr);
+    }
+}
+/* Cap any single storage card to 50% of the container so a single
+   storage location doesn't stretch across the whole row. */
+.v2 .storage-grid.single-col .storage-card { max-width: 50%; }
+.v2 .storage-card {
+    background: var(--bs-body-bg);
+    border: 1px solid var(--bs-border-color);
+    border-radius: 10px;
+    padding: 12px 14px;
+    transition: border-color 0.12s;
+}
+.v2 .storage-card:hover { border-color: var(--bs-primary); }
+.v2 .storage-card .sc-head { display: flex; justify-content: space-between; align-items: start; gap: 8px; margin-bottom: 8px; }
+.v2 .storage-card .sc-label { font-weight: 600; font-size: 0.9rem; word-break: break-word; }
+.v2 .storage-card .sc-kind { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--bs-secondary-color); }
+.v2 .storage-card .sc-kind.remote { color: #9ec5fe; }
+.v2 .storage-card .sc-path { font-size: 0.72rem; color: var(--bs-secondary-color); font-family: ui-monospace, Menlo, Consolas, monospace; margin-bottom: 8px; word-break: break-all; }
+.v2 .storage-card .sc-bar { height: 8px; background: var(--bs-tertiary-bg); border-radius: 4px; overflow: hidden; margin-bottom: 6px; }
+.v2 .storage-card .sc-fill { height: 100%; border-radius: 4px; }
+.v2 .storage-card .sc-numbers { display: flex; justify-content: space-between; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+.v2 .storage-card .sc-footer { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--bs-secondary-color); margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--bs-border-color); }
+
+.v2 .mini-stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.82rem; }
+.v2 .mini-stat .k { color: var(--bs-secondary-color); }
+.v2 .mini-stat .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* Backup Summary: 3-col x 2-row grid of compact stat tiles. Sized to
+   match the Server Health card height alongside it. */
+.v2 .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+}
+.v2 .summary-tile {
+    background: var(--bs-tertiary-bg);
+    border: 1px solid var(--bs-border-color-translucent);
+    border-radius: 8px;
+    padding: 18px 4px 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+}
+.v2 .summary-tile .stat-icon {
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center; justify-content: center;
+    font-size: 0.9rem;
+    margin-bottom: 4px;
+}
+.v2 .summary-tile .icon-blue   { background: rgba(59,130,246,0.18);  color: #60a5fa; box-shadow: 0 0 0 1px rgba(59,130,246,0.25); }
+.v2 .summary-tile .icon-purple { background: rgba(168,85,247,0.18);  color: #c084fc; box-shadow: 0 0 0 1px rgba(168,85,247,0.25); }
+.v2 .summary-tile .icon-cyan   { background: rgba(6,182,212,0.18);   color: #22d3ee; box-shadow: 0 0 0 1px rgba(6,182,212,0.25); }
+.v2 .summary-tile .icon-green  { background: rgba(34,197,94,0.18);   color: #4ade80; box-shadow: 0 0 0 1px rgba(34,197,94,0.25); }
+.v2 .summary-tile .icon-orange { background: rgba(245,158,11,0.18);  color: #fbbf24; box-shadow: 0 0 0 1px rgba(245,158,11,0.25); }
+.v2 .summary-tile .stat-label  { font-size: 0.68rem; color: var(--bs-secondary-color); margin-bottom: 3px; line-height: 1.15; }
+.v2 .summary-tile .stat-value  { font-size: 1.05rem; font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; }
+
+@media (max-width: 575px) {
+    .v2 .summary-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+.v2 .table thead th {
+    font-size: 0.875rem;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--bs-secondary-color);
+    font-weight: 600;
+}
+</style>
+
+<div class="v2 container-fluid px-0">
+    <?php if (!empty($schedulerStale)): ?>
+    <div class="alert alert-warning d-flex align-items-start gap-2 mb-3" role="alert">
+        <i class="bi bi-exclamation-triangle-fill mt-1"></i>
+        <div>
+            <strong>The scheduler isn't running.</strong>
+            <?php if (!empty($schedulerLastRun)): ?>
+                It last ran <?= htmlspecialchars(\BBS\Core\TimeHelper::ago($schedulerLastRun)) ?> (expected every minute).
+            <?php else: ?>
+                It has never recorded a run.
+            <?php endif; ?>
+            Server-side jobs (prune, compact, catalog) will stay queued and can block later backups for the same repository, even though agent backups still run.
+            <div class="small mt-1 text-body-secondary">
+                Check the scheduler cron is active. On Docker: <code>tail /var/log/bbs-scheduler.log</code> inside the container (it should update every minute) and confirm <code>cron</code> is running. On bare metal, confirm the <code>scheduler.php</code> cron entry exists for the web user.
             </div>
         </div>
     </div>
     <?php endif; ?>
-</div>
+    <!-- Row 1: Hero tiles — same icon-on-left pattern as /clients and /queue -->
+    <?php $errCls = $errorCount > 0 ? 'danger' : 'success'; ?>
+    <div class="row g-3 mb-3">
+        <div class="col-xl-3 col-md-6">
+            <a href="/clients" class="text-decoration-none text-reset metric-card-link d-block">
+                <div class="card border-0 shadow-sm h-100 metric-card-blue">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stat-icon bg-primary bg-opacity-10 text-primary rounded-3 p-3 me-3">
+                            <i class="bi bi-display fs-3"></i>
+                        </div>
+                        <div>
+                            <div class="text-muted small">Clients</div>
+                            <div class="fs-4 fw-bold" id="tile-agent-count"><?= $agentCount ?></div>
+                            <div class="text-muted small">
+                                <span class="text-success fw-semibold" id="tile-online-count"><?= $onlineCount ?></span>
+                                online · <span id="tile-offline-count"><?= max(0, $agentCount - $onlineCount) ?></span> offline
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <a href="/queue" class="text-decoration-none text-reset metric-card-link d-block">
+                <div class="card border-0 shadow-sm h-100 metric-card-success">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stat-icon bg-success bg-opacity-10 text-success rounded-3 p-3 me-3">
+                            <i class="bi bi-arrow-repeat fs-3"></i>
+                        </div>
+                        <div>
+                            <div class="text-muted small">Running</div>
+                            <div class="fs-4 fw-bold" id="tile-running-count"><?= $runningJobs ?></div>
+                            <div class="text-muted small">active · <span id="tile-queued-count"><?= $queuedJobs ?></span> queued</div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <a href="#recovery-points" class="text-decoration-none text-reset metric-card-link d-block">
+                <div class="card border-0 shadow-sm h-100 metric-card-warning">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stat-icon bg-warning bg-opacity-10 text-warning rounded-3 p-3 me-3">
+                            <i class="bi bi-archive fs-3"></i>
+                        </div>
+                        <div>
+                            <div class="text-muted small">Recovery Points</div>
+                            <div class="fs-4 fw-bold"><?= $compact($totalArchiveCount) ?></div>
+                            <div class="text-muted small"><?= ServerStats::formatBytes($totalDiskBytes) ?> on disk</div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <a href="/log?level=error&hours=24" id="tile-errors-link" class="text-decoration-none text-reset metric-card-link d-block">
+                <div class="card border-0 shadow-sm h-100 metric-card-<?= $errCls ?>" id="tile-errors-card">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stat-icon bg-<?= $errCls ?> bg-opacity-10 text-<?= $errCls ?> rounded-3 p-3 me-3" id="tile-errors-icon-wrap">
+                            <i class="bi bi-<?= $errorCount > 0 ? 'exclamation-circle' : 'check-circle' ?> fs-3" id="tile-errors-icon"></i>
+                        </div>
+                        <div>
+                            <div class="text-muted small">Errors (24h)</div>
+                            <div class="fs-4 fw-bold" id="tile-error-count"><?= $errorCount ?></div>
+                            <div class="text-muted small">check logs</div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+    </div>
 
-<?php if ($isAdmin): ?>
-<?php
-// Compact number formatter: 1234 → "1,234", 51200 → "51.2K", 1100000 → "1.1M"
-$compactNum = function(int $n): string {
-    if ($n >= 1000000) return round($n / 1000000, 1) . 'M';
-    if ($n >= 10000) return round($n / 1000, 1) . 'K';
-    return number_format($n);
-};
-$chStats = $clickhouseStats ?? null;
-$pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
-?>
-<!-- Row 3: Storage Pool + MySQL Health (left) | ClickHouse Catalog (right) -->
-<div class="row g-4 mb-4">
-    <!-- Left column: Storage Pool + MySQL Health stacked -->
-    <div class="col-lg-4">
-        <?php if (!empty($storage) && $storage['disk_total'] !== null): ?>
-        <?php
-            $stUsed = $storage['disk_used'] ?? ($storage['disk_total'] - $storage['disk_free']);
-            $stRepoPct = $storage['disk_total'] > 0 ? round($storage['total_repo_bytes'] / $storage['disk_total'] * 100, 1) : 0;
-            $stOtherPct = $storage['disk_total'] > 0 ? round(($stUsed - $storage['total_repo_bytes']) / $storage['disk_total'] * 100, 1) : 0;
-            if ($stOtherPct < 0) $stOtherPct = 0;
-            $stFreePct = $storage['disk_total'] > 0 ? round($storage['disk_free'] / $storage['disk_total'] * 100, 1) : 0;
-            $stUsedPct = round(100 - $stFreePct, 1);
-            // SVG donut
-            $r = 45; $c = 2 * M_PI * $r;
-            $seg1 = $c * $stRepoPct / 100;
-            $seg2 = $c * $stOtherPct / 100;
-            $off2 = $seg1;
-            // Dedup ratio
-            $dedupSavings = $storage['dedup_savings'] ?? 0;
-            $totalOrig = (int)($storage['total_original'] ?? 0);
-            $totalDedup = (int)($storage['total_dedup'] ?? 0);
-            $dedupRatio = ($totalDedup > 0 && $totalOrig > 0) ? round($totalOrig / $totalDedup, 1) : 0;
-        ?>
-        <div class="card border-0 shadow-sm">
-            <div class="card-header bg-body d-flex justify-content-between align-items-center">
-                <span class="fw-semibold"><i class="bi bi-device-hdd me-1"></i> Storage Pool</span>
-                <span class="text-muted" style="font-size:.7rem;"><?= htmlspecialchars($storage['path']) ?></span>
+    <!-- Row 2: Activity chart | Backup summary | Server health (admin only) -->
+    <?php
+        // Admin: Jobs gets half, Backup Summary + Server Health share the
+        // other half equally. Non-admin: Jobs + Backup Summary split 7/5.
+        $row2JobsCol = $isAdmin ? 'col-xl-6 col-lg-6' : 'col-lg-7';
+        $row2SummaryCol = $isAdmin ? 'col-xl-3 col-lg-6' : 'col-lg-5';
+        $row2HealthCol = 'col-xl-3 col-lg-12';
+    ?>
+    <div class="row g-3 mb-3">
+        <div class="<?= $row2JobsCol ?>">
+            <div class="card border-0 shadow-sm h-100">
+                <div class="card-header card-head-gradient fw-semibold">
+                    <i class="bi bi-bar-chart me-2"></i>Jobs (Last 24h)
+                </div>
+                <div class="card-body py-2">
+                    <div style="position: relative; min-height: 155px; height: 100%;">
+                        <canvas id="jobsChart"></canvas>
+                    </div>
+                </div>
             </div>
-            <div class="card-body px-3 py-2">
-                <div class="d-flex align-items-center justify-content-between">
-                    <!-- Col 1: Repositories / Recovery Points (hidden on smaller screens) -->
-                    <div class="d-none d-xxl-block">
-                        <div class="mb-2">
-                            <div class="fw-semibold text-success" style="font-size:.6rem;">Repositories</div>
-                            <div class="d-flex align-items-center">
-                                <i class="bi bi-archive text-muted me-1" style="font-size:.75rem;"></i>
-                                <span class="fw-bold" style="font-size:1rem;line-height:1;"><?= $storage['repo_count'] ?></span>
-                            </div>
+        </div>
+
+        <div class="<?= $row2SummaryCol ?>" id="recovery-points">
+            <div class="card border-0 shadow-sm h-100">
+                <div class="card-header card-head-gradient fw-semibold">
+                    <i class="bi bi-shield-check me-2"></i>Backup Summary
+                </div>
+                <div class="card-body">
+                    <div class="summary-grid">
+                        <div class="summary-tile">
+                            <div class="stat-icon icon-blue"><i class="bi bi-archive"></i></div>
+                            <div class="stat-label">Recovery Points</div>
+                            <div class="stat-value"><?= number_format($totalArchiveCount) ?></div>
                         </div>
-                        <div>
-                            <div class="fw-semibold text-success" style="font-size:.6rem;">Recovery Points</div>
-                            <div class="d-flex align-items-center">
-                                <i class="bi bi-clock-history text-muted me-1" style="font-size:.75rem;"></i>
-                                <span class="fw-bold" style="font-size:1rem;line-height:1;"><?= number_format($storage['total_archives'] ?? 0) ?></span>
-                            </div>
+                        <div class="summary-tile">
+                            <div class="stat-icon icon-purple"><i class="bi bi-file-earmark"></i></div>
+                            <div class="stat-label">Original Data</div>
+                            <div class="stat-value"><?= ServerStats::formatBytes($totalOriginalBytes) ?></div>
                         </div>
-                    </div>
-                    <!-- Col 2: Protected Data / Dedup Savings -->
-                    <div>
-                        <div class="mb-2">
-                            <div class="fw-semibold text-success" style="font-size:.6rem;">Protected Data</div>
-                            <div class="d-flex align-items-center">
-                                <i class="bi bi-shield-check text-muted me-1" style="font-size:.75rem;"></i>
-                                <span class="fw-bold" style="font-size:1rem;line-height:1;"><?= \BBS\Services\ServerStats::formatBytes($totalOrig) ?></span>
-                            </div>
+                        <div class="summary-tile">
+                            <div class="stat-icon icon-cyan"><i class="bi bi-hdd"></i></div>
+                            <div class="stat-label">On Disk</div>
+                            <div class="stat-value"><?= ServerStats::formatBytes($totalDiskBytes) ?></div>
                         </div>
-                        <div>
-                            <div class="fw-semibold text-success" style="font-size:.6rem;">Dedup Savings</div>
-                            <div class="d-flex align-items-center">
-                                <span class="fw-bold" style="font-size:1rem;line-height:1;"><?= $dedupSavings ?>%</span>
-                                <?php if ($dedupRatio >= 1): ?>
-                                <span class="text-muted ms-1" style="font-size:.55rem;">(<?= $dedupRatio == (int)$dedupRatio ? (int)$dedupRatio : $dedupRatio ?>:1)</span>
-                                <?php endif; ?>
-                            </div>
+                        <div class="summary-tile">
+                            <div class="stat-icon icon-green"><i class="bi bi-stars"></i></div>
+                            <div class="stat-label">Dedup Savings</div>
+                            <div class="stat-value text-success"><?= $dedupSavingsPct ?>%</div>
                         </div>
-                    </div>
-                    <!-- Col 3: Donut + Legend -->
-                    <div class="d-flex align-items-center">
-                        <div style="width:80px;flex-shrink:0;margin-top:-20px;">
-                            <svg viewBox="0 0 120 120" style="width:100%;height:auto;transform:rotate(-90deg);">
-                                <circle cx="60" cy="60" r="<?= $r ?>" fill="none" class="donut-track" stroke-width="14"/>
-                                <?php if ($stRepoPct > 0): ?>
-                                <circle cx="60" cy="60" r="<?= $r ?>" fill="none" stroke="#48bb78" stroke-width="14"
-                                    stroke-dasharray="<?= round($seg1, 2) ?> <?= round($c - $seg1, 2) ?>"
-                                    stroke-dashoffset="0"/>
-                                <?php endif; ?>
-                                <?php if ($stOtherPct > 0): ?>
-                                <circle cx="60" cy="60" r="<?= $r ?>" fill="none" stroke="#6c757d" stroke-width="14"
-                                    stroke-dasharray="<?= round($seg2, 2) ?> <?= round($c - $seg2, 2) ?>"
-                                    stroke-dashoffset="-<?= round($off2, 2) ?>"/>
-                                <?php endif; ?>
-                            </svg>
-                            <div class="text-center" style="margin-top:-55px;position:relative;line-height:1.2;">
-                                <div class="fw-bold" style="font-size:.8rem;"><?= $stUsedPct ?>%</div>
-                                <div class="text-muted" style="font-size:.5rem;">used</div>
-                            </div>
+                        <div class="summary-tile">
+                            <div class="stat-icon icon-orange"><i class="bi bi-clock-history"></i></div>
+                            <div class="stat-label">Last Backup</div>
+                            <div class="stat-value"><?= $lastBackup ? TimeHelper::ago($lastBackup['completed_at']) : '—' ?></div>
                         </div>
-                        <div class="ms-2" style="font-size:.6rem;line-height:1.7;">
-                            <div><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:#48bb78;margin-right:3px;"></span>Repos <?= \BBS\Services\ServerStats::formatBytes($storage['total_repo_bytes']) ?></div>
-                            <?php if ($stOtherPct > 0): ?>
-                            <div><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:#6c757d;margin-right:3px;"></span>Other <?= \BBS\Services\ServerStats::formatBytes($stUsed - $storage['total_repo_bytes']) ?></div>
-                            <?php endif; ?>
-                            <div><span class="donut-free-dot" style="display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:3px;"></span>Free <?= \BBS\Services\ServerStats::formatBytes($storage['disk_free']) ?></div>
-                            <div class="text-muted">Total: <?= \BBS\Services\ServerStats::formatBytes($storage['disk_total']) ?></div>
+                        <div class="summary-tile">
+                            <div class="stat-icon icon-blue"><i class="bi bi-graph-up-arrow"></i></div>
+                            <div class="stat-label">Backups (24h)</div>
+                            <div class="stat-value"><?= number_format($backupsLast24h ?? 0) ?></div>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
-        <?php endif; ?>
 
-        <?php /* Remote storage dashboard widgets — disabled pending redesign
-        <?php if (!empty($storage['remote_storage'])): ?>
-        <?php foreach ($storage['remote_storage'] as $rs): ?>
-        ...
-        <?php endforeach; ?>
-        <?php endif; ?>
-        */ ?>
+        <?php if ($isAdmin): ?>
+        <div class="<?= $row2HealthCol ?>">
+            <div class="card border-0 shadow-sm h-100">
+                <div class="card-header card-head-gradient fw-semibold">
+                    <i class="bi bi-cpu me-2"></i>Server Health
+                </div>
+                <div class="card-body">
+                    <?php
+                        $cpuPct = (float) ($cpuLoad['percent'] ?? 0);
+                        $memPct = (float) ($memory['percent'] ?? 0);
+                        $memUsed = (int) ($memory['used'] ?? 0);
+                        $memTotal = (int) ($memory['total'] ?? 0);
+                        $cpuColor = $cpuPct > 80 ? '#ef4444' : ($cpuPct > 50 ? '#f59e0b' : '#22c55e');
+                        $cpuStatus = $cpuPct > 80 ? 'High Usage' : ($cpuPct > 50 ? 'Moderate' : 'Healthy');
+                        $memColor = $memPct > 85 ? '#ef4444' : ($memPct > 60 ? '#f59e0b' : '#0dcaf0');
 
-        <?php if (!empty($mysqlStats)): ?>
-        <div class="card border-0 shadow-sm mt-4">
-            <div class="card-header bg-body fw-semibold py-2">
-                <i class="bi bi-database me-1"></i> MySQL Health
-            </div>
-            <div class="card-body py-2">
-                <div class="row g-2 text-center" style="font-size:.7rem;">
-                    <div class="col-4">
-                        <div class="fw-bold" style="font-size:.9rem;" id="stat-qps"><?= $mysqlStats['qps'] ?></div>
-                        <div class="text-muted">QPS</div>
-                    </div>
-                    <div class="col-4">
-                        <div class="fw-bold" style="font-size:.9rem;" id="stat-connections"><?= $mysqlStats['threads_connected'] ?></div>
-                        <div class="text-muted">Connections</div>
-                    </div>
-                    <div class="col-4">
-                        <div class="fw-bold" style="font-size:.9rem;" id="stat-hit-rate"><?= $mysqlStats['hit_rate'] ?>%</div>
-                        <div class="text-muted">Hit Rate</div>
-                    </div>
-                    <div class="col-4">
-                        <?php
-                        $uptimeDays = floor($mysqlStats['uptime'] / 86400);
-                        $uptimeHrs = floor(($mysqlStats['uptime'] % 86400) / 3600);
-                        $uptimeStr = $uptimeDays > 0 ? "{$uptimeDays}d {$uptimeHrs}h" : "{$uptimeHrs}h";
-                        ?>
-                        <div class="fw-bold" style="font-size:.9rem;" id="stat-uptime"><?= $uptimeStr ?></div>
-                        <div class="text-muted">Uptime</div>
-                    </div>
-                    <div class="col-4">
-                        <div class="fw-bold" style="font-size:.9rem;" id="stat-bp-usage"><?= $mysqlStats['buffer_pool_used_pct'] ?>%</div>
-                        <div class="text-muted">Buffer Pool</div>
-                    </div>
-                    <div class="col-4">
-                        <div class="fw-bold" style="font-size:.9rem;" id="stat-slow"><?= number_format($mysqlStats['slow_queries']) ?></div>
-                        <div class="text-muted">Slow Queries</div>
+                        // Featured partition. In hosted mode the platform-managed
+                        // mount is the only one customers care about, so we
+                        // resolve the default storage_locations.path and use
+                        // df on it (it might be a bind-mount under a different
+                        // device that df doesn't show as its own row).
+                        // Non-hosted: /var/bbs preferred, fall back to /.
+                        $diskPart = null;
+                        $hostedDefault = \BBS\Core\Config::isHosted()
+                            ? $this->db->fetchOne("SELECT path FROM storage_locations WHERE is_default = 1")
+                            : null;
+                        if ($hostedDefault && !empty($hostedDefault['path'])) {
+                            $defaultPath = rtrim($hostedDefault['path'], '/') ?: '/';
+                            foreach (($partitions ?? []) as $p) {
+                                if (($p['mount'] ?? '') === $defaultPath) { $diskPart = $p; break; }
+                            }
+                            if (!$diskPart) {
+                                $du = ServerStats::getDiskUsage($defaultPath);
+                                if ($du) {
+                                    $diskPart = [
+                                        'mount'   => $defaultPath,
+                                        'size'    => ServerStats::formatDfSize($du['total']),
+                                        'used'    => ServerStats::formatDfSize($du['used']),
+                                        'percent' => $du['percent'],
+                                    ];
+                                }
+                            }
+                        }
+                        if (!$diskPart) {
+                            foreach (($partitions ?? []) as $p) {
+                                if (($p['mount'] ?? '') === '/var/bbs') { $diskPart = $p; break; }
+                            }
+                        }
+                        if (!$diskPart) {
+                            foreach (($partitions ?? []) as $p) {
+                                if (($p['mount'] ?? '') === '/') { $diskPart = $p; break; }
+                            }
+                        }
+                        $diskMount = $diskPart['mount'] ?? '/';
+                        $diskPct  = (float) ($diskPart['percent'] ?? 0);
+                        $diskSize = ServerStats::dfPairLabel($diskPart['used'] ?? '0', $diskPart['size'] ?? '0');
+                        $diskColor = $diskPct >= 90 ? '#ef4444' : ($diskPct >= 75 ? '#f59e0b' : '#0dcaf0');
+
+                        $arcLen    = 251.33;                              // π × radius 80, semicircle
+                        $cpuOffset = $arcLen * (1 - $cpuPct / 100);
+                        $memPair   = ServerStats::formatBytesPair($memUsed, $memTotal);
+
+                        // Network meter initial labels. First page load after a
+                        // cold cache has no rate yet ("—"); the 15s poll fills it.
+                        $netRxLabel = ServerStats::formatRate($netThroughput['rx_bps'] ?? null);
+                        $netTxLabel = ServerStats::formatRate($netThroughput['tx_bps'] ?? null);
+                    ?>
+                    <div class="health-tiles">
+                        <!-- CPU gauge -->
+                        <div class="health-tile cpu">
+                            <div class="tile-header-bar">
+                                <i class="bi bi-cpu"></i><span>CPU &amp; Memory</span>
+                            </div>
+                            <div class="cpu-dial-wrap">
+                                <svg class="cpu-gauge" viewBox="0 20 200 110" xmlns="http://www.w3.org/2000/svg">
+                                    <path class="arc-bg" d="M 20 110 A 80 80 0 0 1 180 110" fill="none" stroke-width="14" stroke-linecap="round"/>
+                                    <path id="cpu-arc" class="arc-fg" d="M 20 110 A 80 80 0 0 1 180 110" fill="none" stroke="<?= $cpuColor ?>"
+                                          stroke-width="14" stroke-linecap="round"
+                                          stroke-dasharray="<?= $arcLen ?>" stroke-dashoffset="<?= round($cpuOffset, 2) ?>"/>
+                                    <g class="ticks" stroke-width="1.5">
+                                        <?php for ($a = -180; $a <= 0; $a += 18):
+                                            $rad = deg2rad($a);
+                                            $x1 = 100 + 62 * cos($rad); $y1 = 110 + 62 * sin($rad);
+                                            $x2 = 100 + 70 * cos($rad); $y2 = 110 + 70 * sin($rad);
+                                        ?>
+                                        <line x1="<?= round($x1, 2) ?>" y1="<?= round($y1, 2) ?>" x2="<?= round($x2, 2) ?>" y2="<?= round($y2, 2) ?>"/>
+                                        <?php endfor; ?>
+                                    </g>
+                                </svg>
+                                <div class="cpu-pct"><span id="cpu-pct-num"><?= round($cpuPct, 1) ?></span><span class="pct-suffix">%</span></div>
+                                <div class="cpu-status" id="cpu-status" style="color: <?= $cpuColor ?>"><?= $cpuStatus ?></div>
+                            </div>
+                            <div class="cpu-mem-row" title="Memory: <?= round($memPct, 1) ?>% used">
+                                <div class="cm-bar">
+                                    <div id="mem-bar-fill" class="cm-bar-fill" style="width: <?= $memPct ?>%; background-color: <?= $memColor ?>;"></div>
+                                    <span class="cm-bar-label"><span id="mem-pct"><?= round($memPct, 1) ?></span>%</span>
+                                </div>
+                                <span class="cm-size" id="mem-size"><?= $memPair ?></span>
+                            </div>
+                        </div>
+
+                        <!-- Network throughput meter -->
+                        <div class="health-tile net">
+                            <div class="tile-header-bar">
+                                <i class="bi bi-arrow-down-up"></i><span>Network</span>
+                            </div>
+                            <div class="net-rows">
+                                <div class="net-block">
+                                    <div class="net-row">
+                                        <span class="net-dir"><i class="bi bi-arrow-down-short"></i></span>
+                                        <span class="net-lbl">DOWN</span>
+                                        <span class="net-val" id="net-rx-label"><?= $netRxLabel ?></span>
+                                    </div>
+                                    <svg class="net-spark" id="net-rx-spark" viewBox="0 0 64 16" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+                                        <polygon class="spark-fill" points=""/>
+                                        <polyline class="spark-line" points=""/>
+                                    </svg>
+                                </div>
+                                <div class="net-block">
+                                    <div class="net-row">
+                                        <span class="net-dir"><i class="bi bi-arrow-up-short"></i></span>
+                                        <span class="net-lbl">UP</span>
+                                        <span class="net-val" id="net-tx-label"><?= $netTxLabel ?></span>
+                                    </div>
+                                    <svg class="net-spark" id="net-tx-spark" viewBox="0 0 64 16" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+                                        <polygon class="spark-fill" points=""/>
+                                        <polyline class="spark-line" points=""/>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Disk (single featured partition) — full-width strip -->
+                        <div class="health-tile disk" data-mount="<?= htmlspecialchars($diskMount) ?>">
+                            <div class="tile-head">
+                                <span class="icon"><i class="bi bi-hdd"></i></span>
+                                <span class="text-truncate" title="<?= htmlspecialchars($diskMount) ?>"><?= htmlspecialchars($diskMount) ?></span>
+                            </div>
+                            <div class="disk-bar">
+                                <div id="disk-fill" class="disk-bar-fill" style="width: <?= $diskPct ?>%; background-color: <?= $diskColor ?>;"></div>
+                                <span class="disk-bar-label"><span id="disk-pct"><?= round($diskPct) ?></span>%</span>
+                            </div>
+                            <div class="disk-size" id="disk-size"><?= $diskSize ?></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -326,666 +697,814 @@ $pieColors = ['#36a2eb', '#ff6384', '#ffce56', '#4bc0c0', '#9966ff', '#6c757d'];
         <?php endif; ?>
     </div>
 
-    <!-- Right column: ClickHouse Catalog (spans full height) -->
-    <?php if (!empty($mysqlStats)): ?>
-    <div class="col-lg-8">
-        <div class="card border-0 shadow-sm h-100">
-            <div class="card-header bg-body fw-semibold">
-                <img src="/images/clickhouse.svg" alt="" style="height:1em;vertical-align:-.1em;" class="me-1"> ClickHouse Catalog
-            </div>
-            <div class="card-body py-3">
-                <div class="d-flex h-100">
-                    <!-- Left: Stats + Table -->
-                    <div class="flex-grow-1" style="min-width:0;">
-                        <!-- Row count + Recovery Points + Jobs -->
-                        <div class="d-flex align-items-center mb-2">
-                            <div class="me-auto">
-                                <div class="fw-bold" style="font-size:2.2rem;line-height:1;color:#e67e22;"><span id="stat-catalog"><?= $compactNum($mysqlStats['catalog_files']) ?></span> <span style="font-size:1rem;color:#999;">Rows</span></div>
-                            </div>
-                            <div class="d-flex gap-4 text-center" style="font-size:.75rem;">
-                                <div>
-                                    <div class="fw-bold" style="font-size:1rem;" id="stat-archives"><?= $compactNum($mysqlStats['archives']) ?></div>
-                                    <div class="text-muted">Recovery Points</div>
-                                </div>
-                                <div>
-                                    <div class="fw-bold" style="font-size:1rem;" id="stat-completed-jobs"><?= $compactNum($mysqlStats['completed_jobs']) ?></div>
-                                    <div class="text-muted">Jobs Run</div>
-                                </div>
+    <!-- Row 3: Storage Locations — admin only, infra detail. Hidden in
+         hosted mode (platform manages storage; customer sees the per-mount
+         disk strip on the Server Health card instead). -->
+    <?php if ($isAdmin && !empty($storageLocations) && !\BBS\Core\Config::isHosted()): ?>
+    <?php
+        $formatStorageWidgetBytes = function (int $bytes, array $loc): string {
+            $isBorgBaseApi = ($loc['kind'] ?? '') === 'remote'
+                && ((($loc['provider'] ?? '') === 'borgbase') || str_contains((string)($loc['path'] ?? ''), '.repo.borgbase.com'))
+                && (($loc['borgbase_usage_source'] ?? '') === 'borgbase_api');
+            if (!$isBorgBaseApi) {
+                return ServerStats::formatBytes($bytes);
+            }
+            $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            $i = 0;
+            $size = (float) $bytes;
+            while ($size >= 1000 && $i < count($units) - 1) {
+                $size /= 1000;
+                $i++;
+            }
+            return round($size, 1) . "\u{00A0}" . $units[$i];
+        };
+    ?>
+    <div class="card border-0 shadow-sm mb-3">
+        <div class="card-header card-head-gradient fw-semibold d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-hdd-stack me-2"></i>Storage Locations</span>
+            <span class="text-muted small"><?= count($storageLocations) ?> configured</span>
+        </div>
+        <div class="card-body">
+            <?php
+                $locCount = count($storageLocations);
+                $gridClasses = 'storage-grid';
+                if ($locCount <= 6) $gridClasses .= ' exact-cols';
+                if ($locCount === 1) $gridClasses .= ' single-col';
+            ?>
+            <div class="<?= $gridClasses ?>" style="--storage-cols: <?= min($locCount, 6) ?>">
+                <?php foreach ($storageLocations as $loc): ?>
+                <?php
+                    $pct = $loc['disk_percent'] ?? 0;
+                    $fillColor = $pct >= 90 ? '#dc3545' : ($pct >= 75 ? '#ffc107' : '#0dcaf0');
+                ?>
+                <div class="storage-card">
+                    <div class="sc-head">
+                        <div>
+                            <div class="sc-label"><?= htmlspecialchars($loc['label']) ?></div>
+                            <div class="sc-kind <?= $loc['kind'] === 'remote' ? 'remote' : '' ?>">
+                                <?= $loc['kind'] === 'remote' ? 'Remote SSH' : ($loc['is_default'] ? 'Default · Local' : 'Local') ?>
                             </div>
                         </div>
-                        <?php if ($chStats): ?>
-                        <!-- ClickHouse Stats Grid -->
-                        <div class="border-top pt-2 mt-1" id="ch-stats-grid">
-                            <div class="row g-1 text-center" style="font-size:.7rem;">
-                                <div class="col-3">
-                                    <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-disk"><?= \BBS\Services\ServerStats::formatBytes($chStats['disk_bytes']) ?></div>
-                                    <div class="text-muted">Disk Usage</div>
-                                </div>
-                                <div class="col-3">
-                                    <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-compression"><?= $chStats['compression_ratio'] ?>x</div>
-                                    <div class="text-muted">Compress</div>
-                                </div>
-                                <div class="col-3">
-                                    <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-agents"><?= $chStats['agent_count'] ?></div>
-                                    <div class="text-muted">Agents</div>
-                                </div>
-                                <div class="col-3">
-                                    <div class="fw-bold" style="font-size:.85rem;" id="stat-ch-avg-archive"><?= $compactNum($chStats['avg_per_archive']) ?></div>
-                                    <div class="text-muted">Avg/Archive</div>
-                                </div>
-                            </div>
-                        </div>
-                        <!-- Top Repositories Table -->
-                        <?php if (!empty($chStats['top_repos'])): ?>
-                        <div class="border-top pt-2 mt-2" id="ch-repos-section">
-                            <div class="d-flex align-items-center mb-1">
-                                <i class="bi bi-trophy me-1 text-muted" style="font-size:.7rem;"></i>
-                                <span class="fw-semibold text-muted" style="font-size:.65rem;text-transform:uppercase;letter-spacing:.5px;">Top Repositories</span>
-                            </div>
-                            <table class="table table-sm mb-0" style="font-size:.7rem;" id="ch-top-repos">
-                                <tbody>
-                                    <?php foreach ($chStats['top_repos'] as $i => $repo): ?>
-                                    <tr>
-                                        <td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:<?= $pieColors[$i % 5] ?>;margin-right:4px;"></span><span class="fw-semibold"><?= htmlspecialchars($repo['name']) ?></span></td>
-                                        <td class="border-0 py-0 text-end text-muted"><?= $compactNum($repo['rows']) ?> rows</td>
-                                        <td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell"><?= $repo['archives'] ?> archives</td>
-                                        <td class="border-0 py-0 text-end text-muted"><?= \BBS\Services\ServerStats::formatBytes($repo['disk_bytes']) ?></td>
-                                    </tr>
-                                    <?php endforeach; ?>
-                                </tbody>
-                            </table>
-                        </div>
-                        <?php endif; ?>
+                        <?php if ($loc['disk_percent'] !== null): ?>
+                        <span class="fw-bold" style="color: <?= $fillColor ?>;"><?= $pct ?>%</span>
+                        <?php else: ?>
+                        <span class="text-muted small">n/a</span>
                         <?php endif; ?>
                     </div>
-                    <!-- Right: Pie Chart -->
-                    <?php if ($chStats && !empty($chStats['top_repos'])): ?>
-                    <?php
-                        $isSqlite = isset($chStats['backend']) && $chStats['backend'] === 'sqlite';
-                        $prop = $isSqlite ? 'rows' : 'disk_bytes';
-                        $totalProp = $isSqlite ? 'total_rows' : 'disk_bytes';
-                        
-                        $top5Val = array_sum(array_column($chStats['top_repos'], $prop));
-                        // Some systems might not accurately estimate other disk bytes properly for some reason, ensure safe max
-                        $otherVal = max(($chStats[$totalProp] ?? 0) - $top5Val, 0);
-                        
-                        $pieLabels = array_map(fn($r) => $r['name'], $chStats['top_repos']);
-                        $pieData = array_map(fn($r) => $r[$prop], $chStats['top_repos']);
-                        if ($otherVal > 0) {
-                            $pieLabels[] = 'Other';
-                            $pieData[] = $otherVal;
-                        }
-                    ?>
-                    <div class="d-none d-md-flex flex-column align-items-center justify-content-center border-start ms-3 ps-3" style="flex:0 0 33%;max-width:33%;" id="ch-pie-wrap">
-                        <div class="fw-semibold text-muted mb-2" style="font-size:.65rem;text-transform:uppercase;letter-spacing:.5px;">Top Repositories</div>
-                        <canvas id="catalogPieChart" style="max-width:200px;max-height:200px;"></canvas>
+                    <div class="sc-path"><?= htmlspecialchars($loc['path']) ?></div>
+                    <?php if ($loc['disk_total']): ?>
+                    <div class="sc-bar"><div class="sc-fill" style="width: <?= $pct ?>%; background: <?= $fillColor ?>;"></div></div>
+                    <div class="sc-numbers">
+                        <span><?= $formatStorageWidgetBytes((int) $loc['disk_used'], $loc) ?> used</span>
+                        <span><?= $formatStorageWidgetBytes((int) $loc['disk_free'], $loc) ?> free</span>
+                    </div>
+                    <?php else: ?>
+                    <div class="text-muted small fst-italic">
+                        <?= ($loc['kind'] === 'remote' && (($loc['provider'] ?? '') === 'borgbase' || str_contains((string)($loc['path'] ?? ''), '.repo.borgbase.com'))) ? 'Set quota manually or use API' : 'Quota unavailable' ?>
+                    </div>
+                    <?php endif; ?>
+                    <div class="sc-footer">
+                        <span><i class="bi bi-hdd me-1"></i><?= $loc['repo_count'] ?> repo<?= $loc['repo_count'] === 1 ? '' : 's' ?></span>
+                        <span><?= ServerStats::formatBytes((int) $loc['repo_bytes']) ?> disk usage</span>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Row 4: Activity tables -->
+    <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+            <div class="card border-0 shadow-sm h-100">
+                <div class="card-header card-head-gradient fw-semibold">
+                    <i class="bi bi-lightning-charge me-2"></i>Active &amp; Queued
+                </div>
+                <div class="card-body p-0" id="active-jobs">
+                    <?php if (empty($activeJobs)): ?>
+                    <div class="p-5 text-muted text-center">
+                        <i class="bi bi-hourglass d-block mb-2" style="font-size:1.8rem;opacity:0.4;"></i>
+                        <div>No Active Jobs</div>
+                    </div>
+                    <?php else: ?>
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0 small">
+                            <thead><tr><th>Client</th><th>Task</th><th class="d-th-md">Repo</th><th>Status</th></tr></thead>
+                            <tbody>
+                            <?php foreach ($activeJobs as $j): ?>
+                                <?php
+                                    $pct = ($j['files_total'] ?? 0) > 0 ? round(($j['files_processed'] / $j['files_total']) * 100) : null;
+                                    $badgeClass = $j['status'] === 'queued' ? 'text-bg-warning' : 'text-bg-primary';
+                                ?>
+                                <tr style="cursor:pointer" onclick="window.location='/queue/<?= (int) $j['id'] ?>'">
+                                    <td><?= htmlspecialchars($j['agent_name']) ?></td>
+                                    <td><?= htmlspecialchars(ucfirst($j['task_type'])) ?></td>
+                                    <td class="d-table-cell-md"><?= htmlspecialchars($j['repo_name'] ?? '--') ?></td>
+                                    <td>
+                                        <?php if ($pct !== null && $j['status'] === 'running'): ?>
+                                        <div class="progress" style="height:18px;min-width:60px;"><div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" style="width:<?= $pct ?>%"><?= $pct ?>%</div></div>
+                                        <?php else: ?>
+                                        <span class="badge <?= $badgeClass ?>"><?= htmlspecialchars(ucfirst($j['status'])) ?></span>
+                                        <?php endif; ?>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="card border-0 shadow-sm h-100">
+                <div class="card-header card-head-gradient fw-semibold d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-calendar-event me-2"></i>Upcoming Backups</span>
+                    <a href="/schedules" class="small text-decoration-none" style="color: #9ec5fe;">View Schedule <i class="bi bi-arrow-right"></i></a>
+                </div>
+                <div class="card-body p-0" id="upcoming-backups">
+                    <?php if (empty($upcomingSchedules)): ?>
+                    <div class="p-4 text-muted text-center">No scheduled backups</div>
+                    <?php else: ?>
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0 small">
+                            <thead><tr><th>Client</th><th>Plan</th><th>Next Run</th><th></th></tr></thead>
+                            <tbody>
+                            <?php foreach (array_slice($upcomingSchedules, 0, 6) as $s): ?>
+                                <?php
+                                    $nextTs = strtotime($s['next_run'] ?? '');
+                                    $isOverdue = $nextTs && $nextTs < time();
+                                ?>
+                                <tr style="cursor:pointer" onclick="window.location='/clients/<?= (int) $s['agent_id'] ?>?tab=schedules'">
+                                    <td><?= htmlspecialchars($s['agent_name']) ?></td>
+                                    <td><?= htmlspecialchars($s['plan_name']) ?></td>
+                                    <td class="<?= $isOverdue ? 'text-danger fw-semibold' : '' ?>">
+                                        <?php if ($isOverdue): ?><i class="bi bi-exclamation-triangle me-1" title="Agent Offline, Backup Delayed"></i><?php endif; ?>
+                                        <?= TimeHelper::format($s['next_run'], 'M j, g:i A') ?>
+                                    </td>
+                                    <td class="text-nowrap" onclick="event.stopPropagation()">
+                                        <form method="POST" action="/plans/<?= (int) $s['plan_id'] ?>/trigger" class="d-inline" data-confirm="Run <?= htmlspecialchars($s['agent_name']) ?> / <?= htmlspecialchars($s['plan_name']) ?> now?">
+                                            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                            <button type="submit" class="btn btn-sm btn-outline-success py-0 px-2" title="Run now"><i class="bi bi-play-fill"></i></button>
+                                        </form>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table&gt;
                     </div>
                     <?php endif; ?>
                 </div>
             </div>
         </div>
     </div>
+
+    <!-- Row 5: Recent completed jobs -->
+    <div class="card border-0 shadow-sm mb-3">
+        <div class="card-header card-head-gradient fw-semibold d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-check2-circle me-2"></i>Recently Completed</span>
+            <div class="dropdown">
+                <button id="recentFilterBtn" class="btn btn-sm btn-link text-white text-decoration-none p-0" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false" title="Filter by type">
+                    <i class="bi bi-funnel"></i>
+                    <span id="recentFilterCount" class="badge bg-primary bg-opacity-50 ms-1" style="display:none;font-size:0.6rem;"></span>
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end p-2" style="min-width: 200px;">
+                    <li class="small text-muted fw-semibold px-1 pb-1 border-bottom mb-1">Task Types</li>
+                    <?php
+                    $filterCats = [
+                        ['backup',  'Backup',        'bi-box-arrow-in-down'],
+                        ['restore', 'Restore',       'bi-box-arrow-up'],
+                        ['prune',   'Prune',         'bi-scissors'],
+                        ['compact', 'Compact',       'bi-archive'],
+                        ['s3',      'S3 Sync',       'bi-cloud-upload'],
+                        ['other',   'Other / Maint', 'bi-tools'],
+                    ];
+                    foreach ($filterCats as [$key, $label, $icon]): ?>
+                    <li>
+                        <label class="dropdown-item d-flex align-items-center gap-2 py-1 px-2 rounded" style="cursor:pointer;">
+                            <input type="checkbox" class="form-check-input m-0 recent-filter-cb" data-cat="<?= $key ?>" checked>
+                            <i class="bi <?= $icon ?> text-muted"></i>
+                            <span><?= $label ?></span>
+                        </label>
+                    </li>
+                    <?php endforeach; ?>
+                    <li><hr class="dropdown-divider my-1"></li>
+                    <li class="d-flex gap-2 px-1">
+                        <button type="button" class="btn btn-sm btn-outline-secondary flex-grow-1" id="recentFilterAll">All</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary flex-grow-1" id="recentFilterNone">None</button>
+                    </li>
+                </ul>
+            </div>
+        </div>
+        <div class="card-body p-0" id="recent-jobs">
+            <?php if (empty($recentJobs)): ?>
+            <div class="p-4 text-muted text-center">No completed jobs yet</div>
+            <?php else: ?>
+            <div class="table-responsive">
+                <table class="table table-hover mb-0 small recent-jobs-table">
+                    <thead><tr><th>Client</th><th>Task</th><th class="d-th-md">Plan</th><th class="d-th-md">Repo</th><th>Completed</th><th class="d-th-md">Duration</th><th class="text-center">Status</th></tr></thead>
+                    <tbody>
+                    <?php
+                        // Task-type icon map — must stay aligned with src/Views/queue/index.php
+                        // so Dashboard "Recently Completed" looks like Queue at a glance (#172).
+                        $taskIcons = [
+                            'backup'          => 'bi-box-seam text-warning',
+                            'prune'           => 'bi-scissors text-secondary',
+                            'compact'         => 'bi-arrows-collapse text-info',
+                            'restore'         => 'bi-cloud-download text-primary',
+                            'restore_mysql'   => 'bi-database text-primary',
+                            'restore_pg'      => 'bi-database text-primary',
+                            'restore_mongo'   => 'bi-database text-primary',
+                            'check'           => 'bi-shield-check text-success',
+                            'repo_check'      => 'bi-shield-check text-success',
+                            'repo_repair'     => 'bi-tools text-warning',
+                            'break_lock'      => 'bi-unlock text-secondary',
+                            'update_borg'     => 'bi-arrow-up-square text-info',
+                            'update_agent'    => 'bi-arrow-up-square text-info',
+                            'plugin_test'     => 'bi-pencil text-secondary',
+                            's3_sync'         => 'bi-cloud-upload text-info',
+                            's3_restore'      => 'bi-cloud-download text-info',
+                            'catalog_sync'    => 'bi-list-ul text-success',
+                            'catalog_rebuild' => 'bi-list-ul text-success',
+                        ];
+                    ?>
+                    <?php foreach ($recentJobs as $j): ?>
+                        <?php
+                            $hadWarn = ($j['status'] === 'completed' && !empty($j['had_warnings']));
+                            $statusIcon = $hadWarn ? 'bi-exclamation-triangle-fill text-warning'
+                                : ($j['status'] === 'completed' ? 'bi-check-circle-fill text-success'
+                                : ($j['status'] === 'failed' ? 'bi-x-circle-fill text-danger' : 'bi-slash-circle-fill text-secondary'));
+                            $statusTitle = $hadWarn
+                                ? 'Completed with warnings: ' . substr($j['error_log'] ?? '', 0, 200)
+                                : '';
+                            $taskIcon = $taskIcons[$j['task_type']] ?? 'bi-gear text-muted';
+                        ?>
+                        <tr style="cursor:pointer" onclick="window.location='/queue/<?= (int) $j['id'] ?>'">
+                            <td><?= htmlspecialchars($j['agent_name']) ?></td>
+                            <td class="text-nowrap"><i class="bi <?= $taskIcon ?> me-1"></i><?= htmlspecialchars(ucfirst($j['task_type'])) ?></td>
+                            <td class="d-table-cell-md"><?= htmlspecialchars($j['plan_name'] ?? '--') ?></td>
+                            <td class="d-table-cell-md"><?= htmlspecialchars($j['repo_name'] ?? '--') ?></td>
+                            <td><?= TimeHelper::ago($j['completed_at']) ?></td>
+                            <td class="d-table-cell-md"><?= TimeHelper::duration((int) ($j['duration_seconds'] ?? 0)) ?></td>
+                            <td class="text-center"><i class="bi <?= $statusIcon ?>"<?= $statusTitle ? ' data-bs-toggle="tooltip" title="' . htmlspecialchars($statusTitle) . '"' : '' ?>></i></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <?php if ($isAdmin): ?>
+    <!-- Row 6: MariaDB (2/5) + File Catalog (3/5) -->
+    <div class="row g-3 mb-3">
+        <?php if (!empty($mysqlStats)): ?>
+        <?php
+            $msUptime = (int) ($mysqlStats['uptime'] ?? 0);
+            $msUptimeStr = $msUptime >= 86400
+                ? intdiv($msUptime, 86400) . 'd ' . intdiv($msUptime % 86400, 3600) . 'h'
+                : intdiv($msUptime, 3600) . 'h ' . intdiv($msUptime % 3600, 60) . 'm';
+        ?>
+        <div class="col-lg-5">
+            <div class="card border-0 shadow-sm h-100">
+                <div class="card-header card-head-gradient fw-semibold">
+                    <i class="bi bi-database me-2"></i>MariaDB
+                </div>
+                <div class="card-body py-3">
+                    <div class="row g-0 text-center">
+                        <div class="col-4 py-2">
+                            <div class="fw-bold" style="font-size:1.1rem;"><?= $mysqlStats['qps'] ?? 0 ?></div>
+                            <div class="text-muted" style="font-size:0.7rem;">QPS</div>
+                        </div>
+                        <div class="col-4 py-2">
+                            <div class="fw-bold" style="font-size:1.1rem;"><?= $mysqlStats['threads_connected'] ?? 0 ?></div>
+                            <div class="text-muted" style="font-size:0.7rem;">Connections</div>
+                        </div>
+                        <div class="col-4 py-2">
+                            <div class="fw-bold" style="font-size:1.1rem;"><?= $mysqlStats['hit_rate'] ?? 0 ?>%</div>
+                            <div class="text-muted" style="font-size:0.7rem;">Hit Rate</div>
+                        </div>
+                        <div class="col-4 py-2">
+                            <div class="fw-bold" style="font-size:1.1rem;"><?= $msUptimeStr ?></div>
+                            <div class="text-muted" style="font-size:0.7rem;">Uptime</div>
+                        </div>
+                        <div class="col-4 py-2">
+                            <div class="fw-bold" style="font-size:1.1rem;"><?= $mysqlStats['buffer_pool_used_pct'] ?? 0 ?>%</div>
+                            <div class="text-muted" style="font-size:0.7rem;">Buffer Pool</div>
+                        </div>
+                        <div class="col-4 py-2">
+                            <div class="fw-bold" style="font-size:1.1rem;"><?= $compact((int) ($mysqlStats['slow_queries'] ?? 0)) ?></div>
+                            <div class="text-muted" style="font-size:0.7rem;">Slow Queries</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <?php if (!empty($clickhouseStats ?? null)): ?>
+        <?php
+            $chTopRepos = $clickhouseStats['top_repos'] ?? [];
+            $chDiskBytes = (int) ($clickhouseStats['disk_bytes'] ?? 0);
+            $pieColors = ['#36a2eb','#ff6384','#ffce56','#4bc0c0','#9966ff','#6c757d'];
+        ?>
+        <div class="col-lg-7">
+            <div class="card border-0 shadow-sm h-100">
+                <div class="card-header card-head-gradient fw-semibold">
+                    <i class="bi bi-list-columns-reverse me-2"></i>File Catalog (ClickHouse)
+                </div>
+                <div class="card-body py-2">
+                    <div class="d-flex flex-wrap" style="gap: 0;">
+                        <!-- Stats (left) — expands full-width when wrapped on mobile -->
+                        <div class="ch-stats-wrap" style="min-width:220px;max-width:260px;margin-right:60px;">
+                            <?php
+                            $chStatRows = [
+                                ['Catalog rows', $compact((int) ($clickhouseStats['total_rows'] ?? 0))],
+                                ['Index size',   ServerStats::formatBytes($chDiskBytes)],
+                                ['Compression',  ($clickhouseStats['compression_ratio'] ?? 0) . '×'],
+                                ['Indexed clients', (int) ($clickhouseStats['agent_count'] ?? 0)],
+                            ];
+                            ?>
+                            <table class="table table-sm mb-0 ch-stats-table" style="font-size:0.82rem;">
+                                <tbody>
+                                <?php foreach ($chStatRows as $ri => $row): ?>
+                                <tr>
+                                    <td class="text-muted py-1 ps-2"><?= $row[0] ?></td>
+                                    <td class="fw-bold py-1 pe-2 text-end"><?= $row[1] ?></td>
+                                </tr>
+                                <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <!-- Donut + Top repos (right, aligned at top) -->
+                        <?php if (!empty($chTopRepos)): ?>
+                        <div class="d-flex align-items-start flex-grow-1" style="gap: 16px; min-width: 240px;">
+                            <div class="flex-shrink-0 pt-1">
+                                <canvas id="catalogPieChart" width="110" height="110"></canvas>
+                            </div>
+                            <div class="flex-grow-1">
+                                <div class="small fw-semibold text-uppercase mb-1" style="font-size:0.65rem;letter-spacing:0.03em;color:var(--bs-secondary-color);"><i class="bi bi-trophy me-1"></i>Top Repositories</div>
+                                <?php foreach ($chTopRepos as $i => $repo): ?>
+                                <div class="d-flex align-items-center justify-content-between top-repo-row" style="font-size:0.8rem;<?= $i % 2 === 1 ? 'background:var(--bs-tertiary-bg);border-radius:3px;' : '' ?>">
+                                    <span class="text-truncate me-2"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:<?= $pieColors[$i % 6] ?>;margin-right:6px;"></span><?= htmlspecialchars($repo['name']) ?></span>
+                                    <span class="text-muted text-nowrap" style="font-size:0.75rem;font-variant-numeric:tabular-nums;"><?= $compact((int) $repo['rows']) ?> rows</span>
+                                </div>
+                                <?php endforeach; ?>
+                            </div>
+                        </div>
+                        <?php else: ?>
+                        <div class="text-muted small fst-italic align-self-center">No catalog data yet</div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
     <?php endif; ?>
-</div>
-<?php endif; ?>
 
-<div class="row g-4">
-    <!-- Active Jobs -->
-    <div class="col-lg-6">
-        <div class="card border-0 shadow-sm">
-            <div class="card-header bg-body fw-semibold">
-                <i class="bi bi-play-circle me-1"></i> Active &amp; Queued Jobs
-            </div>
-            <div class="card-body p-0 dash-table" id="active-jobs">
-                <?php if (empty($activeJobs)): ?>
-                    <div class="p-4 text-muted text-center">No active jobs</div>
-                <?php else: ?>
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead class="table-light">
-                            <tr>
-                                <th>Client</th>
-                                <th>Task</th>
-                                <th class="d-th-md">Plan</th>
-                                <th class="d-th-md">Repo</th>
-                                <th>Progress</th>
-                                <th class="d-th-md">Duration</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody class="small">
-                            <?php foreach ($activeJobs as $job): ?>
-                            <?php
-                                $elapsed = '';
-                                if ($job['started_at']) {
-                                    $e = time() - strtotime($job['started_at'] . ' UTC');
-                                    $elapsed = $e >= 3600 ? floor($e / 3600) . 'h ' . floor(($e % 3600) / 60) . 'm'
-                                        : ($e >= 60 ? floor($e / 60) . 'm ' . ($e % 60) . 's' : $e . 's');
-                                }
-                            ?>
-                            <tr style="cursor: pointer;" onclick="window.location='/queue/<?= $job['id'] ?>'">
-                                <td><?= htmlspecialchars($job['agent_name']) ?></td>
-                                <td><?= ucfirst($job['task_type']) ?></td>
-                                <td class="d-table-cell-md"><?= htmlspecialchars($job['plan_name'] ?? '--') ?></td>
-                                <td class="d-table-cell-md"><?= htmlspecialchars($job['repo_name'] ?? '--') ?></td>
-                                <td style="min-width: 100px;">
-                                    <?php if ($job['status'] === 'queued'): ?>
-                                        <span class="text-muted">Waiting</span>
-                                    <?php elseif (($job['files_total'] ?? 0) > 0): ?>
-                                        <?php $pct = round(($job['files_processed'] / $job['files_total']) * 100); ?>
-                                        <div class="progress" style="height: 20px;">
-                                            <div class="progress-bar progress-bar-striped progress-bar-animated bg-success" style="width: <?= $pct ?>%">
-                                                <?= $pct ?>%
-                                            </div>
-                                        </div>
-                                    <?php else: ?>
-                                        <div class="progress" style="height: 20px;">
-                                            <div class="progress-bar progress-bar-striped progress-bar-animated bg-info" style="width: 100%">Preparing...</div>
-                                        </div>
-                                    <?php endif; ?>
-                                </td>
-                                <td class="d-table-cell-md text-nowrap"><?= $elapsed ?: '--' ?></td>
-                                <?php
-                                $jobBadge = match($job['status']) {
-                                    'running' => 'info',
-                                    'sent' => 'primary',
-                                    'queued' => 'warning',
-                                    default => 'secondary',
-                                };
-                                ?>
-                                <td><span class="badge bg-<?= $jobBadge ?>"><?= $job['status'] ?></span></td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-                <?php endif; ?>
-            </div>
-        </div>
-
-        <!-- Upcoming Backups -->
-        <div class="card border-0 shadow-sm mt-4">
-            <div class="card-header bg-body fw-semibold">
-                <i class="bi bi-calendar-event me-1"></i> Upcoming Backups
-            </div>
-            <div class="card-body p-0 dash-table" id="upcoming-backups">
-                <?php if (empty($upcomingSchedules)): ?>
-                    <div class="p-4 text-muted text-center">No scheduled backups</div>
-                <?php else: ?>
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead class="table-light">
-                            <tr>
-                                <th>Client</th>
-                                <th>Plan</th>
-                                <th class="d-th-md">Frequency</th>
-                                <th>Next Run</th>
-                                <th class="d-th-md">Countdown</th>
-                                <th></th>
-                            </tr>
-                        </thead>
-                        <tbody class="small">
-                            <?php foreach ($upcomingSchedules as $sched): ?>
-                            <?php
-                                $nextDiff = strtotime($sched['next_run']) - time();
-                                if ($nextDiff < 0) {
-                                    $countdown = 'Overdue';
-                                    $countdownClass = 'text-danger fw-semibold';
-                                } elseif ($nextDiff < 3600) {
-                                    $countdown = floor($nextDiff / 60) . 'm';
-                                    $countdownClass = 'text-warning fw-semibold';
-                                } elseif ($nextDiff < 86400) {
-                                    $countdown = floor($nextDiff / 3600) . 'h ' . floor(($nextDiff % 3600) / 60) . 'm';
-                                    $countdownClass = '';
-                                } else {
-                                    $countdown = floor($nextDiff / 86400) . 'd ' . floor(($nextDiff % 86400) / 3600) . 'h';
-                                    $countdownClass = 'text-muted';
-                                }
-                            ?>
-                            <tr style="cursor: pointer;" onclick="window.location='/clients/<?= $sched['agent_id'] ?>?tab=schedules'">
-                                <td><?= htmlspecialchars($sched['agent_name']) ?></td>
-                                <td><?= htmlspecialchars($sched['plan_name']) ?></td>
-                                <td class="d-table-cell-md"><?= ucfirst($sched['frequency']) ?></td>
-                                <td><?= \BBS\Core\TimeHelper::format($sched['next_run'], 'M j, g:i A') ?></td>
-                                <td class="d-table-cell-md <?= $countdownClass ?>"><?= $countdown ?></td>
-                                <td class="text-nowrap" onclick="event.stopPropagation()">
-                                    <form method="POST" action="/plans/<?= $sched['plan_id'] ?>/trigger" class="d-inline" data-confirm="Manually run <?= htmlspecialchars($sched['agent_name']) ?> / <?= htmlspecialchars($sched['plan_name']) ?> backup now?">
-                                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                                        <button type="submit" class="btn btn-sm btn-outline-success py-0 px-2" title="Run now">
-                                            <i class="bi bi-play-fill"></i>
-                                        </button>
-                                    </form>
-                                </td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-                <?php endif; ?>
-            </div>
-        </div>
-    </div>
-
-    <!-- Recently Completed -->
-    <div class="col-lg-6">
-        <div class="card border-0 shadow-sm">
-            <div class="card-header bg-body fw-semibold">
-                <i class="bi bi-check-circle me-1"></i> Recently Completed
-            </div>
-            <div class="card-body p-0 dash-table" id="recent-jobs">
-                <?php if (empty($recentJobs)): ?>
-                    <div class="p-4 text-muted text-center">No completed jobs yet</div>
-                <?php else: ?>
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead class="table-light">
-                            <tr>
-                                <th>Client</th>
-                                <th>Task</th>
-                                <th class="d-th-md">Plan</th>
-                                <th class="d-th-md">Repo</th>
-                                <th>Completed</th>
-                                <th class="d-th-md">Duration</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody class="small">
-                            <?php foreach ($recentJobs as $job): ?>
-                            <?php
-                                $d = $job['duration_seconds'] ?? 0;
-                                $durStr = $d >= 3600 ? floor($d / 3600) . 'h ' . floor(($d % 3600) / 60) . 'm'
-                                    : ($d >= 60 ? floor($d / 60) . 'm ' . ($d % 60) . 's' : ($d > 0 ? $d . 's' : '--'));
-                                $sIcon = match($job['status']) {
-                                    'completed' => '<i class="bi bi-check-circle-fill text-success"></i>',
-                                    'failed' => '<i class="bi bi-x-circle-fill text-danger"></i>',
-                                    'cancelled' => '<i class="bi bi-slash-circle-fill text-secondary"></i>',
-                                    default => '<i class="bi bi-exclamation-triangle-fill text-warning"></i>',
-                                };
-                            ?>
-                            <tr style="cursor: pointer;" onclick="window.location='/queue/<?= $job['id'] ?>'">
-                                <td><?= htmlspecialchars($job['agent_name']) ?></td>
-                                <td><?= ucfirst($job['task_type']) ?></td>
-                                <td class="d-table-cell-md"><?= htmlspecialchars($job['plan_name'] ?? '--') ?></td>
-                                <td class="d-table-cell-md"><?= htmlspecialchars($job['repo_name'] ?? '--') ?></td>
-                                <td title="<?= \BBS\Core\TimeHelper::format($job['completed_at'], 'M j, Y g:i A') ?>"><?= \BBS\Core\TimeHelper::ago($job['completed_at']) ?></td>
-                                <td class="d-table-cell-md text-nowrap"><?= $durStr ?></td>
-                                <td class="text-center"><?= $sIcon ?></td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-                <?php endif; ?>
-            </div>
-        </div>
+    <!-- Server identity footer -->
+    <div class="text-center text-muted mt-4 pb-2" style="font-size: 0.8125rem;">
+        <span title="Server version"><i class="bi bi-box-seam me-1"></i>Borg Backup Server <?= htmlspecialchars($bbsVersion) ?></span>
+        <span class="mx-2">·</span>
+        <span title="Hostname"><i class="bi bi-hdd-network me-1"></i><?= htmlspecialchars($serverHost) ?></span>
+        <span class="mx-2">·</span>
+        <span title="OS"><i class="bi bi-terminal me-1"></i><?= htmlspecialchars($osName) ?></span>
+        <span class="mx-2">·</span>
+        <span title="Uptime"><i class="bi bi-clock-history me-1"></i><?= $fmtUptime($uptimeSec) ?></span>
+        <span class="mx-2">·</span>
+        <span>Open Source &amp; Made with <i class="bi bi-heart-fill text-danger"></i> by Marc Pope</span>
+        <a href="https://github.com/sponsors/marcpope" target="_blank" rel="noopener" class="text-decoration-none ms-2" title="Support this project on GitHub Sponsors">Sponsor</a>
     </div>
 </div>
 
-
-<!-- Chart.js -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="/assets/chartjs/chart.umd.min.js"></script>
 <script>
-// Jobs Chart (stacked bar)
-const chartData = <?= json_encode($chartData) ?>;
-const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
-const chartTextColor = isDark ? '#8b929a' : '#6c757d';
-const chartGridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)';
-const ctx = document.getElementById('backupsChart').getContext('2d');
-new Chart(ctx, {
-    type: 'bar',
-    data: {
-        labels: chartData.map(d => d.label),
-        datasets: [
-            {
-                label: 'Backups',
-                data: chartData.map(d => d.backups),
-                backgroundColor: 'rgba(54, 162, 235, 0.7)',
-                borderRadius: 2,
-            },
-            {
-                label: 'Restores',
-                data: chartData.map(d => d.restores),
-                backgroundColor: 'rgba(255, 159, 64, 0.7)',
-                borderRadius: 2,
-            },
-            {
-                label: 'S3 Sync',
-                data: chartData.map(d => d.s3_sync),
-                backgroundColor: 'rgba(75, 192, 192, 0.7)',
-                borderRadius: 2,
-            },
-        ]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-            legend: {
-                display: true,
-                position: 'bottom',
-                labels: { boxWidth: 10, font: { size: 9 }, padding: 8, color: chartTextColor },
-            },
-        },
-        scales: {
-            y: {
-                beginAtZero: true,
-                stacked: true,
-                ticks: { stepSize: 1, font: { size: 10 }, color: chartTextColor },
-                grid: { color: chartGridColor },
-            },
-            x: {
-                stacked: true,
-                ticks: {
-                    font: { size: 9 },
-                    color: chartTextColor,
-                    maxRotation: 45,
-                    callback: function(val, index) {
-                        return index % 3 === 0 ? this.getLabelForValue(val) : '';
-                    }
-                },
-                grid: { display: false },
-            }
-        }
-    }
-});
+document.addEventListener('DOMContentLoaded', function () {
+    const chartData = <?= json_encode($chartData) ?>;
+    const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    const tc = isDark ? '#8b929a' : '#6c757d';
+    const gc = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
 
-// Catalog Pie Chart
-const pieColors = ['#36a2eb','#ff6384','#ffce56','#4bc0c0','#9966ff','#6c757d'];
-const fmtBytes = b => { b = Number(b); if (b >= 1099511627776) return (b/1099511627776).toFixed(1)+' TB'; if (b >= 1073741824) return (b/1073741824).toFixed(1)+' GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+' MB'; return (b/1024).toFixed(1)+' KB'; };
-<?php if ($chStats && !empty($chStats['top_repos'])): ?>
-const pieCanvas = document.getElementById('catalogPieChart');
-let catalogPieChart = null;
-if (pieCanvas) {
-    catalogPieChart = new Chart(pieCanvas.getContext('2d'), {
-        type: 'pie',
+    // Chart.js by default renders tooltips onto the canvas, so they get
+    // clipped to the canvas rectangle. The ClickHouse doughnut canvas is
+    // only 110×110, so any label beyond a few characters is cut off
+    // (issue #164). This external tooltip handler renders an HTML div
+    // appended to <body> instead, escaping the canvas entirely.
+    const chartTooltipEl = (function () {
+        let el = document.getElementById('chartjs-ext-tooltip');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'chartjs-ext-tooltip';
+            el.style.cssText =
+                'position:absolute;pointer-events:none;z-index:2147483647;' +
+                'background:rgba(0,0,0,0.85);color:#fff;border-radius:4px;' +
+                'padding:6px 10px;font-size:0.78rem;white-space:nowrap;' +
+                'transform:translate(-50%,-100%);transition:opacity 0.1s;opacity:0;';
+            document.body.appendChild(el);
+        }
+        return el;
+    })();
+    function externalTooltip(ctx) {
+        const { chart, tooltip } = ctx;
+        if (tooltip.opacity === 0) { chartTooltipEl.style.opacity = 0; return; }
+        if (tooltip.body) {
+            const titleLines = tooltip.title || [];
+            const bodyLines = tooltip.body.map(b => b.lines);
+            let html = '';
+            titleLines.forEach(t => { html += '<div style="font-weight:600;margin-bottom:2px;">' + t.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])) + '</div>'; });
+            bodyLines.forEach(lines => { html += '<div>' + lines.join(' ').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])) + '</div>'; });
+            chartTooltipEl.innerHTML = html;
+        }
+        const rect = chart.canvas.getBoundingClientRect();
+        chartTooltipEl.style.opacity = 1;
+        chartTooltipEl.style.left = (window.scrollX + rect.left + tooltip.caretX) + 'px';
+        chartTooltipEl.style.top  = (window.scrollY + rect.top + tooltip.caretY - 8) + 'px';
+    }
+
+    new Chart(document.getElementById('jobsChart').getContext('2d'), {
+        type: 'bar',
         data: {
-            labels: <?= json_encode($pieLabels) ?>,
-            datasets: [{
-                data: <?= json_encode($pieData) ?>,
-                backgroundColor: pieColors.slice(0, <?= count($pieData) ?>),
-                borderWidth: isDark ? 0 : 1,
-                borderColor: isDark ? 'transparent' : '#fff',
-            }]
+            labels: chartData.map(d => d.label),
+            datasets: [
+                { label: 'Backups', data: chartData.map(d => d.backups), backgroundColor: 'rgba(54, 162, 235, 0.7)', borderRadius: 2 },
+                { label: 'Restores', data: chartData.map(d => d.restores), backgroundColor: 'rgba(255, 159, 64, 0.7)', borderRadius: 2 },
+                { label: 'S3 Sync', data: chartData.map(d => d.s3_sync), backgroundColor: 'rgba(75, 192, 192, 0.7)', borderRadius: 2 },
+                { label: 'Errors', data: chartData.map(d => d.errors), backgroundColor: 'rgba(220, 53, 69, 0.8)', borderRadius: 2 },
+            ]
         },
         options: {
-            responsive: true,
-            maintainAspectRatio: true,
-            plugins: {
-                legend: { display: false },
-                tooltip: {
-                    callbacks: {
-                        label: function(ctx) {
-                            const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
-                            const pct = total > 0 ? (ctx.raw / total * 100).toFixed(1) : 0;
-                            <?php if ($isSqliteBackend): ?>
-                            const fmtNum = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
-                            return ctx.label + ': ' + fmtNum(ctx.raw) + ' rows (' + pct + '%)';
-                            <?php else: ?>
-                            return ctx.label + ': ' + fmtBytes(ctx.raw) + ' (' + pct + '%)';
-                            <?php endif; ?>
+           responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 9 }, padding: 8, color: tc } } },
+            scales: {
+                y: { beginAtZero: true, stacked: true, ticks: { stepSize: 1, color: tc, font: { size: 10 } }, grid: { color: gc } },
+                x: { stacked: true, ticks: { color: tc, font: { size: 9 }, maxRotation: 45, callback: function (v, i) { return i % 3 === 0 ? this.getLabelForValue(v) : ''; } }, grid: { display: false } },
+            }
+        }
+    });
+
+    // --- ClickHouse pie: top clients by catalog disk usage ---
+    <?php if ($isAdmin && !empty($chTopRepos)): ?>
+    (function () {
+        const el = document.getElementById('catalogPieChart');
+        if (!el) return;
+        const colors = ['#36a2eb','#ff6384','#ffce56','#4bc0c0','#9966ff','#6c757d'];
+        const repos = <?= json_encode($chTopRepos) ?>;
+        const diskTotal = <?= $chDiskBytes ?>;
+        const top5Disk = repos.reduce((s, r) => s + Number(r.disk_bytes), 0);
+        const otherDisk = Math.max(diskTotal - top5Disk, 0);
+        const labels = repos.map(r => r.name);
+        const data = repos.map(r => Number(r.disk_bytes));
+        const rowCounts = repos.map(r => Number(r.rows));
+        if (otherDisk > 0) { labels.push('Other'); data.push(otherDisk); rowCounts.push(null); }
+        const fmtN = n => (n == null ? null : Number(n).toLocaleString());
+        const fmtB = b => { b = Number(b); const s = '\u00A0'; if (b >= 1099511627776) return (b/1099511627776).toFixed(1)+s+'TB'; if (b >= 1073741824) return (b/1073741824).toFixed(1)+s+'GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+s+'MB'; return (b/1024).toFixed(0)+s+'KB'; };
+        new Chart(el.getContext('2d'), {
+            type: 'doughnut',
+            data: {
+                labels: labels,
+                datasets: [{
+                    data: data,
+                    backgroundColor: colors.slice(0, data.length),
+                    borderWidth: 0,
+                }]
+            },
+            options: {
+                responsive: false,
+                cutout: '55%',
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        enabled: false,
+                        external: externalTooltip,
+                        callbacks: {
+                            // Name is already shown as the bold title; body shows
+                            // size and row count.
+                            label: ctx => {
+                                const lines = ['Size: ' + fmtB(ctx.raw)];
+                                const rc = rowCounts[ctx.dataIndex];
+                                if (rc != null) lines.push('Rows: ' + fmtN(rc));
+                                return lines;
+                            }
                         }
+                    },
+                    tooltipExternal: function(ctx) {
+                        // ponytail: upstream tooltip already handles labels well
                     }
                 }
             }
+        });
+        // Legend is rendered server-side as a list, no JS needed.
+    })();
+    <?php endif; ?>
+
+    // --- Server Health: live refresh every 15s ---------------------------
+    <?php if ($isAdmin): ?>
+    (function () {
+        const cpuArc    = document.getElementById('cpu-arc');
+        const cpuPctNum = document.getElementById('cpu-pct-num');
+        const cpuStatus = document.getElementById('cpu-status');
+        const memFill   = document.getElementById('mem-bar-fill');
+        const memPctEl  = document.getElementById('mem-pct');
+        const memSizeEl = document.getElementById('mem-size');
+        const netRxEl   = document.getElementById('net-rx-label');
+        const netTxEl   = document.getElementById('net-tx-label');
+        const netRxSvg  = document.getElementById('net-rx-spark');
+        const netTxSvg  = document.getElementById('net-tx-spark');
+        const diskPctEl = document.getElementById('disk-pct');
+        const diskSize  = document.getElementById('disk-size');
+        const diskFill  = document.getElementById('disk-fill');
+        if (!cpuArc && !memFill && !diskFill) return;
+
+        const ARC_LEN = 251.33;
+
+        // Sparkline buffers: last 20 samples ≈ a 5-minute window at the
+        // 15s poll. Rendering stretches to the SVG viewBox (64×26).
+        const SPARK_MAX = 20;
+        const netHist = { rx: [], tx: [] };
+        function renderSpark(svg, buf) {
+            if (!svg || buf.length < 2) return;
+            const W = 64, H = 16, PAD = 2;
+            const max = Math.max(1, ...buf);
+            const step = W / (buf.length - 1); // stretch the window across the full width
+            const pts = buf.map((v, i) =>
+                (i * step).toFixed(1) + ',' + (H - PAD - (v / max) * (H - PAD * 2)).toFixed(1)
+            );
+            svg.querySelector('.spark-line').setAttribute('points', pts.join(' '));
+            svg.querySelector('.spark-fill').setAttribute('points',
+                '0,' + H + ' ' + pts.join(' ') + ' ' + W + ',' + H);
         }
-    });
-}
-<?php endif; ?>
-
-// Helper: escape HTML
-function esc(str) { const d = document.createElement('div'); d.textContent = str ?? ''; return d.innerHTML; }
-
-// Helper: format elapsed seconds
-function fmtDur(s) {
-    s = parseInt(s) || 0;
-    if (s >= 3600) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-    if (s >= 60) return Math.floor(s/60) + 'm ' + (s%60) + 's';
-    return s > 0 ? s + 's' : '--';
-}
-
-// Helper: format time diff for countdowns
-function fmtCountdown(diffSec) {
-    if (diffSec < 0) return { text: 'Overdue', cls: 'text-danger fw-semibold' };
-    if (diffSec < 3600) return { text: Math.floor(diffSec/60) + 'm', cls: 'text-warning fw-semibold' };
-    if (diffSec < 86400) return { text: Math.floor(diffSec/3600) + 'h ' + Math.floor((diffSec%3600)/60) + 'm', cls: '' };
-    return { text: Math.floor(diffSec/86400) + 'd ' + Math.floor((diffSec%86400)/3600) + 'h', cls: 'text-muted' };
-}
-
-// Helper: format date like "Jan 30, 4:15 PM" or "Jan 30, 16:15"
-// Uses BBS profile timezone, not browser timezone
-function fmtDate(str) {
-    if (!str) return '--';
-    const d = new Date(str.replace(' ', 'T') + 'Z');
-    const tz = window.BBS_TIMEZONE || 'UTC';
-    const timeOpts = window.BBS_TIME_24H
-        ? { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: tz }
-        : { hour: 'numeric', minute: '2-digit', timeZone: tz };
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: tz }) + ', ' +
-           d.toLocaleTimeString('en-US', timeOpts);
-}
-
-function renderActiveJobs(jobs) {
-    const el = document.getElementById('active-jobs');
-    if (!jobs || !jobs.length) { el.innerHTML = '<div class="p-4 text-muted text-center">No active jobs</div>'; return; }
-    const now = Math.floor(Date.now() / 1000);
-    let html = '<div class="table-responsive"><table class="table table-hover mb-0"><thead class="table-light"><tr><th>Client</th><th>Task</th><th class="d-th-md">Plan</th><th class="d-th-md">Repo</th><th>Progress</th><th class="d-th-md">Duration</th><th>Status</th></tr></thead><tbody class="small">';
-    jobs.forEach(j => {
-        let elapsed = '--';
-        if (j.started_at) { const e = now - Math.floor(new Date((j.started_at).replace(' ','T')+'Z').getTime()/1000); elapsed = fmtDur(e); }
-        let progress = '';
-        if (j.status === 'queued') { progress = '<span class="text-muted">Waiting</span>'; }
-        else if ((j.files_total || 0) > 0) {
-            const pct = Math.round((j.files_processed / j.files_total) * 100);
-            progress = '<div class="progress" style="height:20px"><div class="progress-bar progress-bar-striped progress-bar-animated bg-success" style="width:'+pct+'%">'+pct+'%</div></div>';
-        } else { progress = '<div class="progress" style="height:20px"><div class="progress-bar progress-bar-striped progress-bar-animated bg-info" style="width:100%">Preparing...</div></div>'; }
-        const badge = { running: 'info', sent: 'primary', queued: 'warning' }[j.status] || 'secondary';
-        html += '<tr style="cursor:pointer" onclick="window.location=\'/queue/'+j.id+'\'"><td>'+esc(j.agent_name)+'</td><td>'+esc(j.task_type?.[0]?.toUpperCase()+j.task_type?.slice(1))+'</td><td class="d-table-cell-md">'+esc(j.plan_name||'--')+'</td><td class="d-table-cell-md">'+esc(j.repo_name||'--')+'</td><td style="min-width:100px">'+progress+'</td><td class="d-table-cell-md text-nowrap">'+elapsed+'</td><td><span class="badge bg-'+badge+'">'+esc(j.status)+'</span></td></tr>';
-    });
-    html += '</tbody></table></div>';
-    el.innerHTML = html;
-}
-
-function renderUpcoming(schedules, csrfToken) {
-    const el = document.getElementById('upcoming-backups');
-    if (!schedules || !schedules.length) { el.innerHTML = '<div class="p-4 text-muted text-center">No scheduled backups</div>'; return; }
-    const now = Math.floor(Date.now() / 1000);
-    let html = '<div class="table-responsive"><table class="table table-hover mb-0"><thead class="table-light"><tr><th>Client</th><th>Plan</th><th class="d-th-md">Frequency</th><th>Next Run</th><th class="d-th-md">Countdown</th><th></th></tr></thead><tbody class="small">';
-    schedules.forEach(s => {
-        const nextTs = Math.floor(new Date((s.next_run).replace(' ','T')+'Z').getTime()/1000);
-        const cd = fmtCountdown(nextTs - now);
-        html += '<tr style="cursor:pointer" onclick="window.location=\'/clients/'+s.agent_id+'?tab=schedules\'"><td>'+esc(s.agent_name)+'</td><td>'+esc(s.plan_name)+'</td><td class="d-table-cell-md">'+esc(s.frequency?.[0]?.toUpperCase()+s.frequency?.slice(1))+'</td><td>'+fmtDate(s.next_run)+'</td><td class="d-table-cell-md '+cd.cls+'">'+cd.text+'</td>';
-        html += '<td class="text-nowrap" onclick="event.stopPropagation()"><form method="POST" action="/plans/'+s.plan_id+'/trigger" class="d-inline" data-confirm="Manually run '+esc(s.agent_name)+' / '+esc(s.plan_name)+' backup now?"><input type="hidden" name="csrf_token" value="'+csrfToken+'"><button type="submit" class="btn btn-sm btn-outline-success py-0 px-2" title="Run now"><i class="bi bi-play-fill"></i></button></form></td>';
-        html += '</tr>';
-    });
-    html += '</tbody></table></div>';
-    el.innerHTML = html;
-}
-
-function timeAgo(str) {
-    if (!str) return '';
-    const then = new Date((str).replace(' ','T')+'Z').getTime();
-    const diff = Math.floor((Date.now() - then) / 1000);
-    if (diff < 0) return 'just now';
-    if (diff < 60) return diff + 's ago';
-    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
-    return Math.floor(diff / 86400) + 'd ago';
-}
-
-function statusIcon(status) {
-    const map = {
-        completed: '<i class="bi bi-check-circle-fill text-success"></i>',
-        failed: '<i class="bi bi-x-circle-fill text-danger"></i>',
-        cancelled: '<i class="bi bi-slash-circle-fill text-secondary"></i>'
-    };
-    return map[status] || '<i class="bi bi-exclamation-triangle-fill text-warning"></i>';
-}
-
-function renderRecentJobs(jobs) {
-    const el = document.getElementById('recent-jobs');
-    if (!jobs || !jobs.length) { el.innerHTML = '<div class="p-4 text-muted text-center">No completed jobs yet</div>'; return; }
-    let html = '<div class="table-responsive"><table class="table table-hover mb-0"><thead class="table-light"><tr><th>Client</th><th>Task</th><th class="d-th-md">Plan</th><th class="d-th-md">Repo</th><th>Completed</th><th class="d-th-md">Duration</th><th>Status</th></tr></thead><tbody class="small">';
-    jobs.forEach(j => {
-        html += '<tr style="cursor:pointer" onclick="window.location=\'/queue/'+j.id+'\'"><td>'+esc(j.agent_name)+'</td><td>'+esc(j.task_type?.[0]?.toUpperCase()+j.task_type?.slice(1))+'</td><td class="d-table-cell-md">'+esc(j.plan_name||'--')+'</td><td class="d-table-cell-md">'+esc(j.repo_name||'--')+'</td><td title="'+esc(fmtDate(j.completed_at))+'">'+timeAgo(j.completed_at)+'</td><td class="d-table-cell-md text-nowrap">'+fmtDur(j.duration_seconds)+'</td><td class="text-center">'+statusIcon(j.status)+'</td></tr>';
-    });
-    html += '</tbody></table></div>';
-    el.innerHTML = html;
-}
-
-function renderLogs(logs) {
-    const el = document.getElementById('server-log');
-    if (!logs || !logs.length) { el.innerHTML = '<div class="p-4 text-muted text-center">No log entries</div>'; return; }
-    // Desktop table
-    let html = '<div class="table-responsive d-none d-md-block"><table class="table table-hover mb-0 small"><thead class="table-light"><tr><th>Time</th><th>Client</th><th>Level</th><th>Message</th></tr></thead><tbody>';
-    logs.forEach(l => {
-        const badge = { error: 'danger', warning: 'warning' }[l.level] || 'info';
-        html += '<tr><td class="text-nowrap">'+fmtDate(l.created_at)+'</td><td class="text-nowrap">'+esc(l.agent_name||'--')+'</td><td><span class="badge bg-'+badge+'">'+esc(l.level)+'</span></td><td>'+esc(l.message)+'</td></tr>';
-    });
-    html += '</tbody></table></div>';
-    // Mobile list
-    html += '<div class="d-md-none">';
-    logs.forEach((l, i) => {
-        const badge = { error: 'danger', warning: 'warning' }[l.level] || 'info';
-        html += '<div class="px-3 py-2'+(i > 0 ? ' border-top' : '')+'">';
-        html += '<div class="d-flex align-items-center gap-2 small"><span class="badge bg-'+badge+'">'+esc(l.level)+'</span><span class="text-muted">'+fmtDate(l.created_at)+'</span>';
-        if (l.agent_name) html += '<span class="text-muted">&middot; '+esc(l.agent_name)+'</span>';
-        html += '</div><div class="small mt-1" style="word-break:break-word;">'+esc(l.message)+'</div></div>';
-    });
-    html += '</div>';
-    el.innerHTML = html;
-}
-
-const csrfToken = '<?= $this->csrfToken() ?>';
-
-// Fast refresh every 8 seconds (queues, jobs, logs — no ClickHouse)
-setInterval(function() {
-    fetch('/dashboard/json', { credentials: 'same-origin' })
-        .then(r => r.json())
-        .then(data => {
-            document.getElementById('stat-agents').textContent = data.agentCount;
-            document.getElementById('stat-online').textContent = data.onlineCount;
-            document.getElementById('stat-running').textContent = data.runningJobs;
-            document.getElementById('stat-queued').textContent = data.queuedJobs;
-            document.getElementById('stat-errors').textContent = data.errorCount;
-            renderActiveJobs(data.activeJobs);
-            renderUpcoming(data.upcomingSchedules, csrfToken);
-            renderRecentJobs(data.recentJobs);
-            renderLogs(data.recentLogs);
-        })
-        .catch(() => {});
-}, 8000);
-
-<?php if ($isAdmin): ?>
-// Slow stats refresh every 60 seconds (ClickHouse, server health)
-function updateSlowStats(data) {
-    if (data.cpuLoad) {
-        const p = data.cpuLoad.percent, arc = 212.06, circ = 282.74;
-        document.getElementById('cpu-pct').textContent = p + '%';
-        document.getElementById('cpu-detail').textContent = data.cpuLoad['1min'] + ' / ' + data.cpuLoad.cores + ' cores';
-        const cpuArc = document.getElementById('cpu-arc');
-        cpuArc.setAttribute('stroke-dasharray', (arc * p / 100) + ' ' + circ);
-        cpuArc.setAttribute('stroke', p > 80 ? '#dc3545' : (p > 50 ? '#ffc107' : '#198754'));
-    }
-    if (data.memory) {
-        const p = data.memory.percent, arc = 212.06, circ = 282.74;
-        document.getElementById('mem-pct').textContent = p + '%';
-        const memArc = document.getElementById('mem-arc');
-        memArc.setAttribute('stroke-dasharray', (arc * p / 100) + ' ' + circ);
-        memArc.setAttribute('stroke', p > 85 ? '#dc3545' : (p > 60 ? '#ffc107' : '#0dcaf0'));
-    }
-    if (data.mysqlStats) {
-        const ms = data.mysqlStats;
-        const fmt = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
-        const map = {
-            'stat-catalog': ms.catalog_files, 'stat-archives': ms.archives,
-            'stat-completed-jobs': ms.completed_jobs
-        };
-        for (const [id, val] of Object.entries(map)) {
-            const el = document.getElementById(id);
-            if (el) el.textContent = fmt(val);
+        function pushSample(key, svg, bps) {
+            if (bps === null || bps === undefined) return;
+            const buf = netHist[key];
+            buf.push(Number(bps) || 0);
+            if (buf.length > SPARK_MAX) buf.shift();
+            renderSpark(svg, buf);
         }
-        const qpsEl = document.getElementById('stat-qps');
-        if (qpsEl) qpsEl.textContent = ms.qps;
-        const connEl = document.getElementById('stat-connections');
-        if (connEl) connEl.textContent = ms.threads_connected;
-        const hitEl = document.getElementById('stat-hit-rate');
-        if (hitEl) hitEl.textContent = ms.hit_rate + '%';
-        const upEl = document.getElementById('stat-uptime');
-        if (upEl) {
-            const u = Number(ms.uptime);
-            const d = Math.floor(u / 86400), h = Math.floor((u % 86400) / 3600);
-            upEl.textContent = d > 0 ? d + 'd ' + h + 'h' : h + 'h';
+
+        function cpuPalette(p) {
+            return p > 80 ? ['#ef4444', 'High Usage']
+                 : p > 50 ? ['#f59e0b', 'Moderate']
+                 :          ['#22c55e', 'Healthy'];
         }
-        const bpEl = document.getElementById('stat-bp-usage');
-        if (bpEl) bpEl.textContent = ms.buffer_pool_used_pct + '%';
-        const slowEl = document.getElementById('stat-slow');
-        if (slowEl) slowEl.textContent = Number(ms.slow_queries).toLocaleString();
-    }
-    if (data.clickhouseStats) {
-        const ch = data.clickhouseStats;
-        const isSqlite = ch.backend === 'sqlite';
-        const fmt = n => { n = Number(n); if (n >= 1000000) return (n/1000000).toFixed(1)+'M'; if (n >= 10000) return (n/1000).toFixed(1)+'K'; return n.toLocaleString(); };
-        const fmtB = b => { b = Number(b); if (b >= 1099511627776) return (b/1099511627776).toFixed(1)+'TB'; if (b >= 1073741824) return (b/1073741824).toFixed(1)+'GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+'MB'; return (b/1024).toFixed(1)+'KB'; };
-        if (!isSqlite) {
-            const chMap = {
-                'stat-ch-disk': fmtB(ch.disk_bytes),
-                'stat-ch-compression': ch.compression_ratio + 'x',
-                'stat-ch-agents': ch.agent_count,
-                'stat-ch-avg-archive': fmt(ch.avg_per_archive)
-            };
-            for (const [id, val] of Object.entries(chMap)) {
-                const el = document.getElementById(id);
-                if (el) el.textContent = val;
-            }
-        } else {
-            const chMap = {
-                'stat-ch-agents': ch.agent_count,
-                'stat-ch-avg-archive': fmt(ch.avg_per_archive)
-            };
-            for (const [id, val] of Object.entries(chMap)) {
-                const el = document.getElementById(id);
-                if (el) el.textContent = val;
-            }
-        }
-        const repoTable = document.getElementById('ch-top-repos');
-        if (repoTable && ch.top_repos) {
-            let html = '<tbody>';
-            ch.top_repos.forEach((r, i) => {
-                html += '<tr><td class="border-0 py-0 ps-0"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:'+pieColors[i%5]+';margin-right:4px;"></span><span class="fw-semibold">'+esc(r.name)+'</span></td><td class="border-0 py-0 text-end text-muted">'+fmt(r.rows)+' rows</td><td class="border-0 py-0 text-end text-muted d-none d-xl-table-cell">'+r.archives+' archives</td>';
-                if (!isSqlite) {
-                    html += '<td class="border-0 py-0 text-end text-muted">'+fmtB(r.disk_bytes)+'</td>';
+
+        function memPalette(p) { return p > 85 ? '#ef4444' : (p > 60 ? '#f59e0b' : '#0dcaf0'); }
+        function diskPalette(p) { return p >= 90 ? '#ef4444' : (p >= 75 ? '#f59e0b' : '#0dcaf0'); }
+
+        async function poll() {
+            try {
+                const resp = await fetch('/dashboard/health-json', { credentials: 'same-origin' });
+                if (!resp.ok) return;
+                const d = await resp.json();
+
+                if (d.cpu && cpuArc) {
+                    const p = Number(d.cpu.percent) || 0;
+                    const [color, status] = cpuPalette(p);
+                    cpuArc.style.strokeDashoffset = String(ARC_LEN * (1 - p / 100));
+                    cpuArc.setAttribute('stroke', color);
+                    if (cpuPctNum) cpuPctNum.textContent = (Math.round(p * 10) / 10).toString();
+                    if (cpuStatus) { cpuStatus.textContent = status; cpuStatus.style.color = color; }
                 }
-                html += '</tr>';
+
+                if (d.memory && memFill) {
+                    const p = Number(d.memory.percent) || 0;
+                    memFill.style.width = p + '%';
+                    memFill.style.backgroundColor = memPalette(p);
+                    if (memPctEl) memPctEl.textContent = (Math.round(p * 10) / 10).toString();
+                    if (memSizeEl && d.memory.pair_label) memSizeEl.textContent = d.memory.pair_label;
+                }
+
+                if (d.net) {
+                    if (netRxEl) netRxEl.textContent = d.net.rx_label;
+                    if (netTxEl) netTxEl.textContent = d.net.tx_label;
+                    pushSample('rx', netRxSvg, d.net.rx_bps);
+                    pushSample('tx', netTxSvg, d.net.tx_bps);
+                }
+
+                if (d.disk && diskFill) {
+                    const p = Number(d.disk.percent) || 0;
+                    const color = diskPalette(p);
+                    if (diskPctEl) diskPctEl.textContent = Math.round(p).toString();
+                    if (diskSize) diskSize.textContent = d.disk.size_label;
+                    diskFill.style.width = p + '%';
+                    diskFill.style.backgroundColor = color;
+                }
+            } catch (e) { /* silent */ }
+        }
+
+        setInterval(poll, 15000);
+    })();
+    <?php endif; ?>
+
+    // --- Active & Queued + top-tile counts: 10s poll ---------------------
+    // The Active/Queued table and the four hero tiles change in real time
+    // as jobs queue, run, and complete. Was previously a snapshot at page
+    // render and never updated. Polls a small JSON endpoint every 10s.
+    (function () {
+        const tileAgentCount  = document.getElementById('tile-agent-count');
+        const tileOnlineCount = document.getElementById('tile-online-count');
+        const tileOfflineCount = document.getElementById('tile-offline-count');
+        const tileRunning     = document.getElementById('tile-running-count');
+        const tileQueued      = document.getElementById('tile-queued-count');
+        const tileErrorCount  = document.getElementById('tile-error-count');
+        const tileErrorsLink  = document.getElementById('tile-errors-link');
+        const activeContainer = document.getElementById('active-jobs');
+        if (!activeContainer) return;
+
+        function escHtml(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+        function ucfirst(s) { return (s || '').charAt(0).toUpperCase() + (s || '').slice(1); }
+
+        function renderActive(jobs) {
+            if (!jobs || !jobs.length) {
+                activeContainer.innerHTML = ''
+                    + '<div class="p-5 text-muted text-center">'
+                    + '<i class="bi bi-hourglass d-block mb-2" style="font-size:1.8rem;opacity:0.4;"></i>'
+                    + '<div>No Active Jobs</div></div>';
+                return;
+            }
+            let html = '<div class="table-responsive"><table class="table table-hover mb-0 small">'
+                + '<thead><tr><th>Client</th><th>Task</th><th class="d-th-md">Repo</th><th>Status</th></tr></thead><tbody>';
+            jobs.forEach(j => {
+                const badgeClass = j.status === 'queued' ? 'text-bg-warning' : 'text-bg-primary';
+                let statusHtml;
+                if (j.percent !== null && j.percent !== undefined && j.status === 'running') {
+                    statusHtml = '<div class="progress" style="height:18px;min-width:60px;">'
+                        + '<div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" style="width:'
+                        + j.percent + '%">' + j.percent + '%</div></div>';
+                } else {
+                    statusHtml = '<span class="badge ' + badgeClass + '">' + escHtml(ucfirst(j.status)) + '</span>';
+                }
+                html += '<tr style="cursor:pointer" onclick="window.location=\'/queue/' + j.id + '\'">'
+                    + '<td>' + escHtml(j.agent_name) + '</td>'
+                    + '<td>' + escHtml(ucfirst(j.task_type)) + '</td>'
+                    + '<td class="d-table-cell-md">' + escHtml(j.repo_name || '--') + '</td>'
+                    + '<td>' + statusHtml + '</td></tr>';           });
+            html += '</tbody></table></div>';
+            activeContainer.innerHTML = html;
+        }
+        async function pollActive() {
+            try {
+                const resp = await fetch('/dashboard/active-json', { credentials: 'same-origin' });
+                if (!resp.ok) return;
+                const d = await resp.json();
+                if (tileAgentCount)  tileAgentCount.textContent  = d.agentCount;
+                if (tileOnlineCount) tileOnlineCount.textContent = d.onlineCount;
+                if (tileOfflineCount) tileOfflineCount.textContent = Math.max(0, d.agentCount - d.onlineCount);
+                if (tileRunning)     tileRunning.textContent     = d.runningJobs;
+                if (tileQueued)      tileQueued.textContent      = d.queuedJobs;
+                if (tileErrorCount)  tileErrorCount.textContent  = d.errorCount;
+                // Repaint the errors tile (card bg + icon wrap colour + icon
+                // glyph) when the count crosses zero — the server picks the
+                // initial classes; the JS keeps them in sync after that.
+                {
+                    const isErr = d.errorCount > 0;
+                    const card = document.getElementById('tile-errors-card');
+                    const iconWrap = document.getElementById('tile-errors-icon-wrap');
+                    const icon = document.getElementById('tile-errors-icon');
+                    if (card) {
+                        card.classList.toggle('metric-card-danger', isErr);
+                        card.classList.toggle('metric-card-success', !isErr);
+                    }
+                    if (iconWrap) {
+                        iconWrap.classList.toggle('bg-danger', isErr);
+                        iconWrap.classList.toggle('text-danger', isErr);
+                        iconWrap.classList.toggle('bg-success', !isErr);
+                        iconWrap.classList.toggle('text-success', !isErr);
+                    }
+                    if (icon) {
+                        icon.classList.toggle('bi-exclamation-circle', isErr);
+                        icon.classList.toggle('bi-check-circle', !isErr);
+                    }
+                }
+                renderActive(d.activeJobs || []);
+            } catch (e) { /* silent */ }       }
+
+        setInterval(pollActive, 10000);
+    })();
+
+    // --- Recently Completed: task-type filter ----------------------------
+    (function () {
+        const STORAGE_KEY = 'bbs_recent_jobs_filter';
+        const ALL = ['backup','restore','prune','compact','s3','other'];
+        const checkboxes = document.querySelectorAll('.recent-filter-cb');
+        const btn = document.getElementById('recentFilterBtn');
+        const badge = document.getElementById('recentFilterCount');
+        const btnAll = document.getElementById('recentFilterAll');
+        const btnNone = document.getElementById('recentFilterNone');
+        const container = document.getElementById('recent-jobs');
+        if (!checkboxes.length || !container) return;
+
+        // Load saved selection (defaults to all checked)
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+        const active = saved && Array.isArray(saved) ? new Set(saved) : new Set(ALL);
+        checkboxes.forEach(cb => { cb.checked = active.has(cb.dataset.cat); });
+        updateBadge();
+
+        function updateBadge() {
+            const count = ALL.length - active.size;
+            if (count === 0 || active.size === 0) {
+                badge.style.display = 'none';
+            } else {
+                badge.textContent = active.size;
+                badge.style.display = '';
+            }
+        }
+
+        function save() {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify([...active]));
+        }
+
+        function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+        function timeAgo(str) {
+            if (!str) return '--';
+            const diff = Math.floor((Date.now() - new Date((str).replace(' ','T')+'Z').getTime()) / 1000);
+            if (diff < 60) return diff + 's ago';
+            if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+            return Math.floor(diff/86400) + 'd ago';
+        }
+        // Task-type icon map (mirrors the PHP one above and queue/index.php)
+        const TASK_ICONS = {
+            'backup':          'bi-box-seam text-warning',
+            'prune':           'bi-scissors text-secondary',
+            'compact':         'bi-arrows-collapse text-info',
+            'restore':         'bi-cloud-download text-primary',
+            'restore_mysql':   'bi-database text-primary',
+            'restore_pg':      'bi-database text-primary',
+            'restore_mongo':   'bi-database text-primary',
+            'check':           'bi-shield-check text-success',
+            'repo_check':      'bi-shield-check text-success',
+            'repo_repair':     'bi-tools text-warning',
+            'break_lock':      'bi-unlock text-secondary',
+            'update_borg':     'bi-arrow-up-square text-info',
+            'update_agent':    'bi-arrow-up-square text-info',
+            'plugin_test':     'bi-pencil text-secondary',
+            's3_sync':         'bi-cloud-upload text-info',
+            's3_restore':      'bi-cloud-download text-info',
+            'catalog_sync':    'bi-list-ul text-success',
+            'catalog_rebuild': 'bi-list-ul text-success',
+        };
+
+        function renderRows(jobs) {
+            if (!jobs || !jobs.length) {
+                container.innerHTML = '<div class="p-5 text-muted text-center"><i class="bi bi-filter d-block mb-2" style="font-size:1.8rem;opacity:0.4;"></i><div>No Jobs Match This Filter</div></div>';
+                return;
+            }
+            let html = '<div class="table-responsive"><table class="table table-hover mb-0 small recent-jobs-table"><thead><tr><th>Client</th><th>Task</th><th class="d-th-md">Plan</th><th class="d-th-md">Repo</th><th>Completed</th><th class="d-th-md">Duration</th><th class="text-center">Status</th></tr></thead><tbody>';
+            jobs.forEach(j => {
+                const icon = j.status === 'completed' ? 'bi-check-circle-fill text-success'
+                    : j.status === 'failed' ? 'bi-x-circle-fill text-danger'
+                    : 'bi-slash-circle-fill text-secondary';
+                const taskIcon = TASK_ICONS[j.task_type] || 'bi-gear text-muted';
+                const taskLabel = (j.task_type||'').charAt(0).toUpperCase() + (j.task_type||'').slice(1);
+                html += '<tr style="cursor:pointer" onclick="window.location=\'/queue/'+j.id+'\'">'
+                    + '<td>' + esc(j.agent_name) + '</td>'
+                    + '<td class="text-nowrap"><i class="bi ' + taskIcon + ' me-1"></i>' + esc(taskLabel) + '</td>'
+                    + '<td class="d-table-cell-md">' + esc(j.plan_name || '--') + '</td>'
+                    + '<td class="d-table-cell-md">' + esc(j.repo_name || '--') + '</td>'
+                    + '<td>' + timeAgo(j.completed_at) + '</td>'
+                    + '<td class="d-table-cell-md">' + window.BBS.formatDuration(j.duration_seconds) + '</td>'
+                    + '<td class="text-center"><i class="bi ' + icon + '"></i></td>'
+                    + '</tr>';
             });
-            html += '</tbody>';
-            repoTable.innerHTML = html;
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
         }
-        if (typeof catalogPieChart !== 'undefined' && catalogPieChart && ch.top_repos) {
-            const prop = isSqlite ? 'rows' : 'disk_bytes';
-            const totalProp = isSqlite ? 'total_rows' : 'disk_bytes';
 
-            const top5 = ch.top_repos.reduce((s, r) => s + Number(r[prop] || 0), 0);
-            const other = Math.max(Number(ch[totalProp] || 0) - top5, 0);
-
-            const labels = ch.top_repos.map(r => r.name);
-            const vals = ch.top_repos.map(r => Number(r[prop] || 0));
-
-            if (other > 0) { labels.push('Other'); vals.push(other); }
-            catalogPieChart.data.labels = labels;
-            catalogPieChart.data.datasets[0].data = vals;
-            catalogPieChart.data.datasets[0].backgroundColor = pieColors.slice(0, vals.length);
-            catalogPieChart.update('none');
+        async function refresh() {
+            const types = [...active].join(',');
+            const url = '/dashboard/json' + (types && active.size < ALL.length ? '?types=' + encodeURIComponent(types) : '');
+            try {
+                const resp = await fetch(url, { credentials: 'same-origin' });
+                if (!resp.ok) return;
+                const data = await resp.json();
+                renderRows(data.recentJobs || []);
+            } catch (e) { /* silent */ }
         }
-    }
-}
-function fetchSlowStats() {
-    fetch('/dashboard/stats-json', { credentials: 'same-origin' })
-        .then(r => r.json())
-        .then(updateSlowStats)
-        .catch(() => {});
-}
-// Background refresh on load, then every 60s
-setTimeout(fetchSlowStats, 500);
-setInterval(fetchSlowStats, 60000);
-<?php endif; ?>
+
+        checkboxes.forEach(cb => cb.addEventListener('change', () => {
+            if (cb.checked) active.add(cb.dataset.cat);
+            else active.delete(cb.dataset.cat);
+            save();
+            updateBadge();
+            refresh();
+        }));
+        btnAll.addEventListener('click', () => {
+            ALL.forEach(c => active.add(c));
+            checkboxes.forEach(cb => cb.checked = true);
+            save(); updateBadge(); refresh();
+        });
+        btnNone.addEventListener('click', () => {
+            active.clear();
+            checkboxes.forEach(cb => cb.checked = false);
+            save(); updateBadge(); refresh();
+        });
+
+        // Initial fetch if saved filter differs from the server-rendered default
+        if (saved && active.size < ALL.length) refresh();
+    })();
+});
 </script>

@@ -17,6 +17,11 @@ class BorgCommandBuilder
         $cmd[] = '--log-json';
         $cmd[] = '--list';
         $cmd[] = '--progress';
+        // Wait up to 10 min for the repo lock instead of failing immediately
+        // when a transient operation (e.g. borg prune/compact, concurrent
+        // backup on the same remote repo) still holds it. Borg's default is 1
+        // second, which turns any brief contention into a hard failure (#194).
+        $cmd[] = '--lock-wait=600';
 
         // Advanced options from the plan
         // Borg flags like --pattern take a value that may start with + or -
@@ -129,7 +134,15 @@ class BorgCommandBuilder
      */
     public static function buildExtractCommand(array $repo, string $archiveName, array $paths = [], int $stripComponents = 0): array
     {
-        $cmd = ['borg', 'extract', '--log-json'];
+        // --progress tells borg to emit progress_percent events; the agent
+        // forwards those to /api/agent/progress so the UI shows a live bar
+        // during restore instead of staying stuck at "Starting task..." (#168).
+        // --list makes borg emit one file_status event per extracted item
+        // so the agent can report an accurate file count back to the
+        // server (otherwise progress_percent only carries bytes).
+        // --lock-wait=600 matches borg create — avoid instant failure when
+        // another transient op is holding the repo lock (#194).
+        $cmd = ['borg', 'extract', '--log-json', '--progress', '--list', '--lock-wait=600'];
 
         if ($stripComponents > 0) {
             $cmd[] = '--strip-components=' . $stripComponents;
@@ -185,11 +198,11 @@ class BorgCommandBuilder
             if ($remoteSshConfig) {
                 // Remote SSH repo: agent uses a temp key file written from the task payload
                 $port = (int) ($remoteSshConfig['remote_port'] ?? 22);
-                $env['BORG_RSH'] = "ssh -i /tmp/bbs-remote-ssh-key -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes";
+                $env['BORG_RSH'] = "ssh -i /tmp/bbs-remote-ssh-key -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
             } elseif (self::isSshRepo($repo['path'] ?? '')) {
                 // Local repo on BBS server: agent uses its installed SSH key
                 $port = $sshPort ?? 22;
-                $env['BORG_RSH'] = "ssh -i /etc/bbs-agent/ssh_key -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes";
+                $env['BORG_RSH'] = "ssh -i /etc/bbs-agent/ssh_key -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
             }
         } else {
             // Server-side: www-data can't write to /var/www/.config, redirect borg's config/cache

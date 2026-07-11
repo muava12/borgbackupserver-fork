@@ -18,6 +18,42 @@ class PluginConfigController extends Controller
     }
 
     /**
+     * In hosted mode, S3 sync plugin configs must use the platform's
+     * managed credentials — customers can still create / edit / attach
+     * configs (needed to toggle per-repo sync), but the credentials
+     * source is locked to 'global' and any custom endpoint/region/
+     * bucket/access_key/secret_key fields they POST are stripped.
+     * Path prefix and bandwidth limit are legitimate per-config knobs
+     * and pass through.
+     *
+     * Returns the sanitized config array. For non-S3 plugins, returns
+     * the input unchanged. For non-hosted deployments, also unchanged.
+     */
+    private function sanitizeHostedConfig(int $pluginId, array $config): array
+    {
+        if (!\BBS\Core\Config::isHosted()) return $config;
+        $row = $this->db->fetchOne("SELECT slug FROM plugins WHERE id = ?", [$pluginId]);
+        if (!$row || ($row['slug'] ?? '') !== 's3_sync') return $config;
+
+        $config['credential_source'] = 'global';
+        foreach (['endpoint', 'region', 'bucket', 'access_key', 'secret_key'] as $field) {
+            unset($config[$field]);
+        }
+        return $config;
+    }
+
+    private function sanitizeHostedConfigByConfigId(int $configId, array $config): array
+    {
+        if (!\BBS\Core\Config::isHosted()) return $config;
+        $row = $this->db->fetchOne(
+            "SELECT p.id AS plugin_id FROM plugin_configs pc JOIN plugins p ON p.id = pc.plugin_id WHERE pc.id = ?",
+            [$configId]
+        );
+        if (!$row) return $config;
+        return $this->sanitizeHostedConfig((int) $row['plugin_id'], $config);
+    }
+
+    /**
      * Create a named plugin config.
      * POST /clients/{id}/plugin-configs
      */
@@ -37,6 +73,19 @@ class PluginConfigController extends Controller
 
         if (empty($name) || empty($pluginId)) {
             $this->flash('danger', 'Name and plugin are required.');
+            $this->redirect("/clients/{$id}?tab=plugins");
+        }
+
+        $config = $this->sanitizeHostedConfig($pluginId, $config);
+
+        // Duplicate names hit the unique_agent_config_name key — catch it
+        // up front instead of surfacing a raw PDOException
+        $duplicate = $this->db->fetchOne(
+            "SELECT id FROM plugin_configs WHERE agent_id = ? AND plugin_id = ? AND name = ?",
+            [$id, $pluginId, $name]
+        );
+        if ($duplicate) {
+            $this->flash('danger', "A configuration named \"{$name}\" already exists for this plugin. Choose a different name.");
             $this->redirect("/clients/{$id}?tab=plugins");
         }
 
@@ -76,6 +125,21 @@ class PluginConfigController extends Controller
 
         if (empty($name)) {
             $this->flash('danger', 'Name is required.');
+            $this->redirect("/clients/{$id}?tab=plugins");
+        }
+
+        $config = $this->sanitizeHostedConfigByConfigId($configId, $config);
+
+        // Renaming to another config's name would hit the same unique key
+        $duplicate = $this->db->fetchOne(
+            "SELECT pc.id FROM plugin_configs pc
+             JOIN plugin_configs self ON self.id = ?
+             WHERE pc.agent_id = self.agent_id AND pc.plugin_id = self.plugin_id
+               AND pc.name = ? AND pc.id != self.id",
+            [$configId, $name]
+        );
+        if ($duplicate) {
+            $this->flash('danger', "A configuration named \"{$name}\" already exists for this plugin. Choose a different name.");
             $this->redirect("/clients/{$id}?tab=plugins");
         }
 
@@ -127,7 +191,9 @@ class PluginConfigController extends Controller
     public function test(int $id, int $configId): void
     {
         $this->requireAuth();
-        // Skip CSRF for AJAX — session auth is sufficient for same-origin POST
+        // Session-authenticated POST must verify CSRF — same-origin isn't
+        // enforced by browsers for cross-origin form POSTs.
+        $this->verifyCsrf();
 
         if (!$this->getAgent($id)) {
             $this->json(['error' => 'Access denied'], 403);

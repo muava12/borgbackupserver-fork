@@ -4,12 +4,33 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title><?= htmlspecialchars($pageTitle ?? 'Dashboard') ?> - Borg Backup Server</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <!-- Self-hosted assets (no CDN). A self-hosted backup server must work in
+         airgapped / firewalled networks; loading Bootstrap & fonts from a CDN
+         meant the UI (buttons, dropdowns, modals) silently broke when the CDN
+         was unreachable or slow, since the blocking bootstrap script stalls the
+         whole page (#320). Served from /public/assets, shipped in the image. -->
+    <link href="/assets/inter/inter.css" rel="stylesheet">
+    <link href="/assets/bootstrap/bootstrap.min.css" rel="stylesheet">
+    <link href="/assets/bootstrap-icons/bootstrap-icons.min.css" rel="stylesheet">
     <link href="/css/style.css?v=<?= filemtime(__DIR__ . '/../../../public/css/style.css') ?>" rel="stylesheet">
+    <!-- bootstrap.bundle here (head, blocking) instead of at body-end so view
+         inline scripts that reference `bootstrap` (Tooltip, Collapse) don't
+         race against the loader. Without this, the first uncached page load
+         on tabs with inline bootstrap calls intermittently throws
+         "bootstrap is not defined" and the page renders in a broken state.
+         Now local, so it loads instantly and reliably. -->
+    <script src="/assets/bootstrap/bootstrap.bundle.min.js"></script>
+    <script src="/js/app-utils.js?v=<?= filemtime(__DIR__ . '/../../../public/js/app-utils.js') ?>"></script>
     <link rel="manifest" href="/manifest.json">
-    <link rel="apple-touch-icon" href="/images/apple-touch-icon.png">
+    <!-- Favicons + apple-touch-icon. Served by BrandingController, which
+         resizes a single uploaded source (or the bundled mascot default)
+         to whatever size the browser asks for. The legacy /favicon.ico
+         at the public root still catches old auto-requests. -->
+    <link rel="icon" type="image/png" sizes="16x16" href="/branding/icon/16">
+    <link rel="icon" type="image/png" sizes="32x32" href="/branding/icon/32">
+    <link rel="icon" type="image/png" sizes="96x96" href="/branding/icon/96">
+    <link rel="shortcut icon" href="/favicon.ico">
+    <link rel="apple-touch-icon" sizes="180x180" href="/branding/icon/180">
     <meta name="theme-color" content="#2c3e50">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
@@ -24,13 +45,32 @@
                     $brandIcon = \BBS\Core\Database::getInstance()->fetchOne("SELECT `value` FROM settings WHERE `key` = 'branding_icon'");
                     if (!empty($brandIcon['value'])):
                 ?>
-                <img src="data:image/png;base64,<?= $brandIcon['value'] ?>" alt="Logo" style="height: 36px;">
+                <img src="data:image/png;base64,<?= $brandIcon['value'] ?>" alt="Logo" class="topbar-brand-logo">
                 <?php else: ?>
-                <img src="/images/borg_icon_dark.png" alt="BBS" style="height: 36px;">
+                <img src="/images/bbs-logo-mascot.png" alt="BBS" class="topbar-mascot">
                 <?php endif; ?>
             </a>
-            <span class="navbar-text fw-semibold ms-3 d-none d-sm-inline"><?= htmlspecialchars($pageTitle ?? '') ?></span>
-            <span class="navbar-text fw-semibold ms-2 d-sm-none small"><?= htmlspecialchars($pageTitle ?? '') ?></span>
+            <?php
+            $navIcons = [
+                'Dashboard' => 'bi-speedometer2', 'Clients' => 'bi-display',
+                'Queue' => 'bi-clock-history', 'Schedules' => 'bi-calendar-week',
+                'Log' => 'bi-journal-text', 'Storage' => 'bi-hdd-stack',
+                'Settings' => 'bi-gear', 'Users' => 'bi-people',
+                'User Management' => 'bi-people',
+                'Notifications' => 'bi-bell', 'Profile' => 'bi-person',
+            ];
+            $navIcon = $navIcons[$pageTitle ?? ''] ?? '';
+            $badge = $pageTitleBadge ?? '';
+            ?>
+            <span class="navbar-text fw-semibold ms-3 d-none d-sm-inline" style="font-size:1.125rem;color:rgba(255,255,255,0.75);">
+                <?php if ($navIcon): ?><i class="bi <?= $navIcon ?> me-2"></i><?php endif; ?>
+                <?= htmlspecialchars($pageTitle ?? '') ?>
+                <?php if ($badge): ?><span class="badge bg-primary bg-opacity-25 text-primary ms-2" style="font-size:0.55rem;vertical-align:middle;"><?= htmlspecialchars($badge) ?></span><?php endif; ?>
+            </span>
+            <span class="navbar-text fw-semibold ms-2 d-sm-none" style="font-size:1rem;color:rgba(255,255,255,0.75);">
+                <?php if ($navIcon): ?><i class="bi <?= $navIcon ?> me-1"></i><?php endif; ?>
+                <?= htmlspecialchars($pageTitle ?? '') ?>
+            </span>
             <div class="d-flex align-items-center ms-auto me-2 me-md-3">
                 <?php
                 $notifCount = $notifCount ?? (new \BBS\Services\NotificationService())->unreadCount($_SESSION['user_id'] ?? null);
@@ -74,7 +114,7 @@
                     <i class="bi bi-cloud-arrow-down me-1"></i> Upgrade
                 </a>
                 <?php elseif ($agentUpgradeCount > 0): ?>
-                <a href="/settings?tab=updates" class="badge bg-info text-white text-decoration-none me-2 me-md-3 py-2 px-2 d-none d-sm-inline-block">
+                <a href="/settings?tab=updates" class="badge text-bg-primary text-decoration-none me-2 me-md-3 py-2 px-2 d-none d-sm-inline-block">
                     <i class="bi bi-box-seam me-1"></i> Upgrade Agents
                 </a>
                 <?php endif; ?>
@@ -86,7 +126,7 @@
                 </a>
                 <?php endif; ?>
                 <div class="dropdown">
-                    <a class="btn btn-link text-white dropdown-toggle text-decoration-none p-1" href="#" role="button" data-bs-toggle="dropdown">
+                    <a class="btn btn-link text-white dropdown-toggle text-decoration-none p-1" href="#" role="button" data-bs-toggle="dropdown" style="font-size:0.875rem;">
                         <i class="bi bi-person-circle"></i>
                         <span class="d-none d-md-inline ms-1"><?= htmlspecialchars($_SESSION['username'] ?? 'User') ?></span>
                     </a>
@@ -136,18 +176,26 @@
                     </a>
                 </li>
                 <li class="nav-item">
+                    <a href="/schedules" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Schedules' ? 'active' : '' ?>">
+                        <i class="bi bi-calendar-week d-block mb-1 fs-4"></i>
+                        <span class="small">Schedules</span>
+                    </a>
+                </li>
+                <li class="nav-item">
                     <a href="/log" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Log' ? 'active' : '' ?>">
                         <i class="bi bi-journal-text d-block mb-1 fs-4"></i>
                         <span class="small">Log</span>
                     </a>
                 </li>
                 <?php if (($_SESSION['user_role'] ?? '') === 'admin'): ?>
+                <?php if (!\BBS\Core\Config::isHosted()): ?>
                 <li class="nav-item">
                     <a href="/storage-locations" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Storage' ? 'active' : '' ?>">
                         <i class="bi bi-hdd-stack d-block mb-1 fs-4"></i>
                         <span class="small">Storage</span>
                     </a>
                 </li>
+                <?php endif; ?>
                 <li class="nav-item">
                     <a href="/settings" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Settings' ? 'active' : '' ?>">
                         <i class="bi bi-gear d-block mb-1 fs-4"></i>
@@ -155,13 +203,21 @@
                     </a>
                 </li>
                 <li class="nav-item">
-                    <a href="/users" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Users' ? 'active' : '' ?>">
+                    <a href="/users" class="nav-link sidebar-link <?= str_contains($pageTitle ?? '', 'User') ? 'active' : '' ?>">
                         <i class="bi bi-people d-block mb-1 fs-4"></i>
                         <span class="small">Users</span>
                     </a>
                 </li>
                 <?php endif; ?>
             </ul>
+            <?php
+                $bbsVersionForSidebar = (new \BBS\Services\UpdateService())->getCurrentVersion();
+            ?>
+            <div class="text-center pb-2">
+                <span class="badge rounded-pill sidebar-version-pill">
+                    v<?= htmlspecialchars($bbsVersionForSidebar) ?>
+                </span>
+            </div>
             <div class="border-top p-2 text-center">
                 <a href="/logout" class="nav-link sidebar-link">
                     <i class="bi bi-box-arrow-left d-block mb-1 fs-4"></i>
@@ -183,35 +239,71 @@
     </div>
 
     <!-- Bottom nav (mobile only) -->
+    <?php
+        $pt = $pageTitle ?? '';
+        $isAdmin = ($_SESSION['user_role'] ?? '') === 'admin';
+        // Active state for the More menu: true if the current page is one of
+        // the items inside the More sheet, so the user sees which section of
+        // the app they're in even though it's not a top-level tab.
+        $moreActive = in_array($pt, ['Schedules', 'Log', 'Storage'], true)
+            || ($isAdmin && str_contains($pt, 'User'));
+    ?>
     <nav class="mobile-bottom-nav d-md-none">
-        <a href="/" class="mobile-nav-item <?= ($pageTitle ?? '') === 'Dashboard' ? 'active' : '' ?>">
+        <a href="/" class="mobile-nav-item <?= $pt === 'Dashboard' ? 'active' : '' ?>">
             <i class="bi bi-speedometer2"></i>
             <span>Home</span>
         </a>
-        <a href="/clients" class="mobile-nav-item <?= ($pageTitle ?? '') === 'Clients' ? 'active' : '' ?>">
+        <a href="/clients" class="mobile-nav-item <?= $pt === 'Clients' ? 'active' : '' ?>">
             <i class="bi bi-display"></i>
             <span>Clients</span>
         </a>
-        <a href="/queue" class="mobile-nav-item <?= ($pageTitle ?? '') === 'Queue' ? 'active' : '' ?>">
+        <a href="/queue" class="mobile-nav-item <?= $pt === 'Queue' ? 'active' : '' ?>">
             <i class="bi bi-clock-history"></i>
             <span>Queue</span>
         </a>
-        <?php if (($_SESSION['user_role'] ?? '') === 'admin'): ?>
-        <a href="/settings" class="mobile-nav-item <?= ($pageTitle ?? '') === 'Settings' ? 'active' : '' ?>">
+        <?php if ($isAdmin): ?>
+        <a href="/settings" class="mobile-nav-item <?= $pt === 'Settings' ? 'active' : '' ?>">
             <i class="bi bi-gear"></i>
             <span>Settings</span>
         </a>
-        <a href="/users" class="mobile-nav-item <?= ($pageTitle ?? '') === 'Users' ? 'active' : '' ?>">
-            <i class="bi bi-people"></i>
-            <span>Users</span>
-        </a>
-        <?php else: ?>
-        <a href="/log" class="mobile-nav-item <?= ($pageTitle ?? '') === 'Log' ? 'active' : '' ?>">
-            <i class="bi bi-journal-text"></i>
-            <span>Log</span>
-        </a>
         <?php endif; ?>
+        <button type="button" class="mobile-nav-item <?= $moreActive ? 'active' : '' ?>"
+                data-bs-toggle="offcanvas" data-bs-target="#mobileMoreMenu" aria-controls="mobileMoreMenu">
+            <i class="bi bi-three-dots"></i>
+            <span>More</span>
+        </button>
     </nav>
+
+    <!-- "More" offcanvas — pops up from the bottom with secondary nav items -->
+    <div class="offcanvas offcanvas-bottom mobile-more-sheet" tabindex="-1" id="mobileMoreMenu" aria-labelledby="mobileMoreMenuLabel">
+        <div class="offcanvas-header border-bottom">
+            <h5 class="offcanvas-title" id="mobileMoreMenuLabel">More</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+        </div>
+        <div class="offcanvas-body p-0">
+            <div class="list-group list-group-flush">
+                <a href="/schedules" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Schedules' ? 'active' : '' ?>">
+                    <i class="bi bi-calendar-week fs-5 me-3"></i>Schedules
+                </a>
+                <a href="/log" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Log' ? 'active' : '' ?>">
+                    <i class="bi bi-journal-text fs-5 me-3"></i>Log
+                </a>
+                <?php if ($isAdmin): ?>
+                <a href="/users" class="list-group-item list-group-item-action d-flex align-items-center <?= str_contains($pt, 'User') ? 'active' : '' ?>">
+                    <i class="bi bi-people fs-5 me-3"></i>Users
+                </a>
+                <?php if (!\BBS\Core\Config::isHosted()): ?>
+                <a href="/storage-locations" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Storage' ? 'active' : '' ?>">
+                    <i class="bi bi-hdd-stack fs-5 me-3"></i>Storage
+                </a>
+                <?php endif; ?>
+                <?php endif; ?>
+                <a href="/logout" class="list-group-item list-group-item-action d-flex align-items-center text-danger">
+                    <i class="bi bi-box-arrow-right fs-5 me-3"></i>Logout
+                </a>
+            </div>
+        </div>
+    </div>
 
     <!-- Confirm modal -->
     <div class="modal fade" id="confirmModal" tabindex="-1" data-bs-backdrop="static">
@@ -236,7 +328,83 @@
     window.BBS_TIME_24H = <?= json_encode(($_SESSION['time_format'] ?? '12h') === '24h') ?>;
     window.BBS_TIMEZONE = <?= json_encode($_SESSION['timezone'] ?? 'America/New_York') ?>;
     </script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- bootstrap.bundle moved to <head> (see comment there) — no second tag here. -->
+    <script>
+    // Global dropdown/tooltip escape fix (issue #161 and predecessors).
+    // Every dropdown toggle in the app gets data-bs-strategy="fixed" so Popper
+    // positions the menu with position:fixed, which escapes parent containers
+    // that clip it (cards with overflow:hidden, table wrappers, sticky headers).
+    // Tooltips get boundary:'viewport' + container:'body' via a default instance
+    // so they also clear parent clipping. This replaces the per-element patches
+    // we were adding case-by-case.
+    (function() {
+        function upgradeDropdown(el) {
+            if (el.dataset.bsDropdownFixed === '1') return;
+            el.setAttribute('data-bs-strategy', 'fixed');
+            el.dataset.bsDropdownFixed = '1';
+            // If Bootstrap already instantiated this dropdown, dispose so the
+            // next open picks up the new strategy.
+            if (window.bootstrap && bootstrap.Dropdown) {
+                var existing = bootstrap.Dropdown.getInstance(el);
+                if (existing) existing.dispose();
+            }
+        }
+        function upgradeTooltip(el) {
+            if (el.dataset.bsTooltipFixed === '1') return;
+            el.dataset.bsTooltipFixed = '1';
+            // Set container/boundary via data attributes so that any tooltip
+            // instance (whether created here or later by a view-level script
+            // doing `new bootstrap.Tooltip(el)`) picks up the same config.
+            if (!el.hasAttribute('data-bs-container')) el.setAttribute('data-bs-container', 'body');
+            if (!el.hasAttribute('data-bs-boundary')) el.setAttribute('data-bs-boundary', 'viewport');
+            if (window.bootstrap && bootstrap.Tooltip && !bootstrap.Tooltip.getInstance(el)) {
+                new bootstrap.Tooltip(el);
+            }
+        }
+        function upgradeAll(root) {
+            root = root || document;
+            root.querySelectorAll('[data-bs-toggle="dropdown"]').forEach(upgradeDropdown);
+            root.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(upgradeTooltip);
+        }
+        function init() {
+            upgradeAll();
+            // Pick up dropdowns/tooltips added to the DOM later (AJAX rows, modals).
+            var obs = new MutationObserver(function(muts) {
+                muts.forEach(function(m) {
+                    m.addedNodes.forEach(function(n) {
+                        if (n.nodeType !== 1) return;
+                        if (n.matches) {
+                            if (n.matches('[data-bs-toggle="dropdown"]')) upgradeDropdown(n);
+                            if (n.matches('[data-bs-toggle="tooltip"]')) upgradeTooltip(n);
+                        }
+                        if (n.querySelectorAll) upgradeAll(n);
+                    });
+                });
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+
+            // A dropdown left open on the page floats over a modal that opens
+            // afterward: the global max z-index on .dropdown-menu.show puts it
+            // (and its toggle's three-dots) above the modal backdrop, so it
+            // bleeds through — e.g. a plan's Actions kebab showing inside the
+            // Browse Filesystem modal (#328). Close any open dropdown when a
+            // modal is shown.
+            document.addEventListener('show.bs.modal', function() {
+                document.querySelectorAll('[data-bs-toggle="dropdown"][aria-expanded="true"]').forEach(function(t) {
+                    if (window.bootstrap && bootstrap.Dropdown) {
+                        var inst = bootstrap.Dropdown.getInstance(t);
+                        if (inst) inst.hide();
+                    }
+                });
+            });
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+    })();
+    </script>
     <script>
     function toggleTheme() {
         var html = document.documentElement;

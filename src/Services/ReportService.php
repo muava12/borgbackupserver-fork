@@ -16,8 +16,13 @@ class ReportService
     /**
      * Generate a daily report for the given date (default: today).
      * Stores as JSON in daily_reports table (upserts if date already exists).
+     *
+     * $bumpTimestamp: when true, re-writes created_at to NOW() on upsert so
+     * the UI timestamp reflects the manual refresh (#152). The scheduler's
+     * automatic minute-by-minute regeneration passes false so it doesn't
+     * look like the user just clicked the button (#176).
      */
-    public function generate(?string $date = null): array
+    public function generate(?string $date = null, bool $bumpTimestamp = false): array
     {
         if ($date) {
             $reportDate = $date;
@@ -35,24 +40,89 @@ class ReportService
         // All agents
         $agents = $this->db->fetchAll("SELECT id, name, hostname, status, last_heartbeat FROM agents ORDER BY name");
 
+        // On-disk repository size per agent — the deduplicated footprint
+        // maintained by RepositorySizeService. This is the same figure the
+        // Clients page shows (and matches `du`); the report's "Size" column
+        // uses it so the two never disagree, and so it stays correct even when
+        // the most recent backup failed (#292). It deliberately does NOT use
+        // the last archive's original_size (uncompressed, non-deduplicated).
+        $repoSizeByAgent = [];
+        foreach ($this->db->fetchAll(
+            "SELECT agent_id, COALESCE(SUM(size_bytes), 0) as total_size FROM repositories GROUP BY agent_id"
+        ) as $rs) {
+            $repoSizeByAgent[(int) $rs['agent_id']] = (int) $rs['total_size'];
+        }
+
         $agentData = [];
         $totalCompleted = 0;
         $totalFailed = 0;
         $totalBytes = 0;
 
         foreach ($agents as $agent) {
-            // Last backup job for this agent
-            $lastJob = $this->db->fetchOne("
-                SELECT bj.status, bj.completed_at, bj.files_processed,
+            // Latest completed/failed backup per plan for this agent — clients
+            // with multiple plans used to show only one plan's size in the
+            // report (#175). Aggregating across plans fixes that and gives a
+            // true "total backed-up" count for the client.
+            $planJobs = $this->db->fetchAll("
+                SELECT bj.backup_plan_id, bj.status, bj.completed_at, bj.files_processed,
                        COALESCE(a.original_size, bj.bytes_total, 0) as original_size,
                        COALESCE(a.deduplicated_size, 0) as deduplicated_size,
                        bj.error_log, bj.duration_seconds, bp.name as plan_name
                 FROM backup_jobs bj
+                INNER JOIN (
+                    SELECT backup_plan_id, MAX(completed_at) as max_at
+                    FROM backup_jobs
+                    WHERE agent_id = ? AND task_type = 'backup'
+                      AND status IN ('completed', 'failed')
+                      AND completed_at IS NOT NULL
+                    GROUP BY backup_plan_id
+                ) latest ON (
+                    (latest.backup_plan_id <=> bj.backup_plan_id)
+                    AND latest.max_at = bj.completed_at
+                )
                 LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
                 LEFT JOIN archives a ON a.backup_job_id = bj.id
-                WHERE bj.agent_id = ? AND bj.task_type = 'backup' AND bj.status IN ('completed', 'failed')
-                ORDER BY bj.completed_at DESC LIMIT 1
-            ", [$agent['id']]);
+                WHERE bj.agent_id = ? AND bj.task_type = 'backup'
+                  AND bj.status IN ('completed', 'failed')
+                ORDER BY bj.completed_at DESC
+            ", [$agent['id'], $agent['id']]);
+
+            // Aggregate across plans. "last_backup" keeps the most recent
+            // per-plan entry as the top-line timestamp; plan_breakdown
+            // surfaces each plan's status so a partial failure (one plan ok,
+            // one failed) is visible in the HTML renderer.
+            $lastJob = null;
+            $aggFiles = 0;
+            $aggOriginal = 0;
+            $aggDedup = 0;
+            $anyFailed = false;
+            $anyOk = false;
+            $planBreakdown = [];
+            foreach ($planJobs as $pj) {
+                if ($lastJob === null) $lastJob = $pj; // rows are ORDER BY completed_at DESC
+                if ($pj['status'] === 'completed') {
+                    $aggFiles    += (int) $pj['files_processed'];
+                    $aggOriginal += (int) $pj['original_size'];
+                    $aggDedup    += (int) $pj['deduplicated_size'];
+                    $anyOk = true;
+                } else {
+                    $anyFailed = true;
+                }
+                $planBreakdown[] = [
+                    'plan_name'    => $pj['plan_name'],
+                    'status'       => $pj['status'],
+                    'completed_at' => $pj['completed_at'],
+                    'files'        => (int) $pj['files_processed'],
+                    'original_size'=> (int) $pj['original_size'],
+                    'error'        => $pj['status'] === 'failed' ? substr($pj['error_log'] ?? '', 0, 200) : null,
+                ];
+            }
+            // Overall row status: failed if anything failed; completed if at
+            // least one ok and nothing failed; otherwise mirror $lastJob.
+            $overallStatus = null;
+            if ($anyFailed && $anyOk)       $overallStatus = 'partial';
+            elseif ($anyFailed)             $overallStatus = 'failed';
+            elseif ($anyOk)                 $overallStatus = 'completed';
 
             // Backups since last report for this agent
             $periodStats = $this->db->fetchOne("
@@ -78,15 +148,21 @@ class ReportService
                 'hostname' => $agent['hostname'],
                 'status' => $agent['status'],
                 'last_heartbeat' => $agent['last_heartbeat'],
+                'repo_size' => $repoSizeByAgent[(int) $agent['id']] ?? 0,
                 'last_backup' => $lastJob ? [
-                    'status' => $lastJob['status'],
+                    // Status is the client-level overall across all plans; the
+                    // individual plan results are in plan_breakdown below.
+                    'status' => $overallStatus ?? $lastJob['status'],
                     'completed_at' => $lastJob['completed_at'],
                     'plan_name' => $lastJob['plan_name'],
-                    'files' => (int) $lastJob['files_processed'],
-                    'original_size' => (int) $lastJob['original_size'],
-                    'deduplicated_size' => (int) $lastJob['deduplicated_size'],
+                    // Totals aggregate every plan's latest completed backup,
+                    // so clients with multiple repos show their full data (#175).
+                    'files' => $aggFiles,
+                    'original_size' => $aggOriginal,
+                    'deduplicated_size' => $aggDedup,
                     'duration' => (int) $lastJob['duration_seconds'],
                     'error' => $lastJob['status'] === 'failed' ? substr($lastJob['error_log'] ?? '', 0, 500) : null,
+                    'plan_breakdown' => $planBreakdown,
                 ] : null,
                 'today_completed' => $completed,
                 'today_failed' => $failed,
@@ -113,8 +189,57 @@ class ReportService
         }
 
         $storagePath = $settings['storage_path'] ?? '/var/bbs';
-        $diskUsage = ServerStats::getDiskUsage($storagePath);
 
+        // Aggregate disk usage across every configured local storage location.
+        // Falls back to the default storage_path if no locations are configured.
+        $locations = $this->db->fetchAll("SELECT id, label, path FROM storage_locations ORDER BY label");
+        $locationStats = [];
+        $seenPartitions = [];
+        $aggTotal = 0; $aggUsed = 0; $aggFree = 0;
+        foreach ($locations as $loc) {
+            $u = ServerStats::getDiskUsage($loc['path']);
+            if (!$u) continue;
+            // Dedupe by (total + free) as a cheap partition fingerprint so
+            // multiple logical locations on the same disk aren't double-counted.
+            $fp = $u['total'] . ':' . $u['free'];
+            $isDup = isset($seenPartitions[$fp]);
+            if (!$isDup) {
+                $aggTotal += (int) $u['total'];
+                $aggUsed  += (int) $u['used'];
+                $aggFree  += (int) $u['free'];
+                $seenPartitions[$fp] = true;
+            }
+            $locationStats[] = [
+                'label' => $loc['label'] ?: $loc['path'],
+                'path'  => $loc['path'],
+                'disk_total' => (int) $u['total'],
+                'disk_used'  => (int) $u['used'],
+                'disk_free'  => (int) $u['free'],
+                'disk_percent' => (float) ($u['percent'] ?? 0),
+            ];
+        }
+        // Fallback when no storage_locations rows are configured (fresh install)
+        if (empty($locationStats)) {
+            $u = ServerStats::getDiskUsage($storagePath);
+            if ($u) {
+                $aggTotal = (int) $u['total'];
+                $aggUsed  = (int) $u['used'];
+                $aggFree  = (int) $u['free'];
+                $locationStats[] = [
+                    'label' => $storagePath,
+                    'path'  => $storagePath,
+                    'disk_total' => (int) $u['total'],
+                    'disk_used'  => (int) $u['used'],
+                    'disk_free'  => (int) $u['free'],
+                    'disk_percent' => (float) ($u['percent'] ?? 0),
+                ];
+            }
+        }
+        $aggPercent = $aggTotal > 0 ? round(($aggUsed / $aggTotal) * 100, 1) : 0;
+
+        // Counts + on-disk bytes split across two queries to avoid the JOIN
+        // inflation that was reporting SUM(deduplicated_size) — which is the
+        // per-archive marginal contribution, not the actual disk footprint.
         $repoStats = $this->db->fetchOne("
             SELECT COUNT(*) as repo_count, COALESCE(SUM(size_bytes), 0) as total_size
             FROM repositories
@@ -122,8 +247,7 @@ class ReportService
 
         $archiveStats = $this->db->fetchOne("
             SELECT COUNT(*) as archive_count,
-                   COALESCE(SUM(original_size), 0) as total_original,
-                   COALESCE(SUM(deduplicated_size), 0) as total_dedup
+                   COALESCE(SUM(original_size), 0) as total_original
             FROM archives
         ");
 
@@ -150,15 +274,15 @@ class ReportService
             'errors' => $errors,
             'server' => [
                 'storage_path' => $storagePath,
-                'disk_total' => $diskUsage['total'] ?? 0,
-                'disk_used' => $diskUsage['used'] ?? 0,
-                'disk_free' => $diskUsage['free'] ?? 0,
-                'disk_percent' => $diskUsage['percent'] ?? 0,
+                'disk_total' => $aggTotal,
+                'disk_used' => $aggUsed,
+                'disk_free' => $aggFree,
+                'disk_percent' => $aggPercent,
+                'storage_locations' => $locationStats,
                 'repo_count' => (int) ($repoStats['repo_count'] ?? 0),
                 'repo_total_size' => (int) ($repoStats['total_size'] ?? 0),
                 'archive_count' => (int) ($archiveStats['archive_count'] ?? 0),
                 'archive_original' => (int) ($archiveStats['total_original'] ?? 0),
-                'archive_dedup' => (int) ($archiveStats['total_dedup'] ?? 0),
             ],
         ];
 
@@ -179,10 +303,18 @@ class ReportService
             $data['remote_storage'] = $remoteStorageData;
         }
 
-        // Upsert: update existing report for this date or create new one
+        // Upsert: update existing report for this date or create new one.
+        // Bump created_at only when the caller asked (manual regenerate) — the
+        // scheduler refreshes numbers every minute and bumping the timestamp
+        // there makes the "Recent Reports" list always show the current time
+        // (#176).
         $existing = $this->db->fetchOne("SELECT id FROM daily_reports WHERE report_date = ?", [$reportDate]);
         if ($existing) {
-            $this->db->update('daily_reports', ['data' => json_encode($data)], 'id = ?', [$existing['id']]);
+            $update = ['data' => json_encode($data)];
+            if ($bumpTimestamp) {
+                $update['created_at'] = date('Y-m-d H:i:s');
+            }
+            $this->db->update('daily_reports', $update, 'id = ?', [$existing['id']]);
             $id = (int) $existing['id'];
         } else {
             $id = $this->db->insert('daily_reports', [
@@ -312,18 +444,22 @@ class ReportService
             $lastBackup = '--';
             $result = '--';
             $files = '--';
-            $size = '--';
+            // Size is the on-disk repository footprint (matches the Clients page
+            // and `du`), shown whenever the client has stored data — even if the
+            // most recent backup failed (#292).
+            $size = $agent['repo_size'] > 0 ? self::formatBytes($agent['repo_size']) : '--';
 
             if ($agent['last_backup']) {
                 $lb = $agent['last_backup'];
                 $lastBackup = $lb['completed_at'] ? $fmtTime($lb['completed_at'], 'M j, g:i A') : '--';
                 if ($lb['status'] === 'completed') {
                     $result = "<span style='color:#28a745;font-weight:600;'>OK</span>";
+                } elseif ($lb['status'] === 'partial') {
+                    $result = "<span style='color:#e67e22;font-weight:600;'>PARTIAL</span>";
                 } else {
                     $result = "<span style='color:#dc3545;font-weight:600;'>FAILED</span>";
                 }
                 $files = number_format($lb['files']);
-                $size = self::formatBytes($lb['original_size']);
             }
 
             $todayNote = '';
@@ -376,30 +512,54 @@ class ReportService
             $diskUsed = self::formatBytes($srv['disk_used']);
             $diskTotal = self::formatBytes($srv['disk_total']);
             $diskColor = $diskPct >= 90 ? '#dc3545' : ($diskPct >= 75 ? '#ffc107' : '#28a745');
-            $repoCount = $srv['repo_count'];
-            $archiveCount = $srv['archive_count'];
-            $archiveOriginal = self::formatBytes($srv['archive_original']);
-            $archiveDedup = self::formatBytes($srv['archive_dedup']);
-            $dedupSavings = $srv['archive_original'] > 0
-                ? round((1 - $srv['archive_dedup'] / $srv['archive_original']) * 100, 1) : 0;
+            $repoCount = $srv['repo_count'] ?? 0;
+            $archiveCount = $srv['archive_count'] ?? 0;
+            $archiveOriginal = self::formatBytes($srv['archive_original'] ?? 0);
+            // repo_total_size was added in v2.28.1; fall back to legacy archive_dedup
+            // for reports stored before the fix.
+            $onDiskBytes = (int) ($srv['repo_total_size'] ?? $srv['archive_dedup'] ?? 0);
+            $repoTotal = self::formatBytes($onDiskBytes);
+            $dedupSavings = ($srv['archive_original'] ?? 0) > 0
+                ? round((1 - $onDiskBytes / $srv['archive_original']) * 100, 1) : 0;
+            // Rounding can produce 100 even when the repo still holds bytes (#191).
+            if ($dedupSavings >= 100 && $onDiskBytes > 0) {
+                $dedupSavings = 99.9;
+            }
 
             $html .= <<<HTML
                 <div style="padding:0 24px 16px;">
                     <h3 style="font-size:16px;margin:0 0 12px 0;color:#333;">Server</h3>
                     <table style="font-size:13px;border-collapse:collapse;">
-                        <tr><td style="padding:4px 16px 4px 0;color:#6c757d;">Storage</td>
+                        <tr><td style="padding:4px 16px 4px 0;color:#6c757d;vertical-align:top;">Storage</td>
                             <td style="padding:4px 0;"><span style="color:{$diskColor};font-weight:600;">{$diskPct}%</span> used ({$diskUsed} / {$diskTotal})</td></tr>
+            HTML;
+
+            // Per-location breakdown when multiple storage locations are configured
+            $locations = $srv['storage_locations'] ?? [];
+            if (count($locations) > 1) {
+                foreach ($locations as $loc) {
+                    $locLabel = htmlspecialchars($loc['label']);
+                    $locPct = $loc['disk_percent'];
+                    $locUsed = self::formatBytes($loc['disk_used']);
+                    $locTotal = self::formatBytes($loc['disk_total']);
+                    $locColor = $locPct >= 90 ? '#dc3545' : ($locPct >= 75 ? '#ffc107' : '#28a745');
+                    $html .= "<tr><td style='padding:2px 16px 2px 16px;color:#adb5bd;font-size:12px;'>&nbsp;&nbsp;&bull; {$locLabel}</td>"
+                            . "<td style='padding:2px 0;font-size:12px;color:#6c757d;'><span style='color:{$locColor};'>{$locPct}%</span> ({$locUsed} / {$locTotal})</td></tr>";
+                }
+            }
+
+            $html .= <<<HTML
                         <tr><td style="padding:4px 16px 4px 0;color:#6c757d;">Repositories</td>
-                            <td style="padding:4px 0;">{$repoCount}</td></tr>
+                            <td style="padding:4px 0;">{$repoCount} ({$repoTotal} on disk)</td></tr>
                         <tr><td style="padding:4px 16px 4px 0;color:#6c757d;">Archives</td>
-                            <td style="padding:4px 0;">{$archiveCount} ({$archiveOriginal} original, {$archiveDedup} deduplicated, {$dedupSavings}% savings)</td></tr>
+                            <td style="padding:4px 0;">{$archiveCount} ({$archiveOriginal} original, {$dedupSavings}% dedup savings)</td></tr>
                     </table>
                 </div>
             HTML;
         }
 
-        // Remote storage section
-        if (!empty($data['remote_storage'])) {
+        // Remote storage section — admin-only infrastructure detail
+        if ($isAdmin && !empty($data['remote_storage'])) {
             $html .= '<div style="padding:0 24px 16px;">';
             $html .= '<h3 style="font-size:16px;margin:0 0 12px 0;color:#333;">Remote Storage</h3>';
             $html .= '<table style="font-size:13px;border-collapse:collapse;">';
@@ -446,7 +606,7 @@ class ReportService
 
         $html = $this->renderHtml($report['data'], $userId);
         $dateFormatted = date('M j, Y', strtotime($report['report_date']));
-        $subject = "BBS Daily Report — {$dateFormatted}";
+        $subject = "[BBS] Daily Report — {$dateFormatted}";
 
         return $mailer->send($toEmail, $subject, $html);
     }
@@ -470,11 +630,12 @@ class ReportService
 
     private static function formatBytes(int $bytes): string
     {
-        if ($bytes <= 0) return '0 B';
-        if ($bytes >= 1099511627776) return round($bytes / 1099511627776, 1) . ' TB';
-        if ($bytes >= 1073741824) return round($bytes / 1073741824, 1) . ' GB';
-        if ($bytes >= 1048576) return round($bytes / 1048576, 1) . ' MB';
-        if ($bytes >= 1024) return round($bytes / 1024, 1) . ' KB';
-        return $bytes . ' B';
+        $nbsp = "\u{00A0}";
+        if ($bytes <= 0) return "0{$nbsp}B";
+        if ($bytes >= 1099511627776) return round($bytes / 1099511627776, 1) . "{$nbsp}TB";
+        if ($bytes >= 1073741824) return round($bytes / 1073741824, 1) . "{$nbsp}GB";
+        if ($bytes >= 1048576) return round($bytes / 1048576, 1) . "{$nbsp}MB";
+        if ($bytes >= 1024) return round($bytes / 1024, 1) . "{$nbsp}KB";
+        return $bytes . "{$nbsp}B";
     }
 }

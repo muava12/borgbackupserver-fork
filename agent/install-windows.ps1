@@ -27,6 +27,47 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# -----------------------------------------------------------------------------
+# OS version gate (#274)
+# -----------------------------------------------------------------------------
+# The agent requires Windows 10 1607 / Server 2016 (build 14393) or newer.
+# Older versions ship with PowerShell defaults, TLS stacks, and Python 3
+# runtime support that this installer and the agent itself do not target.
+# Common failures on older OS versions: TLS handshake errors against the
+# BBS server, missing .NET classes for service installation, Python 3
+# refusing to install or run. Bail out with a clear message rather than
+# letting the user discover incompatibility halfway through a partial
+# install. Affected versions that hit this check: Server 2012 / 2012 R2,
+# Windows 8 / 8.1, Windows 7, Server 2008 R2 — all are out of mainstream
+# Microsoft support and should be upgraded before running the agent.
+$osVersion = [Environment]::OSVersion.Version
+$osBuild   = $osVersion.Build
+$osMajor   = $osVersion.Major
+if ($osMajor -lt 10 -or $osBuild -lt 14393) {
+    $productName = "Unknown Windows version"
+    try {
+        $productName = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).ProductName
+    } catch { }
+
+    Write-Host ""
+    Write-Host "===========================================================================" -ForegroundColor Red
+    Write-Host "  Unsupported Windows version" -ForegroundColor Red
+    Write-Host "===========================================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Detected:  $productName (build $osBuild)" -ForegroundColor Yellow
+    Write-Host "  Required:  Windows 10 1607+, Windows 11, Windows Server 2016+, or newer" -ForegroundColor Yellow
+    Write-Host "             (NT kernel 10.0, build 14393 or higher)"
+    Write-Host ""
+    Write-Host "  The BBS agent depends on TLS 1.2 defaults, modern PowerShell"
+    Write-Host "  behaviour, and a Python 3 runtime that older Windows builds do not"
+    Write-Host "  support. Older Server editions (2012, 2012 R2) and client editions"
+    Write-Host "  (7, 8, 8.1) are also out of mainstream Microsoft support."
+    Write-Host ""
+    Write-Host "  Please upgrade the operating system before installing the agent."
+    Write-Host ""
+    exit 1
+}
+
 # Force TLS 1.2+ (PowerShell 5.1 defaults to TLS 1.0 which most servers reject)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
@@ -90,27 +131,36 @@ if ($existingSvc) {
 # -----------------------------------------------------------------------------
 # Install / Update Borg
 # -----------------------------------------------------------------------------
-$borgExe = "$BorgDir\borg\borg.exe"
+# The borg-windows zip layout has shifted between releases. v1.4.3 and earlier
+# shipped "borg/borg.exe" under a subdirectory; v1.4.4-win6 ships "borg.exe"
+# at the zip root next to its support files. Instead of hardcoding one layout,
+# locate borg.exe after extraction wherever it landed.
 $borgZip = "$env:TEMP\borg-windows.zip"
 
-# Remove old borg installation to avoid locked-file errors during extraction.
-# Preserve the ssh/ subdir — MinGit doesn't need to be re-downloaded every time.
-if (Test-Path "$BorgDir\borg") {
+# Remove everything under $BorgDir except ssh\ (MinGit is managed separately).
+# This clears any leftover files from a previous layout so mixed state from an
+# old "borg\" subdir and a new flat layout can't coexist (#180).
+if (Test-Path $BorgDir) {
     Write-Step "Removing old Borg installation..."
+    $oldItems = Get-ChildItem -Path $BorgDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'ssh' }
     for ($i = 1; $i -le 5; $i++) {
-        try {
-            Remove-Item -Path "$BorgDir\borg" -Recurse -Force -ErrorAction Stop
-            Write-Ok "Old borg binaries removed"
-            break
-        } catch {
-            if ($i -eq 5) {
-                Write-Fail "Cannot remove $BorgDir\borg - files may be locked by another process"
-                Write-Fail "Close any open terminals or Explorer windows in that folder and try again"
-                exit 1
+        $failed = $false
+        foreach ($item in $oldItems) {
+            try {
+                Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction Stop
+            } catch {
+                $failed = $true
+                break
             }
-            Write-Warn "Retrying removal ($i/5)..."
-            Start-Sleep -Seconds 2
         }
+        if (-not $failed) { Write-Ok "Old borg binaries removed"; break }
+        if ($i -eq 5) {
+            Write-Fail "Cannot clean $BorgDir - files may be locked by another process"
+            Write-Fail "Close any open terminals or Explorer windows in that folder and try again"
+            exit 1
+        }
+        Write-Warn "Retrying removal ($i/5)..."
+        Start-Sleep -Seconds 2
     }
 }
 
@@ -143,17 +193,23 @@ New-Item -ItemType Directory -Path $BorgDir -Force | Out-Null
 Expand-Archive -Path $borgZip -DestinationPath $BorgDir -Force
 Remove-Item $borgZip -Force -ErrorAction SilentlyContinue
 
-if (Test-Path $borgExe) {
-    $borgVer = & $borgExe --version 2>&1 | Select-Object -First 1
-    Write-Ok "Installed: $borgVer"
-} else {
-    Write-Fail "Borg installation failed - borg.exe not found at $borgExe"
+# Locate borg.exe wherever the archive put it (excluding ssh\ so we don't pick
+# up an ssh-bundled tool with the same name).
+$foundBorg = Get-ChildItem -Path $BorgDir -Filter "borg.exe" -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -notmatch '\\ssh\\' } |
+    Select-Object -First 1
+if (-not $foundBorg) {
+    Write-Fail "Borg installation failed - borg.exe not found anywhere under $BorgDir"
     exit 1
 }
+$borgExe    = $foundBorg.FullName
+$borgBinDir = $foundBorg.Directory.FullName
+$borgVer = & $borgExe --version 2>&1 | Select-Object -First 1
+Write-Ok "Installed: $borgVer"
+Write-Ok "Location:  $borgExe"
 
-# Add borg to system PATH
+# Add borg's directory to system PATH
 Write-Step "Adding Borg to system PATH..."
-$borgBinDir = "$BorgDir\borg"
 $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
 if ($machinePath -notlike "*$borgBinDir*") {
     [Environment]::SetEnvironmentVariable("Path", "$machinePath;$borgBinDir", "Machine")
@@ -169,6 +225,11 @@ if ($machinePath -notlike "*$borgBinDir*") {
 $sshDir = "$BorgDir\ssh"
 $sshExe = "$sshDir\usr\bin\ssh.exe"
 $sshPathFile = "$AgentDir\ssh-path"
+
+# Ensure the agent directory exists before writing the ssh-path marker file.
+# On fresh installs, ProgramData\bbs-agent doesn't exist yet — WriteAllText
+# fails with "Parts of the Path could not be found" (#195).
+New-Item -ItemType Directory -Path $AgentDir -Force | Out-Null
 
 # Check if Git for Windows is already installed
 $gitSshPaths = @(
@@ -217,20 +278,20 @@ if ($existingGitSsh) {
                 Write-Ok "Installed bundled SSH: $sshExe"
                 [System.IO.File]::WriteAllText($sshPathFile, $sshExe, (New-Object System.Text.UTF8Encoding $false))
             } else {
-                # MinGit layout might differ — search for ssh.exe
+                # MinGit layout might differ -search for ssh.exe
                 $foundSsh = Get-ChildItem -Path $sshDir -Recurse -Filter "ssh.exe" | Select-Object -First 1
                 if ($foundSsh) {
                     Write-Ok "Installed bundled SSH: $($foundSsh.FullName)"
                     [System.IO.File]::WriteAllText($sshPathFile, $foundSsh.FullName, (New-Object System.Text.UTF8Encoding $false))
                 } else {
-                    Write-Warn "MinGit extracted but ssh.exe not found — will use system SSH"
+                    Write-Warn "MinGit extracted but ssh.exe not found -will use system SSH"
                 }
             }
         } else {
-            Write-Warn "Could not find MinGit download URL — will use system SSH"
+            Write-Warn "Could not find MinGit download URL -will use system SSH"
         }
     } catch {
-        Write-Warn "Failed to install MinGit SSH: $_ — will use system SSH"
+        Write-Warn "Failed to install MinGit SSH: $_ -will use system SSH"
     }
 }
 

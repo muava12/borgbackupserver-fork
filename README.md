@@ -1,6 +1,7 @@
 # Borg Backup Server
 
-![Dashboard](https://www.borgbackupserver.com/borg-backup-server.png)
+<img width="100%" alt="Borg Backup Server Dashboard" src="https://github.com/user-attachments/assets/6e3cee15-6a2d-428b-be25-d150a38c787a" />
+
 
 A self-hosted web application for centrally managing [BorgBackup](https://borgbackup.readthedocs.io/) across multiple endpoints (Linux, Mac and Windows). A lightweight agent polls the server for tasks over HTTPS, backs up over SSH to the server, and reports progress back. No inbound connections to endpoints from the server — this works behind firewalls and NAT from where the server is providing easy provisioning. Includes a setup wizard for simple installation or a Docker image to start up in 30 seconds.
 
@@ -67,6 +68,8 @@ docker compose logs bbs
 
 Open `http://localhost:8080` and log in. See the **[Docker Installation guide](https://github.com/marcpope/borgbackupserver/wiki/Docker-Installation)** for full configuration, storage, reverse proxy, and update documentation.
 
+**Unraid:** a Community Applications template is included at [`unraid/borgbackupserver.xml`](unraid/borgbackupserver.xml) — add it via *Docker → Add Container → Template* (or your CA templates repo). It maps the web/SSH ports and the `/var/bbs` data path, and defaults `APP_URL`/`SSH_PORT` to the host.
+
 ---
 
 ## Documentation
@@ -90,7 +93,7 @@ All documentation lives on the **[GitHub Wiki](https://github.com/marcpope/borgb
 
 ## Architecture
 
-<img width="100%" alt="Borg Backup Server Architecture" src="https://github.com/user-attachments/assets/5c9c2b9a-d639-43ba-b4e3-1406d8aa284c" />
+<img width="100%" alt="Borg Backup Server Web GUI Architecture" src="https://github.com/user-attachments/assets/5163abe0-c2aa-44f0-b4c9-5feb6f2436fb" />
 
 
 - **HTTPS** for control plane (task polling, progress, status)

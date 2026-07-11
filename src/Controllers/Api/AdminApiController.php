@@ -2,7 +2,9 @@
 
 namespace BBS\Controllers\Api;
 
+use BBS\Core\Config;
 use BBS\Core\Controller;
+use BBS\Controllers\StorageLocationController;
 use BBS\Services\BorgCommandBuilder;
 use BBS\Services\Encryption;
 use BBS\Services\SshKeyManager;
@@ -34,6 +36,84 @@ class AdminApiController extends Controller
         $this->json(['clients' => $agents]);
     }
 
+    public function summary(): void
+    {
+        $this->requireApiToken();
+
+        // Latest terminal backup job per plan, computed once via ROW_NUMBER()
+        // ordered by completed_at (the previous correlated subquery did the
+        // equivalent per-row, which scaled as O(plans × jobs)).
+        $rows = $this->db->fetchAll("
+            SELECT
+                a.id AS client_id,
+                a.name AS client_name,
+                a.status AS client_status,
+                bp.id AS backup_plan_id,
+                bp.name AS backup_plan_name,
+                bp.enabled AS backup_plan_enabled,
+                bp.repository_id AS repository_id,
+                r.name AS repository_name,
+                bj.id AS last_backup_job_id,
+                bj.status AS last_backup_result,
+                bj.duration_seconds AS last_backup_duration_seconds,
+                bj.queued_at AS last_backup_queued_at,
+                bj.started_at AS last_backup_started_at,
+                bj.completed_at AS last_backup_completed_at
+            FROM agents a
+            LEFT JOIN backup_plans bp ON bp.agent_id = a.id
+            LEFT JOIN repositories r ON r.id = bp.repository_id
+            LEFT JOIN (
+                SELECT id, backup_plan_id, status, duration_seconds,
+                       queued_at, started_at, completed_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY backup_plan_id
+                           ORDER BY completed_at DESC, id DESC
+                       ) AS rn
+                FROM backup_jobs
+                WHERE task_type = 'backup'
+                  AND status IN ('completed', 'failed')
+            ) bj ON bj.backup_plan_id = bp.id AND bj.rn = 1
+            ORDER BY a.name, bp.name
+        ");
+
+        $clients = [];
+        foreach ($rows as $row) {
+            $clientId = (int) $row['client_id'];
+            if (!isset($clients[$clientId])) {
+                $clients[$clientId] = [
+                    'id' => $clientId,
+                    'name' => $row['client_name'],
+                    'status' => $row['client_status'],
+                    'backup_plans' => [],
+                ];
+            }
+
+            if ($row['backup_plan_id'] === null) {
+                continue;
+            }
+
+            $clients[$clientId]['backup_plans'][] = [
+                'id' => (int) $row['backup_plan_id'],
+                'name' => $row['backup_plan_name'],
+                'enabled' => (bool) $row['backup_plan_enabled'],
+                'repository_id' => $row['repository_id'] !== null ? (int) $row['repository_id'] : null,
+                'repository_name' => $row['repository_name'],
+                'last_backup' => $row['last_backup_job_id'] === null ? null : [
+                    'job_id' => (int) $row['last_backup_job_id'],
+                    'result' => $row['last_backup_result'],
+                    'duration_seconds' => $row['last_backup_duration_seconds'] !== null ? (int) $row['last_backup_duration_seconds'] : null,
+                    'queued_at' => $row['last_backup_queued_at'],
+                    'started_at' => $row['last_backup_started_at'],
+                    'completed_at' => $row['last_backup_completed_at'],
+                ],
+            ];
+        }
+
+        $this->json([
+            'clients' => array_values($clients),
+        ]);
+    }
+
     public function getClient(int $id): void
     {
         $this->requireApiToken();
@@ -41,7 +121,7 @@ class AdminApiController extends Controller
         $agent = $this->db->fetchOne("
             SELECT a.id, a.name, a.hostname, a.ip_address, a.os_info,
                    a.borg_version, a.agent_version, a.status, a.last_heartbeat,
-                   a.api_key, a.created_at, u.username as owner
+                   a.api_key, a.api_key_encrypted, a.created_at, u.username as owner
             FROM agents a
             LEFT JOIN users u ON u.id = a.user_id
             WHERE a.id = ?
@@ -50,6 +130,14 @@ class AdminApiController extends Controller
         if (!$agent) {
             $this->json(['error' => 'Client not found'], 404);
         }
+
+        // Decrypt stored token for API response (falls back to legacy plaintext).
+        if (empty($agent['api_key']) && !empty($agent['api_key_encrypted'])) {
+            try {
+                $agent['api_key'] = \BBS\Services\Encryption::decrypt($agent['api_key_encrypted']);
+            } catch (\Throwable $e) { /* leave blank */ }
+        }
+        unset($agent['api_key_encrypted']);
 
         // Include repos and plans
         $repos = $this->db->fetchAll(
@@ -84,7 +172,8 @@ class AdminApiController extends Controller
 
         $id = $this->db->insert('agents', [
             'name' => $name,
-            'api_key' => $apiKey,
+            'api_key_hash' => hash('sha256', $apiKey),
+            'api_key_encrypted' => \BBS\Services\Encryption::encrypt($apiKey),
             'status' => 'setup',
             'user_id' => null,
         ]);
@@ -188,9 +277,20 @@ class AdminApiController extends Controller
         }
 
         $repos = $this->db->fetchAll(
-            "SELECT id, name, path, encryption, storage_type, size_bytes, archive_count, created_at
-             FROM repositories WHERE agent_id = ? ORDER BY name", [$id]
+            "SELECT r.id, r.name, r.path, r.encryption, r.storage_type, r.size_bytes, r.archive_count, r.created_at,
+                    COALESCE(rsc.enabled, 0) AS s3_sync_enabled,
+                    rsc.last_sync_at AS s3_last_sync_at
+             FROM repositories r
+             LEFT JOIN (
+                 SELECT repository_id, MAX(enabled) AS enabled, MAX(last_sync_at) AS last_sync_at
+                 FROM repository_s3_configs GROUP BY repository_id
+             ) rsc ON rsc.repository_id = r.id
+             WHERE r.agent_id = ? ORDER BY r.name", [$id]
         );
+        foreach ($repos as &$r) {
+            $r['s3_sync_enabled'] = (bool) $r['s3_sync_enabled'];
+        }
+        unset($r);
 
         $this->json(['repositories' => $repos]);
     }
@@ -213,6 +313,23 @@ class AdminApiController extends Controller
 
         if (empty($name)) {
             $this->json(['error' => 'Repository name is required'], 400);
+        }
+
+        // Hosted mode: storage choices are locked to the platform-provided
+        // default location. Reject any attempt to use remote SSH or to pin
+        // a non-default storage_location_id. The customer UI doesn't expose
+        // these options, so this guard exists for API callers.
+        if (Config::isHosted()) {
+            if ($storageType !== 'local') {
+                $this->json(['error' => 'Storage type is locked to local in hosted mode.'], 422);
+            }
+            $requestedLocId = !empty($input['storage_location_id']) ? (int) $input['storage_location_id'] : null;
+            if ($requestedLocId !== null) {
+                $default = $this->db->fetchOne("SELECT id FROM storage_locations WHERE is_default = 1");
+                if (!$default || (int) $default['id'] !== $requestedLocId) {
+                    $this->json(['error' => 'Only the default storage location may be used in hosted mode.'], 422);
+                }
+            }
         }
 
         // Route to remote SSH handler if requested
@@ -654,6 +771,44 @@ class AdminApiController extends Controller
                    disk_free_bytes, disk_checked_at, created_at
             FROM remote_ssh_configs ORDER BY name
         ");
+
+        // Decorate local locations with live df capacity/usage (#157).
+        foreach ($locations as &$loc) {
+            $disk = \BBS\Services\ServerStats::getDiskUsage($loc['path']);
+            if ($disk) {
+                $loc['total_bytes'] = (int) $disk['total'];
+                $loc['used_bytes'] = (int) $disk['used'];
+                $loc['free_bytes'] = (int) $disk['free'];
+                $loc['total_size_gb'] = round($disk['total'] / 1073741824, 2);
+                $loc['current_usage_gb'] = round($disk['used'] / 1073741824, 2);
+                $loc['free_space_gb'] = round($disk['free'] / 1073741824, 2);
+                $loc['usage_percentage'] = $disk['total'] > 0
+                    ? round(($disk['used'] / $disk['total']) * 100, 1)
+                    : 0;
+            } else {
+                $loc['total_bytes'] = null;
+                $loc['used_bytes'] = null;
+                $loc['free_bytes'] = null;
+                $loc['total_size_gb'] = null;
+                $loc['current_usage_gb'] = null;
+                $loc['free_space_gb'] = null;
+                $loc['usage_percentage'] = null;
+            }
+        }
+        unset($loc);
+
+        // Decorate remote SSH configs with the same fields derived from the
+        // pre-polled disk_* columns (updated by the scheduler every 15 min).
+        foreach ($remoteConfigs as &$rc) {
+            $total = $rc['disk_total_bytes'] !== null ? (int) $rc['disk_total_bytes'] : null;
+            $used  = $rc['disk_used_bytes']  !== null ? (int) $rc['disk_used_bytes']  : null;
+            $free  = $rc['disk_free_bytes']  !== null ? (int) $rc['disk_free_bytes']  : null;
+            $rc['total_size_gb'] = $total !== null ? round($total / 1073741824, 2) : null;
+            $rc['current_usage_gb'] = $used !== null ? round($used / 1073741824, 2) : null;
+            $rc['free_space_gb'] = $free !== null ? round($free / 1073741824, 2) : null;
+            $rc['usage_percentage'] = ($total && $used !== null) ? round(($used / $total) * 100, 1) : null;
+        }
+        unset($rc);
 
         $this->json([
             'local' => $locations,
@@ -1219,5 +1374,706 @@ class AdminApiController extends Controller
         $slug = preg_replace('/-{2,}/', '-', $slug);
         $slug = trim($slug, '-');
         return $slug ?: 'repo';
+    }
+
+    // ── Storage management API (hosted-platform provisioning) ───────
+
+    /**
+     * POST /api/v1/storage
+     * Create a local storage location. In hosted mode, this is the
+     * mechanism by which the platform seeds the managed storage on
+     * first boot — `is_default` is forced to true so the resulting
+     * row is the one the customer's repos are pinned to.
+     */
+    public function createStorageLocation(): void
+    {
+        $this->requireApiToken();
+        $input = $this->getJsonInput();
+
+        $label = trim((string) ($input['label'] ?? ''));
+        $path  = trim((string) ($input['path'] ?? ''));
+        $isDefault = !empty($input['is_default']);
+
+        if ($label === '' || $path === '') {
+            $this->json(['error' => 'label and path are required'], 400);
+        }
+        if ($path[0] !== '/') {
+            $this->json(['error' => 'path must be absolute'], 400);
+        }
+        if (!is_dir($path)) {
+            $this->json(['error' => "Path does not exist or is not a directory: {$path}"], 400);
+        }
+        if ($this->db->fetchOne("SELECT id FROM storage_locations WHERE path = ?", [$path])) {
+            $this->json(['error' => 'A storage location already exists at that path.'], 409);
+        }
+
+        // Hosted mode: the API is how the platform seeds storage, and the
+        // customer-facing repo create form is locked to the default. Force
+        // is_default true so the platform never has to track a separate flag.
+        if (Config::isHosted()) {
+            $isDefault = true;
+        }
+
+        if ($isDefault) {
+            $this->db->query("UPDATE storage_locations SET is_default = 0 WHERE is_default = 1");
+        }
+
+        $newId = $this->db->insert('storage_locations', [
+            'label' => $label,
+            'path' => $path,
+            'is_default' => $isDefault ? 1 : 0,
+        ]);
+
+        // Refresh /etc/bbs/allowed-storage-paths so bbs-ssh-helper accepts
+        // repo operations under the new path.
+        (new StorageLocationController())->updateAllowedPaths();
+
+        $row = $this->db->fetchOne("SELECT id, label, path, is_default FROM storage_locations WHERE id = ?", [$newId]);
+        $row['is_default'] = (bool) $row['is_default'];
+        $this->json($row, 201);
+    }
+
+    /**
+     * GET /api/v1/storage/capacity
+     * Provisioned / used / free bytes for the default storage location.
+     * Useful for any admin dashboard, and the data source for the hosted
+     * mode "Storage" customer-visible card.
+     */
+    public function getStorageCapacity(): void
+    {
+        $this->requireApiToken();
+
+        $loc = $this->db->fetchOne("SELECT path FROM storage_locations WHERE is_default = 1");
+        if (!$loc) {
+            $this->json(['error' => 'No default storage location configured'], 404);
+        }
+        $disk = \BBS\Services\ServerStats::getDiskUsage($loc['path']);
+        if (!$disk) {
+            $this->json(['error' => 'Could not read disk usage for default storage'], 500);
+        }
+        $this->json([
+            'provisioned_bytes' => (int) $disk['total'],
+            'used_bytes' => (int) $disk['used'],
+            'free_bytes' => (int) $disk['free'],
+        ]);
+    }
+
+    // ── S3 credentials API (platform-only) ──────────────────────────
+
+    /**
+     * GET /api/v1/s3-credentials
+     * Return the current global S3 sync settings. Any admin token works
+     * in a normal deployment — the same data is visible in the Settings
+     * UI. In hosted mode, credentials are platform-owned, so this is
+     * gated to the platform token to prevent a customer-minted admin
+     * token from reading the secret key. Returns null fields when unset.
+     */
+    public function getS3Credentials(): void
+    {
+        // Hosted mode: platform-token only for the whole endpoint (even
+        // the non-secret bucket/region fields could reveal where customer
+        // data lives). Non-hosted: any admin token can see the
+        // non-secret fields; the access_key + secret_key only come back
+        // when ?include_secrets=1 is set, and only for tokens with the
+        // Display Secrets capability.
+        $ctx = \BBS\Core\Config::isHosted()
+            ? $this->requirePlatformApiToken()
+            : $this->requireApiToken();
+
+        $includeSecrets = !empty($_GET['include_secrets']) && $_GET['include_secrets'] !== '0';
+        if ($includeSecrets && !$this->tokenCanReadSecrets($ctx)) {
+            $this->json(['error' => 'This token is not permitted to read secrets. Create a token with the "Display Secrets" capability and try again.'], 403);
+        }
+
+        $publicKeys = [
+            's3_endpoint'    => 'endpoint',
+            's3_region'      => 'region',
+            's3_bucket'      => 'bucket',
+            's3_path_prefix' => 'path_prefix',
+        ];
+        $secretKeys = [
+            's3_access_key'  => 'access_key',
+            's3_secret_key'  => 'secret_key',
+        ];
+
+        $out = [];
+        foreach ($publicKeys as $settingKey => $responseKey) {
+            $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = ?", [$settingKey]);
+            $out[$responseKey] = $row['value'] ?? null;
+        }
+        if ($includeSecrets) {
+            foreach ($secretKeys as $settingKey => $responseKey) {
+                $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = ?", [$settingKey]);
+                $out[$responseKey] = $row['value'] ?? null;
+            }
+        }
+
+        // 'configured' has to look at the secret-side fields too, but it
+        // doesn't reveal their value — just yes/no.
+        $accessKeyRow = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 's3_access_key'");
+        $out['configured'] = !empty($out['endpoint'])
+            && !empty($out['bucket'])
+            && !empty($accessKeyRow['value'] ?? '');
+
+        if ($includeSecrets) {
+            $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+            $tokenName = $ctx['token_name'] ?? 'unknown';
+            $this->db->insert('server_log', [
+                'level'   => 'warning',
+                'message' => "S3 credentials exported via API (token=\"{$tokenName}\", ip={$ip})",
+            ]);
+        }
+
+        $this->json($out);
+    }
+
+    /**
+     * POST /api/v1/s3-credentials
+     * Set the global S3 sync credentials. In a normal deployment any admin
+     * token works — matches the Settings UI surface where any admin can
+     * configure S3. Hosted mode keeps the tighter platform-token gate
+     * because the customer admin shouldn't be able to redirect syncs to
+     * a non-platform bucket.
+     */
+    public function setS3Credentials(): void
+    {
+        if (\BBS\Core\Config::isHosted()) {
+            $this->requirePlatformApiToken();
+        } else {
+            $this->requireApiToken();
+        }
+        $input = $this->getJsonInput();
+
+        $fields = ['s3_endpoint', 's3_region', 's3_bucket', 's3_access_key', 's3_secret_key', 's3_path_prefix'];
+        $map = [
+            's3_endpoint'    => $input['endpoint']    ?? null,
+            's3_region'      => $input['region']      ?? null,
+            's3_bucket'      => $input['bucket']      ?? null,
+            's3_access_key'  => $input['access_key']  ?? null,
+            's3_secret_key'  => $input['secret_key']  ?? null,
+            's3_path_prefix' => $input['path_prefix'] ?? '',
+        ];
+
+        foreach (['s3_endpoint', 's3_region', 's3_bucket', 's3_access_key', 's3_secret_key'] as $required) {
+            if ($map[$required] === null || $map[$required] === '') {
+                $this->json(['error' => "Missing required field: " . str_replace('s3_', '', $required)], 400);
+            }
+        }
+
+        foreach ($map as $key => $value) {
+            $existing = $this->db->fetchOne("SELECT `key` FROM settings WHERE `key` = ?", [$key]);
+            if ($existing) {
+                $this->db->update('settings', ['value' => (string) $value], '`key` = ?', [$key]);
+            } else {
+                $this->db->insert('settings', ['key' => $key, 'value' => (string) $value]);
+            }
+        }
+
+        $this->json(['status' => 'ok', 'fields' => array_keys($map)]);
+    }
+
+    /**
+     * DELETE /api/v1/s3-credentials
+     * Clear the global S3 credentials AND disable per-repo S3 sync on
+     * every repository. The platform calls this when a tenant downgrades
+     * off the S3 add-on tier — the customer's repos stop syncing and the
+     * platform separately deletes the bucket on its side.
+     */
+    public function clearS3Credentials(): void
+    {
+        if (\BBS\Core\Config::isHosted()) {
+            $this->requirePlatformApiToken();
+        } else {
+            $this->requireApiToken();
+        }
+
+        $keys = ['s3_endpoint', 's3_region', 's3_bucket', 's3_access_key', 's3_secret_key', 's3_path_prefix'];
+        foreach ($keys as $key) {
+            $this->db->delete('settings', '`key` = ?', [$key]);
+        }
+        $disabled = $this->db->query(
+            "UPDATE repository_s3_configs SET enabled = 0 WHERE enabled = 1"
+        );
+
+        $this->json(['status' => 'ok', 'disabled_repositories' => $disabled ?? 0]);
+    }
+
+    // ── Platform token rotation ─────────────────────────────────────
+
+    /**
+     * POST /api/v1/platform/rotate-token
+     * Mint a new platform token, invalidate the old one. Returns the new
+     * plaintext token — caller must save it. The old token (the one used
+     * to authenticate this request) is removed *after* the new row is
+     * inserted, so a partial failure can't leave the install without a
+     * platform token.
+     */
+    public function rotatePlatformToken(): void
+    {
+        $ctx = $this->requirePlatformApiToken();
+
+        $oldRow = $this->db->fetchOne("SELECT id, user_id, name FROM api_tokens WHERE id = ?", [$ctx['token_id']]);
+        if (!$oldRow) {
+            $this->json(['error' => 'Current token row not found'], 500);
+        }
+
+        $plain = 'bbs_tok_' . bin2hex(random_bytes(24));
+        $hash  = hash('sha256', $plain);
+
+        $this->db->insert('api_tokens', [
+            'name'       => $oldRow['name'],
+            'kind'       => 'platform',
+            'token_hash' => $hash,
+            'user_id'    => $oldRow['user_id'],
+        ]);
+
+        $this->db->delete('api_tokens', 'id = ?', [$oldRow['id']]);
+
+        $this->json(['token' => $plain]);
+    }
+
+    // ── Maintenance mode ────────────────────────────────────────────
+
+    /**
+     * GET /api/v1/maintenance
+     * Read the current maintenance-mode flag.
+     */
+    public function getMaintenance(): void
+    {
+        $this->requireApiToken();
+        $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'maintenance_mode'");
+        $this->json(['enabled' => ($row['value'] ?? '0') === '1']);
+    }
+
+    /**
+     * POST /api/v1/maintenance
+     * Toggle maintenance mode. Body: {"enabled": true|false}.
+     * When enabled, the scheduler stops creating new jobs and the queue
+     * skips agent dispatch (server-side promotions still run).
+     */
+    public function setMaintenance(): void
+    {
+        $this->requireApiToken();
+        $input = $this->getJsonInput();
+
+        if (!array_key_exists('enabled', $input)) {
+            $this->json(['error' => 'enabled is required (boolean)'], 400);
+        }
+        $value = ((bool) $input['enabled']) ? '1' : '0';
+
+        $existing = $this->db->fetchOne("SELECT `key` FROM settings WHERE `key` = 'maintenance_mode'");
+        if ($existing) {
+            $this->db->update('settings', ['value' => $value], '`key` = ?', ['maintenance_mode']);
+        } else {
+            $this->db->insert('settings', ['key' => 'maintenance_mode', 'value' => $value]);
+        }
+
+        $this->json(['enabled' => $value === '1']);
+    }
+
+    // ── Per-repo S3 sync toggle ─────────────────────────────────────
+
+    /**
+     * PUT /api/v1/repositories/{repoId}/s3-sync
+     * Toggle per-repository S3 sync. Body: {"enabled": true|false}.
+     * Customer UI on the repo detail page hits the same code path via
+     * a session-authed route.
+     */
+    public function setRepositoryS3Sync(int $repoId): void
+    {
+        $this->requireApiToken();
+        $input = $this->getJsonInput();
+
+        if (!array_key_exists('enabled', $input)) {
+            $this->json(['error' => 'enabled is required (boolean)'], 400);
+        }
+        $enabled = (bool) $input['enabled'];
+
+        $repo = $this->db->fetchOne("SELECT id, name FROM repositories WHERE id = ?", [$repoId]);
+        if (!$repo) {
+            $this->json(['error' => 'Repository not found'], 404);
+        }
+
+        // Toggles every destination this repo replicates to. A destination
+        // link must already exist — creating one needs a plugin_config_id,
+        // which this endpoint doesn't take (the old insert-without-config
+        // branch violated the NOT NULL foreign key anyway).
+        $existing = $this->db->fetchOne("SELECT id FROM repository_s3_configs WHERE repository_id = ? LIMIT 1", [$repoId]);
+        if (!$existing) {
+            $this->json(['error' => 'Repository has no S3 destination configured'], 400);
+        }
+        $this->db->update('repository_s3_configs', ['enabled' => $enabled ? 1 : 0], 'repository_id = ?', [$repoId]);
+
+        $this->json([
+            'id' => $repo['id'],
+            'name' => $repo['name'],
+            's3_sync_enabled' => $enabled,
+        ]);
+    }
+
+    /**
+     * GET /api/v1/repositories
+     * List every repository across every client. Pass ?include_secrets=1
+     * to also return the decrypted passphrase per repo — meant for
+     * operator escrow ("save my repo passwords somewhere safe in case the
+     * BBS server itself burns down"). The flag is opt-in so casual reads
+     * don't ever leak secrets, and every secret-bearing call is written
+     * to server_log for audit.
+     */
+    public function listAllRepositories(): void
+    {
+        $ctx = $this->requireApiToken();
+        $includeSecrets = !empty($_GET['include_secrets']) && $_GET['include_secrets'] !== '0';
+        if ($includeSecrets && !$this->tokenCanReadSecrets($ctx)) {
+            $this->json(['error' => 'This token is not permitted to read secrets. Create a token with the "Display Secrets" capability and try again.'], 403);
+        }
+
+        $rows = $this->db->fetchAll(
+            "SELECT r.id, r.agent_id, a.name AS agent_name,
+                    r.name, r.path, r.encryption, r.storage_type,
+                    r.size_bytes, r.archive_count, r.created_at,
+                    r.passphrase_encrypted,
+                    COALESCE(rsc.enabled, 0) AS s3_sync_enabled,
+                    rsc.last_sync_at AS s3_last_sync_at
+             FROM repositories r
+             LEFT JOIN agents a ON a.id = r.agent_id
+             LEFT JOIN (
+                 SELECT repository_id, MAX(enabled) AS enabled, MAX(last_sync_at) AS last_sync_at
+                 FROM repository_s3_configs GROUP BY repository_id
+             ) rsc ON rsc.repository_id = r.id
+             ORDER BY a.name, r.name"
+        );
+
+        $out = [];
+        foreach ($rows as $r) {
+            $repo = [
+                'id'              => (int) $r['id'],
+                'agent_id'        => (int) $r['agent_id'],
+                'agent_name'      => $r['agent_name'],
+                'name'            => $r['name'],
+                'path'            => $r['path'],
+                'encryption'      => $r['encryption'],
+                'storage_type'    => $r['storage_type'],
+                'size_bytes'      => (int) $r['size_bytes'],
+                'archive_count'   => (int) $r['archive_count'],
+                'created_at'      => $r['created_at'],
+                's3_sync_enabled' => (bool) $r['s3_sync_enabled'],
+                's3_last_sync_at' => $r['s3_last_sync_at'],
+            ];
+            if ($includeSecrets) {
+                $repo['passphrase'] = null;
+                if (!empty($r['passphrase_encrypted'])) {
+                    try {
+                        $repo['passphrase'] = Encryption::decrypt($r['passphrase_encrypted']);
+                    } catch (\Exception $e) {
+                        $repo['passphrase'] = null;
+                    }
+                }
+            }
+            $out[] = $repo;
+        }
+
+        if ($includeSecrets) {
+            // Audit trail: secrets-bearing read is sensitive enough to log
+            // by token name and source IP so an admin can see who pulled
+            // the master passphrase list and when.
+            $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+            $tokenName = $ctx['token_name'] ?? 'unknown';
+            $this->db->insert('server_log', [
+                'level'   => 'warning',
+                'message' => "Repository passphrases exported via API (token=\"{$tokenName}\", ip={$ip}, count=" . count($out) . ")",
+            ]);
+        }
+
+        $this->json([
+            'repositories'    => $out,
+            'include_secrets' => $includeSecrets,
+        ]);
+    }
+
+    // ── Users ───────────────────────────────────────────────────────
+
+    /**
+     * Shape a users-table row for API responses. Strips password_hash
+     * and totp_secret unconditionally — those are never returned.
+     */
+    private function shapeUser(array $row): array
+    {
+        return [
+            'id'            => (int) $row['id'],
+            'username'      => $row['username'],
+            'email'         => $row['email'],
+            'role'          => $row['role'],
+            'all_clients'   => (bool) $row['all_clients'],
+            'auth_provider' => $row['auth_provider'] ?? 'local',
+            'oidc_status'   => $row['oidc_status'] ?? 'active',
+            'totp_enabled'  => (bool) ($row['totp_enabled'] ?? false),
+            'timezone'      => $row['timezone'],
+            'time_format'   => $row['time_format'],
+        ];
+    }
+
+    /**
+     * GET /api/v1/users
+     */
+    public function listUsers(): void
+    {
+        $this->requireApiToken();
+        $rows = $this->db->fetchAll("SELECT * FROM users ORDER BY username");
+        $out = array_map(fn($r) => $this->shapeUser($r), $rows);
+        $this->json(['users' => $out]);
+    }
+
+    /**
+     * GET /api/v1/users/{id}
+     */
+    public function getUser(int $id): void
+    {
+        $this->requireApiToken();
+        $row = $this->db->fetchOne("SELECT * FROM users WHERE id = ?", [$id]);
+        if (!$row) {
+            $this->json(['error' => 'User not found'], 404);
+        }
+        $this->json($this->shapeUser($row));
+    }
+
+    /**
+     * POST /api/v1/users
+     * Body: {"username": "...", "email": "...", "password": "...", "role": "user|admin"}
+     */
+    public function createUser(): void
+    {
+        $this->requireApiToken();
+        $input = $this->getJsonInput();
+
+        $username = trim((string) ($input['username'] ?? ''));
+        $email    = trim((string) ($input['email'] ?? ''));
+        $password = (string) ($input['password'] ?? '');
+        $role     = $input['role'] ?? 'user';
+
+        if ($username === '' || $email === '' || $password === '') {
+            $this->json(['error' => 'username, email, and password are required'], 400);
+        }
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $this->json(['error' => 'email is not valid'], 400);
+        }
+        if (strlen($password) < 8) {
+            $this->json(['error' => 'password must be at least 8 characters'], 400);
+        }
+        $role = in_array($role, ['admin', 'user'], true) ? $role : 'user';
+
+        if ($this->db->fetchOne("SELECT id FROM users WHERE username = ? OR email = ?", [$username, $email])) {
+            $this->json(['error' => 'A user with that username or email already exists'], 409);
+        }
+
+        $newId = $this->db->insert('users', [
+            'username'      => $username,
+            'email'         => $email,
+            'password_hash' => password_hash($password, PASSWORD_BCRYPT),
+            'role'          => $role,
+        ]);
+        $row = $this->db->fetchOne("SELECT * FROM users WHERE id = ?", [$newId]);
+        $this->json($this->shapeUser($row), 201);
+    }
+
+    /**
+     * PUT /api/v1/users/{id}
+     * Body: any of email / password / role / all_clients / timezone / time_format.
+     * username changes are NOT supported via this endpoint (creates session
+     * inconsistency for the in-flight user; do it via the UI if you really
+     * need to). Pass reset_totp:true to clear the user's 2FA secret.
+     */
+    public function updateUser(int $id): void
+    {
+        $this->requireApiToken();
+        $input = $this->getJsonInput();
+
+        $existing = $this->db->fetchOne("SELECT * FROM users WHERE id = ?", [$id]);
+        if (!$existing) {
+            $this->json(['error' => 'User not found'], 404);
+        }
+
+        $updates = [];
+        if (isset($input['email'])) {
+            $email = trim((string) $input['email']);
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $this->json(['error' => 'email is not valid'], 400);
+            }
+            $dup = $this->db->fetchOne("SELECT id FROM users WHERE email = ? AND id != ?", [$email, $id]);
+            if ($dup) $this->json(['error' => 'That email is already in use'], 409);
+            $updates['email'] = $email;
+        }
+        if (isset($input['password'])) {
+            $password = (string) $input['password'];
+            if (strlen($password) < 8) {
+                $this->json(['error' => 'password must be at least 8 characters'], 400);
+            }
+            $updates['password_hash'] = password_hash($password, PASSWORD_BCRYPT);
+        }
+        if (isset($input['role'])) {
+            $role = $input['role'];
+            if (!in_array($role, ['admin', 'user'], true)) {
+                $this->json(['error' => 'role must be admin or user'], 400);
+            }
+            // Don't allow demoting the last remaining admin.
+            if ($existing['role'] === 'admin' && $role !== 'admin') {
+                $adminCount = (int) ($this->db->fetchOne("SELECT COUNT(*) AS c FROM users WHERE role = 'admin'")['c'] ?? 0);
+                if ($adminCount <= 1) {
+                    $this->json(['error' => 'Cannot demote the last admin user'], 409);
+                }
+            }
+            $updates['role'] = $role;
+        }
+        if (isset($input['all_clients'])) {
+            $updates['all_clients'] = $input['all_clients'] ? 1 : 0;
+        }
+        if (isset($input['timezone'])) {
+            $updates['timezone'] = (string) $input['timezone'];
+        }
+        if (isset($input['time_format'])) {
+            $tf = $input['time_format'];
+            if (!in_array($tf, ['12h', '24h'], true)) {
+                $this->json(['error' => 'time_format must be 12h or 24h'], 400);
+            }
+            $updates['time_format'] = $tf;
+        }
+        if (!empty($input['reset_totp'])) {
+            $updates['totp_secret'] = null;
+            $updates['totp_enabled'] = 0;
+            $updates['totp_enabled_at'] = null;
+        }
+
+        if (empty($updates)) {
+            $this->json(['error' => 'No updatable fields provided'], 400);
+        }
+
+        $this->db->update('users', $updates, 'id = ?', [$id]);
+        $row = $this->db->fetchOne("SELECT * FROM users WHERE id = ?", [$id]);
+        $this->json($this->shapeUser($row));
+    }
+
+    /**
+     * DELETE /api/v1/users/{id}
+     */
+    public function deleteUser(int $id): void
+    {
+        $ctx = $this->requireApiToken();
+
+        $row = $this->db->fetchOne("SELECT * FROM users WHERE id = ?", [$id]);
+        if (!$row) {
+            $this->json(['error' => 'User not found'], 404);
+        }
+        if ((int) $ctx['id'] === (int) $id) {
+            $this->json(['error' => 'Cannot delete the user the API token belongs to'], 409);
+        }
+        if ($row['role'] === 'admin') {
+            $adminCount = (int) ($this->db->fetchOne("SELECT COUNT(*) AS c FROM users WHERE role = 'admin'")['c'] ?? 0);
+            if ($adminCount <= 1) {
+                $this->json(['error' => 'Cannot delete the last admin user'], 409);
+            }
+        }
+        $this->db->delete('users', 'id = ?', [$id]);
+        $this->json(['status' => 'ok']);
+    }
+
+    // ── Server log ──────────────────────────────────────────────────
+
+    /**
+     * GET /api/v1/log
+     * Filters: ?level=info|warning|error&agent_id=N&since=YYYY-MM-DD%20HH:MM:SS&limit=N&offset=N
+     */
+    public function listLog(): void
+    {
+        $this->requireApiToken();
+
+        $level   = $_GET['level'] ?? null;
+        $agentId = isset($_GET['agent_id']) ? (int) $_GET['agent_id'] : null;
+        $since   = $_GET['since'] ?? null;
+        $limit   = isset($_GET['limit']) ? max(1, min(500, (int) $_GET['limit'])) : 100;
+        $offset  = isset($_GET['offset']) ? max(0, (int) $_GET['offset']) : 0;
+
+        $where  = [];
+        $params = [];
+        if ($level !== null && in_array($level, ['info', 'warning', 'error'], true)) {
+            $where[] = "l.level = ?";
+            $params[] = $level;
+        }
+        if ($agentId !== null && $agentId > 0) {
+            $where[] = "l.agent_id = ?";
+            $params[] = $agentId;
+        }
+        if ($since !== null && $since !== '') {
+            $where[] = "l.created_at >= ?";
+            $params[] = $since;
+        }
+        $whereSql = !empty($where) ? ('WHERE ' . implode(' AND ', $where)) : '';
+
+        $total = (int) ($this->db->fetchOne(
+            "SELECT COUNT(*) AS c FROM server_log l {$whereSql}",
+            $params
+        )['c'] ?? 0);
+
+        $rows = $this->db->fetchAll(
+            "SELECT l.id, l.agent_id, a.name AS agent_name, l.backup_job_id, l.level, l.message, l.created_at
+             FROM server_log l
+             LEFT JOIN agents a ON a.id = l.agent_id
+             {$whereSql}
+             ORDER BY l.created_at DESC, l.id DESC
+             LIMIT {$limit} OFFSET {$offset}",
+            $params
+        );
+
+        $this->json([
+            'log'    => $rows,
+            'total'  => $total,
+            'limit'  => $limit,
+            'offset' => $offset,
+        ]);
+    }
+
+    // ── Schedules (cross-client overview) ───────────────────────────
+
+    /**
+     * GET /api/v1/schedules
+     * Flat view of every backup plan and its schedule across all clients.
+     * Aggregates what /clients/{id}/plans returns per-client into one
+     * response so monitoring / oncall tools don't have to fan-out.
+     */
+    public function listSchedules(): void
+    {
+        $this->requireApiToken();
+
+        $rows = $this->db->fetchAll(
+            "SELECT bp.id AS plan_id, bp.name AS plan_name, bp.enabled AS plan_enabled,
+                    bp.agent_id, a.name AS agent_name, a.status AS agent_status,
+                    bp.repository_id, r.name AS repository_name,
+                    s.frequency, s.times, s.day_of_week, s.day_of_month,
+                    s.timezone, s.enabled AS schedule_enabled,
+                    s.next_run, s.last_run,
+                    (SELECT bj.status FROM backup_jobs bj
+                       WHERE bj.backup_plan_id = bp.id
+                       ORDER BY bj.id DESC LIMIT 1) AS last_status,
+                    (SELECT bj.completed_at FROM backup_jobs bj
+                       WHERE bj.backup_plan_id = bp.id AND bj.status = 'completed'
+                       ORDER BY bj.id DESC LIMIT 1) AS last_completed_at
+             FROM backup_plans bp
+             JOIN agents a ON a.id = bp.agent_id
+             JOIN repositories r ON r.id = bp.repository_id
+             LEFT JOIN schedules s ON s.backup_plan_id = bp.id
+             ORDER BY a.name, bp.name"
+        );
+
+        foreach ($rows as &$r) {
+            $r['plan_id']         = (int) $r['plan_id'];
+            $r['agent_id']        = (int) $r['agent_id'];
+            $r['repository_id']   = (int) $r['repository_id'];
+            $r['plan_enabled']    = (bool) $r['plan_enabled'];
+            $r['schedule_enabled']= isset($r['schedule_enabled']) ? (bool) $r['schedule_enabled'] : null;
+            $r['day_of_week']     = isset($r['day_of_week']) && $r['day_of_week'] !== null
+                                    ? (int) $r['day_of_week'] : null;
+        }
+        unset($r);
+
+        $this->json(['schedules' => $rows]);
     }
 }

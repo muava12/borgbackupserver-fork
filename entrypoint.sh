@@ -4,6 +4,331 @@ set -e
 echo "=== BBS Container Starting ==="
 echo "Version: $(cat /var/www/bbs/VERSION 2>/dev/null || echo 'unknown')"
 
+# --- Helper: ensure directory exists with correct owner and permissions ---
+ensure_dir() {
+    local dir="$1" owner="$2" mode="${3:-755}"
+    mkdir -p "$dir"
+    chown "$owner" "$dir"
+    chmod "$mode" "$dir"
+}
+
+# ============================================================
+#  UID/GID migration — declarative, idempotent, logged.
+# ============================================================
+# Persistent volumes carry file ownership across container rebuilds.
+# If the user changes PUID/PGID/MYSQL_PUID/CH_PUID between runs, the
+# pre-existing files on the volume still reference the old UIDs, so
+# we remap the in-container users AND chown the data.
+#
+# Desired state comes from env vars. The last applied state is stored
+# in /var/bbs/config/.ownership (written atomically after success).
+# If env != state, we migrate; otherwise this section is a no-op.
+#
+# Every step is logged with a timestamp so users can see exactly what
+# happened and why a container start took longer than usual.
+#
+# Supported env vars:
+#   PUID / PGID              — app (www-data). Defaults: 33 / 33
+#   MYSQL_PUID / MYSQL_PGID  — MariaDB.        Defaults: 100 / 100
+#   CH_PUID / CH_PGID        — ClickHouse.     Defaults: 999 / 999
+
+log_mig() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+mkdir -p /var/bbs/config
+OWNERSHIP_FILE=/var/bbs/config/.ownership
+
+# Defaults come from the actual /etc/passwd inside this image, not hardcoded
+# values. apt-get assigns system UIDs dynamically, so clickhouse can be 995 on
+# one build and 999 on another — hardcoding would cause false "migrations" that
+# look for files owned by a UID that never existed on this volume.
+DEFAULT_APP_UID=$(id -u www-data 2>/dev/null || echo 33)
+DEFAULT_APP_GID=$(id -g www-data 2>/dev/null || echo 33)
+DEFAULT_MYSQL_UID=$(id -u mysql 2>/dev/null || echo 100)
+DEFAULT_MYSQL_GID=$(id -g mysql 2>/dev/null || echo 100)
+DEFAULT_CH_UID=$(id -u clickhouse 2>/dev/null || echo 999)
+DEFAULT_CH_GID=$(id -g clickhouse 2>/dev/null || echo 999)
+
+# --- Load previously-applied state (if any) ---
+APP_UID=""; APP_GID=""
+MYSQL_UID=""; MYSQL_GID=""
+CH_UID=""; CH_GID=""
+if [ -f "$OWNERSHIP_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$OWNERSHIP_FILE"
+fi
+PREV_APP_UID="${APP_UID:-$DEFAULT_APP_UID}"
+PREV_APP_GID="${APP_GID:-$DEFAULT_APP_GID}"
+PREV_MYSQL_UID="${MYSQL_UID:-$DEFAULT_MYSQL_UID}"
+PREV_MYSQL_GID="${MYSQL_GID:-$DEFAULT_MYSQL_GID}"
+PREV_CH_UID="${CH_UID:-$DEFAULT_CH_UID}"
+PREV_CH_GID="${CH_GID:-$DEFAULT_CH_GID}"
+
+# --- Desired state from env (falls back to previous, which falls back to defaults) ---
+DESIRED_APP_UID="${PUID:-$PREV_APP_UID}"
+DESIRED_APP_GID="${PGID:-$PREV_APP_GID}"
+DESIRED_MYSQL_UID="${MYSQL_PUID:-$PREV_MYSQL_UID}"
+DESIRED_MYSQL_GID="${MYSQL_PGID:-$PREV_MYSQL_GID}"
+DESIRED_CH_UID="${CH_PUID:-$PREV_CH_UID}"
+DESIRED_CH_GID="${CH_PGID:-$PREV_CH_GID}"
+
+# --- Preflight guards ---
+abort_config() {
+    echo ""
+    echo "!!! FATAL: invalid UID/GID configuration !!!"
+    echo "  $1"
+    echo "  Fix the offending env var (e.g. in docker-compose.yml / .env) and restart."
+    exit 1
+}
+
+for pair in "PUID:$DESIRED_APP_UID" "PGID:$DESIRED_APP_GID" \
+            "MYSQL_PUID:$DESIRED_MYSQL_UID" "MYSQL_PGID:$DESIRED_MYSQL_GID" \
+            "CH_PUID:$DESIRED_CH_UID" "CH_PGID:$DESIRED_CH_GID"; do
+    name="${pair%%:*}"; val="${pair##*:}"
+    if [ "$val" = "0" ]; then
+        abort_config "$name = 0 (root) is not allowed. Services must not run as root."
+    fi
+done
+
+if [ "$DESIRED_APP_UID" = "$DESIRED_MYSQL_UID" ]; then
+    abort_config "PUID ($DESIRED_APP_UID) collides with MYSQL_PUID. Pick distinct UIDs for each service."
+fi
+if [ "$DESIRED_APP_UID" = "$DESIRED_CH_UID" ]; then
+    abort_config "PUID ($DESIRED_APP_UID) collides with CH_PUID. Pick distinct UIDs for each service."
+fi
+if [ "$DESIRED_MYSQL_UID" = "$DESIRED_CH_UID" ]; then
+    abort_config "MYSQL_PUID ($DESIRED_MYSQL_UID) collides with CH_PUID. Pick distinct UIDs for each service."
+fi
+
+# Check collision with existing SSH client UIDs (recorded in /var/bbs/home/*/.uid)
+for uidfile in /var/bbs/home/*/.uid; do
+    [ -f "$uidfile" ] || continue
+    ssh_uid=$(cat "$uidfile" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$ssh_uid" ] && continue
+    for pair in "PUID:$DESIRED_APP_UID" "MYSQL_PUID:$DESIRED_MYSQL_UID" "CH_PUID:$DESIRED_CH_UID"; do
+        name="${pair%%:*}"; val="${pair##*:}"
+        if [ "$ssh_uid" = "$val" ]; then
+            client_dir=$(dirname "$uidfile")
+            abort_config "$name ($val) collides with an existing SSH client (UID stored in $uidfile, home $client_dir). Pick a different value."
+        fi
+    done
+done
+
+# --- Migration helper ---
+# Args: service_name display_name old_uid old_gid new_uid new_gid path1 path2 ...
+# Remaps the in-container user/group to the new IDs, then chowns files on the
+# given volume paths that still reference the old IDs. Only runs if IDs changed.
+migrate_service_uid() {
+    local service="$1" label="$2"
+    local old_uid="$3" old_gid="$4"
+    local new_uid="$5" new_gid="$6"
+    shift 6
+    local paths=("$@")
+
+    if [ "$old_uid" = "$new_uid" ] && [ "$old_gid" = "$new_gid" ]; then
+        return 0
+    fi
+
+    log_mig ""
+    log_mig "--- $label migration ---"
+    log_mig "  from: UID=$old_uid GID=$old_gid"
+    log_mig "  to:   UID=$new_uid GID=$new_gid"
+
+    # Remap in-container group (if GID changed)
+    if [ "$old_gid" != "$new_gid" ]; then
+        local clash
+        clash=$(getent group "$new_gid" 2>/dev/null | cut -d: -f1)
+        if [ -n "$clash" ] && [ "$clash" != "$service" ]; then
+            local tmp=$((new_gid + 10000))
+            log_mig "  note: GID $new_gid is taken by group '$clash' — moving it to GID $tmp to free the slot"
+            groupmod -g "$tmp" "$clash" || abort_config "Failed to move group '$clash' out of GID $new_gid"
+        fi
+        log_mig "  remapping group '$service' from GID $old_gid to $new_gid"
+        groupmod -g "$new_gid" "$service" || abort_config "Failed to set group '$service' to GID $new_gid"
+    fi
+
+    # Remap in-container user (if UID changed)
+    if [ "$old_uid" != "$new_uid" ]; then
+        local clash
+        clash=$(getent passwd "$new_uid" 2>/dev/null | cut -d: -f1)
+        if [ -n "$clash" ] && [ "$clash" != "$service" ]; then
+            local tmp=$((new_uid + 10000))
+            log_mig "  note: UID $new_uid is taken by user '$clash' — moving it to UID $tmp to free the slot"
+            usermod -u "$tmp" "$clash" || abort_config "Failed to move user '$clash' out of UID $new_uid"
+        fi
+        log_mig "  remapping user '$service' from UID $old_uid to $new_uid"
+        usermod -u "$new_uid" "$service" || abort_config "Failed to set user '$service' to UID $new_uid"
+    fi
+
+    # Chown files that still reference the old IDs
+    for path in "${paths[@]}"; do
+        if [ ! -e "$path" ]; then continue; fi
+        local uid_count gid_count total
+        uid_count=$(find "$path" -uid "$old_uid" 2>/dev/null | wc -l | tr -d ' ')
+        gid_count=$(find "$path" -gid "$old_gid" 2>/dev/null | wc -l | tr -d ' ')
+        total=$((uid_count > gid_count ? uid_count : gid_count))
+        if [ "$total" = "0" ]; then
+            log_mig "  [$path] nothing to chown (already correct)"
+            continue
+        fi
+        log_mig "  [$path] chowning $total entries (UID matches: $uid_count, GID matches: $gid_count)"
+        log_mig "          this can take several minutes on large repositories — do not cancel"
+        local start end elapsed
+        start=$(date +%s)
+        find "$path" -uid "$old_uid" -exec chown -h "$new_uid" {} + 2>/dev/null || true
+        find "$path" -gid "$old_gid" -exec chgrp -h "$new_gid" {} + 2>/dev/null || true
+        end=$(date +%s); elapsed=$((end - start))
+        log_mig "  [$path] completed in ${elapsed}s"
+    done
+}
+
+# --- Run migrations (if any) ---
+MIGRATION_NEEDED=0
+if [ "$PREV_APP_UID" != "$DESIRED_APP_UID" ] || [ "$PREV_APP_GID" != "$DESIRED_APP_GID" ] \
+    || [ "$PREV_MYSQL_UID" != "$DESIRED_MYSQL_UID" ] || [ "$PREV_MYSQL_GID" != "$DESIRED_MYSQL_GID" ] \
+    || [ "$PREV_CH_UID" != "$DESIRED_CH_UID" ] || [ "$PREV_CH_GID" != "$DESIRED_CH_GID" ]; then
+    MIGRATION_NEEDED=1
+fi
+
+if [ "$MIGRATION_NEEDED" = "1" ]; then
+    log_mig ""
+    log_mig "=== UID/GID migration starting ==="
+    log_mig "Volume was configured as: app=${PREV_APP_UID}:${PREV_APP_GID}  mysql=${PREV_MYSQL_UID}:${PREV_MYSQL_GID}  clickhouse=${PREV_CH_UID}:${PREV_CH_GID}"
+    log_mig "Reconfiguring to:         app=${DESIRED_APP_UID}:${DESIRED_APP_GID}  mysql=${DESIRED_MYSQL_UID}:${DESIRED_MYSQL_GID}  clickhouse=${DESIRED_CH_UID}:${DESIRED_CH_GID}"
+
+    migrate_service_uid "www-data" "app (www-data)" \
+        "$PREV_APP_UID" "$PREV_APP_GID" "$DESIRED_APP_UID" "$DESIRED_APP_GID" \
+        /var/bbs/home /var/bbs/cache /var/bbs/backups /var/bbs/tmp /var/bbs/config
+
+    migrate_service_uid "mysql" "MariaDB" \
+        "$PREV_MYSQL_UID" "$PREV_MYSQL_GID" "$DESIRED_MYSQL_UID" "$DESIRED_MYSQL_GID" \
+        /var/bbs/mysql
+
+    migrate_service_uid "clickhouse" "ClickHouse" \
+        "$PREV_CH_UID" "$PREV_CH_GID" "$DESIRED_CH_UID" "$DESIRED_CH_GID" \
+        /var/bbs/clickhouse
+
+    # Write new state atomically so a crash mid-migration doesn't leave us
+    # thinking the new state is applied when it isn't.
+    cat > "${OWNERSHIP_FILE}.tmp" <<EOF
+# BBS UID/GID state — managed by entrypoint.sh. Do not edit manually.
+# Written after a successful migration on $(date '+%Y-%m-%d %H:%M:%S UTC').
+APP_UID=$DESIRED_APP_UID
+APP_GID=$DESIRED_APP_GID
+MYSQL_UID=$DESIRED_MYSQL_UID
+MYSQL_GID=$DESIRED_MYSQL_GID
+CH_UID=$DESIRED_CH_UID
+CH_GID=$DESIRED_CH_GID
+EOF
+    mv "${OWNERSHIP_FILE}.tmp" "$OWNERSHIP_FILE"
+    chown "$DESIRED_APP_UID:$DESIRED_APP_GID" "$OWNERSHIP_FILE"
+    chmod 644 "$OWNERSHIP_FILE"
+    log_mig "=== UID/GID migration complete ==="
+    log_mig ""
+elif [ ! -f "$OWNERSHIP_FILE" ]; then
+    # First run on this volume — record baseline so future changes are detected.
+    cat > "$OWNERSHIP_FILE" <<EOF
+# BBS UID/GID state — managed by entrypoint.sh. Do not edit manually.
+# Written on $(date '+%Y-%m-%d %H:%M:%S UTC') (baseline).
+APP_UID=$DESIRED_APP_UID
+APP_GID=$DESIRED_APP_GID
+MYSQL_UID=$DESIRED_MYSQL_UID
+MYSQL_GID=$DESIRED_MYSQL_GID
+CH_UID=$DESIRED_CH_UID
+CH_GID=$DESIRED_CH_GID
+EOF
+    chown "$DESIRED_APP_UID:$DESIRED_APP_GID" "$OWNERSHIP_FILE"
+    chmod 644 "$OWNERSHIP_FILE"
+fi
+
+# Expose PUID/PGID as numbers for any downstream references.
+PUID="$DESIRED_APP_UID"
+PGID="$DESIRED_APP_GID"
+
+# /var/www/bbs lives in the container filesystem (not the volume), so its
+# files come from the image baked with UID 33 on every container recreation.
+# Re-chown on each start when PUID/PGID differ from the image defaults.
+if [ "$PUID" != "33" ] || [ "$PGID" != "33" ]; then
+    log_mig "Applying app UID/GID to /var/www/bbs (container filesystem)..."
+    chown -R www-data:www-data /var/www/bbs
+fi
+
+# --- Storage directories (unified) ---
+# All persistent directories are created and permissioned in one place.
+# This ensures correct ownership AND write permissions on filesystems
+# like btrfs (Synology) that may create directories without write bits.
+ensure_dir /var/bbs                 www-data:www-data   755
+ensure_dir /var/bbs/home            www-data:www-data   755
+ensure_dir /var/bbs/cache           www-data:www-data   755
+ensure_dir /var/bbs/backups         www-data:www-data   750
+ensure_dir /var/bbs/tmp             www-data:www-data   1777
+ensure_dir /var/bbs/config          www-data:www-data   755
+ensure_dir /var/bbs/clickhouse      clickhouse:clickhouse 750
+ensure_dir /var/bbs/mysql           mysql:mysql         750
+ensure_dir /run/mysqld              mysql:mysql         755
+ensure_dir /run/sshd                root:root           755
+ensure_dir /var/log/clickhouse-server clickhouse:clickhouse 755
+
+# --- Self-heal service data ownership (issue #158) ---
+# ensure_dir above only sets ownership on the top-level directory. Volumes
+# that were touched by old image builds (which ran `chown -R www-data:www-data
+# /var/bbs` at some point) still carry www-data-owned files under
+# /var/bbs/clickhouse and /var/bbs/mysql, and those services refuse to start
+# on mismatched ownership:
+#   Code: 430. DB::Exception: Effective user of the process (clickhouse)
+#   does not match the owner of the data (www-data).
+# The UID/GID migration block above doesn't catch this case because it keys
+# off the recorded OWNERSHIP_FILE, not the actual filesystem state. This
+# scan inspects the filesystem directly: if ANY entry under the data dir
+# is owned by the wrong user or group, repair it. Idempotent — on a clean
+# volume the initial `find ... -print -quit` short-circuits on the first
+# check and does no work.
+fix_service_dir_ownership() {
+    local dir="$1" user="$2" group="${3:-$2}"
+    [ -d "$dir" ] || return 0
+    local u g
+    u=$(id -u "$user" 2>/dev/null) || return 0
+    g=$(getent group "$group" | cut -d: -f3 2>/dev/null)
+    [ -z "$g" ] && g=$(id -g "$user" 2>/dev/null)
+    [ -z "$g" ] && return 0
+    # Short-circuit on clean volumes. Flag entries with wrong uid, wrong
+    # gid, or mode bits that deny the owner traversal/read. Chown'ing to
+    # clickhouse doesn't help if a part directory is mode 000.
+    local wrong
+    wrong=$(find "$dir" \
+        \( ! -uid "$u" -o ! -gid "$g" \
+        -o \( -type d ! -perm -0500 \) \
+        -o \( -type f ! -perm -0400 \) \
+        \) -print -quit 2>/dev/null || true)
+    [ -z "$wrong" ] && return 0
+    log_mig "Repairing permissions under $dir → $user:$group (first wrong entry: $wrong)"
+    log_mig "  this can take a minute on large data dirs — do not cancel"
+    # Surface real errors. The original self-heal silenced them, which hid
+    # #189: on FUSE filesystems that don't honor chown, the repair would
+    # claim success while ClickHouse still couldn't read its own data and
+    # failed async table load with a directory_iterator error on one part.
+    local fail=0
+    find "$dir" ! -uid "$u" -exec chown -h "$u" {} + || fail=1
+    find "$dir" ! -gid "$g" -exec chgrp -h "$g" {} + || fail=1
+    # u+rX only adds bits (never removes), so this is safe on clean data.
+    # Fixes part directories left unreadable by a crash mid-write and any
+    # files/dirs where the owner somehow lost read/execute access.
+    find "$dir" \
+        \( \( -type d ! -perm -0500 \) -o \( -type f ! -perm -0400 \) \) \
+        -exec chmod u+rX {} + || fail=1
+    if [ "$fail" = "1" ]; then
+        log_mig "  !! one or more repair calls failed — see stderr above"
+        log_mig "  !! If the data dir is on a FUSE filesystem (e.g. Unraid /mnt/user)"
+        log_mig "     that doesn't honor ownership changes, bind-mount from a native"
+        log_mig "     path such as /mnt/cache or /mnt/disk1 and restart the container."
+    else
+        log_mig "  repair complete"
+    fi
+}
+fix_service_dir_ownership /var/bbs/clickhouse clickhouse
+fix_service_dir_ownership /var/bbs/mysql      mysql
+
+export TMPDIR=/var/bbs/tmp
+
 # --- SSH host key persistence ---
 # Persist host keys on the data volume so agents don't see "host key changed"
 # errors after a container rebuild
@@ -22,23 +347,13 @@ fi
 # NOTE: sshd is started AFTER SSH users are recreated (see below)
 
 # --- MariaDB ---
-# Store database files on the persistent volume
 MYSQL_DATADIR="/var/bbs/mysql"
-mkdir -p "$MYSQL_DATADIR"
-chown mysql:mysql "$MYSQL_DATADIR"
 
 echo "Starting MariaDB..."
 if [ ! -d "$MYSQL_DATADIR/mysql" ]; then
     echo "Initializing MariaDB data directory..."
-    mysql_install_db --user=mysql --datadir="$MYSQL_DATADIR" > /dev/null 2>&1
+    mysql_install_db --user=mysql --datadir="$MYSQL_DATADIR" --skip-test-db > /dev/null 2>&1
 fi
-
-# Use persistent volume for temp files so large catalog imports and MySQL
-# temp tables don't fill the container's overlay filesystem
-mkdir -p /var/bbs/tmp
-chown www-data:www-data /var/bbs/tmp
-chmod 1777 /var/bbs/tmp
-export TMPDIR=/var/bbs/tmp
 
 # Force MariaDB to use UTC so CURRENT_TIMESTAMP values are consistent
 # with what TimeHelper::format() expects, regardless of the Docker host timezone.
@@ -49,7 +364,7 @@ default-time-zone = '+00:00'
 tmpdir = /var/bbs/tmp
 MYCNF
 
-mysqld_safe --datadir="$MYSQL_DATADIR" &
+mariadbd-safe --datadir="$MYSQL_DATADIR" &
 sleep 3
 
 # Wait for MySQL to be ready
@@ -64,13 +379,24 @@ done
 # Start ClickHouse (catalog engine)
 echo "Starting ClickHouse..."
 if command -v clickhouse-server &>/dev/null; then
-    # Store ClickHouse data on persistent volume (same pattern as MariaDB)
-    mkdir -p /var/bbs/clickhouse /var/log/clickhouse-server /etc/clickhouse-server/config.d
-    chown -R clickhouse:clickhouse /var/bbs/clickhouse /var/log/clickhouse-server
+    mkdir -p /etc/clickhouse-server/config.d
     # Install config override to disable system log tables (reduces idle disk I/O)
     if [ -f "/var/www/bbs/config/clickhouse-server-override.xml" ]; then
         cp /var/www/bbs/config/clickhouse-server-override.xml /etc/clickhouse-server/config.d/bbs-override.xml
     fi
+    # Self-heal carried over from #252: containers that previously ran
+    # clickhouse-server in --daemon mode left a /var/log/clickhouse-server/
+    # stderr.log file behind, sometimes multi-GB after Poco logger
+    # rotation got stuck. Newer launches (see below) don't create that
+    # file at all — Docker captures stdout/stderr directly. This truncate
+    # cleans up any leftover from a prior image so a freshly-upgraded
+    # container doesn't carry decades of accumulated noise on the volume.
+    for f in /var/log/clickhouse-server/stderr.log /var/log/clickhouse-server/stdout.log; do
+        if [ -f "$f" ] && [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" -gt 104857600 ]; then
+            echo "  Truncating oversized $(basename "$f") ($(du -h "$f" | cut -f1))"
+            : > "$f"
+        fi
+    done
     # Point ClickHouse data to persistent volume so it survives container recreation
     cat > /etc/clickhouse-server/config.d/bbs-docker-paths.xml << 'CHXML'
 <clickhouse>
@@ -78,11 +404,29 @@ if command -v clickhouse-server &>/dev/null; then
     <tmp_path>/var/bbs/clickhouse/tmp/</tmp_path>
 </clickhouse>
 CHXML
-    TMPDIR=/var/bbs/tmp sudo -u clickhouse clickhouse-server --daemon --config-file=/etc/clickhouse-server/config.xml 2>/dev/null || true
+    # Launch in the foreground and background it from the entrypoint shell
+    # so stdout/stderr are inherited by Docker's log stream instead of
+    # being redirected by ClickHouse itself into /var/log/clickhouse-server/
+    # stderr.log. The --daemon flag used to redirect its own stderr to a
+    # file, which would grow unbounded when Poco's RotateBySizeStrategy
+    # got into a bad state (#252, #266) — multi-GB stderr.log files were
+    # routine on long-running containers. Bare-metal installs (systemd)
+    # never hit this because they run clickhouse-server in the foreground
+    # under journald; matching that pattern here gives Docker users the
+    # same well-behaved log routing.
+    #
+    # MISMATCHING_USERS_FOR_PROCESS_AND_DATA and other fatal startup
+    # errors still surface — they're now in `docker logs` directly instead
+    # of buried in stderr.log (which was the original concern in #158).
+    TMPDIR=/var/bbs/tmp sudo -u clickhouse clickhouse-server --config-file=/etc/clickhouse-server/config.xml &
+    CH_PID=$!
     for i in {1..30}; do
         curl -sf http://localhost:8123/ping >/dev/null 2>&1 && break
         sleep 1
     done
+    if ! curl -sf http://localhost:8123/ping >/dev/null 2>&1; then
+        echo "!! ClickHouse did not respond on port 8123 after 30s — catalog features will be disabled"
+    fi
     if curl -sf http://localhost:8123/ping >/dev/null 2>&1; then
         echo "  ClickHouse started"
         # Drop old system log tables to reclaim disk space
@@ -109,7 +453,7 @@ SERVER_HOST="$(echo "${APP_URL:-http://localhost}" | sed -E 's|https?://||' | se
 # all encrypted data becomes unrecoverable.
 ENV_VOLUME="/var/bbs/config/.env"
 ENV_APP="/var/www/bbs/config/.env"
-mkdir -p /var/bbs/config /var/www/bbs/config
+mkdir -p /var/www/bbs/config
 
 # Migration: move existing .env from container filesystem to volume
 if [ -f "$ENV_APP" ] && [ ! -L "$ENV_APP" ] && [ ! -f "$ENV_VOLUME" ]; then
@@ -173,18 +517,8 @@ if ! mysql -e "SELECT 1 FROM mysql.user WHERE user='bbs'" 2>/dev/null | grep -q 
     mysql -e "FLUSH PRIVILEGES;"
 fi
 
-# --- Storage directories ---
-mkdir -p /var/bbs/home
-mkdir -p /var/bbs/cache
-mkdir -p /var/bbs/backups
-
-# Set permissions on persistent volume directories
-# Only chown the top-level dirs (not -R) — per-user subdirs under home/ and cache/
-# have their own ownership (user:www-data) set by bbs-ssh-helper. A recursive chown
-# would clobber .ssh/authorized_keys and per-user borg cache directories.
-chown www-data:www-data /var/bbs/home /var/bbs/cache
+# Set permissions on backups (recursive for nested content)
 chown -R www-data:www-data /var/bbs/backups
-chown -R mysql:mysql "$MYSQL_DATADIR"
 
 # Create ClickHouse database and tables
 if curl -sf http://localhost:8123/ping >/dev/null 2>&1; then
@@ -207,6 +541,16 @@ if [ -f "/var/www/bbs/schema.sql" ]; then
     if [ "$FRESH_INSTALL" -eq 1 ]; then
         echo "Importing database schema..."
         mysql -u bbs -p"$DB_PASS" bbs < /var/www/bbs/schema.sql
+
+        # Safety net: run the migrations against the freshly-imported schema.
+        # schema.sql is meant to be the full current schema, but if it ever
+        # drifts from migrations/ (a missed fold-in), a fresh install would be
+        # missing columns and 500 (#308). The Migrator tolerates "already
+        # applied" errors, so this patches any gap and records every migration
+        # as applied — so later upgrades don't re-run them.
+        echo "Applying database migrations..."
+        su -s /bin/sh -c "cd /var/www/bbs && /usr/local/bin/php migrate.php" www-data 2>&1 \
+            || echo "Warning: migration runner returned an error (migrations will retry on next start)"
     fi
 fi
 
@@ -255,6 +599,42 @@ if [ -d "/var/www/bbs/migrations" ]; then
         fi
     done
 fi
+
+# --- Hosted-mode platform token bootstrap ---
+# Idempotent: only mints a token if none with kind='platform' exists yet.
+# Honors PLATFORM_TOKEN if supplied (platform-generated, preferred). Falls
+# back to generating one and printing it once to stdout.
+case "$(echo "${HOSTED:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes)
+        EXISTING_PLATFORM=$(mysql -u bbs -p"$DB_PASS" bbs -N -e "SELECT COUNT(*) FROM api_tokens WHERE kind = 'platform'" 2>/dev/null || echo "0")
+        if [ "$EXISTING_PLATFORM" = "0" ]; then
+            if [ -z "${PLATFORM_TOKEN:-}" ]; then
+                PLATFORM_TOKEN="bbs_tok_$(openssl rand -hex 24)"
+                GENERATED_TOKEN=1
+            else
+                GENERATED_TOKEN=0
+            fi
+            PLATFORM_HASH=$(printf '%s' "$PLATFORM_TOKEN" | sha256sum | awk '{print $1}')
+            ADMIN_USER_ID=$(mysql -u bbs -p"$DB_PASS" bbs -N -e "SELECT id FROM users WHERE username = 'admin' LIMIT 1" 2>/dev/null)
+            if [ -n "$ADMIN_USER_ID" ]; then
+                mysql -u bbs -p"$DB_PASS" bbs -e "INSERT INTO api_tokens (name, kind, token_hash, user_id) VALUES ('Hosted Platform', 'platform', '$PLATFORM_HASH', $ADMIN_USER_ID);"
+                if [ "$GENERATED_TOKEN" = "1" ]; then
+                    echo ""
+                    echo "================================================================"
+                    echo "  HOSTED PLATFORM API TOKEN — shown only once, save it now!"
+                    echo "================================================================"
+                    echo "  $PLATFORM_TOKEN"
+                    echo "================================================================"
+                    echo "  Use as: Authorization: Bearer <token>"
+                    echo "================================================================"
+                    echo ""
+                else
+                    echo "Hosted platform token registered from env."
+                fi
+            fi
+        fi
+        ;;
+esac
 
 # Sync borg versions from GitHub on fresh install or if table is empty
 BORG_COUNT=$(mysql -u bbs -p"$DB_PASS" bbs -N -e "SELECT COUNT(*) FROM borg_versions" 2>/dev/null || echo "0")
@@ -394,13 +774,45 @@ touch /var/log/bbs-scheduler.log
 chown www-data:www-data /var/log/bbs-scheduler.log
 cat > /etc/cron.d/bbs-scheduler << 'CRON'
 TMPDIR=/var/bbs/tmp
-* * * * * www-data cd /var/www/bbs && /usr/local/bin/php scheduler.php >> /var/log/bbs-scheduler.log 2>&1
+# Run the scheduler as root cron + `su` to www-data, NOT a `www-data`
+# user-field entry. In some container environments (e.g. Unraid's Docker)
+# /etc/cron.d entries with a non-root user field silently never execute —
+# cron's PAM session setup fails for the nologin www-data user — while root
+# entries in the same file run fine. That left the scheduler dead, so
+# server-side jobs (prune/compact/catalog) sat queued forever while agent
+# backups kept working via the poll endpoint (#307). Running as root and
+# dropping to www-data via su sidesteps the PAM-session issue and keeps file
+# ownership correct.
+* * * * * root su -s /bin/sh www-data -c 'cd /var/www/bbs && TMPDIR=/var/bbs/tmp /usr/local/bin/php scheduler.php' >> /var/log/bbs-scheduler.log 2>&1
 # Save UIDs for any user home dirs that have .ssh/ but no .uid file yet
 */5 * * * * root for d in /var/bbs/home/*/; do [ -d "$d/.ssh" ] && [ ! -f "$d/.uid" ] && stat -c \%u "$d" > "$d/.uid" 2>/dev/null; done
+# Cap ClickHouse stderr/stdout at ~50MB. ClickHouse runs as --daemon and
+# inherits stderr/stdout to these files; a Poco logger rotation glitch can
+# cause a tight loop of multi-line stack traces (#79, #252). Truncate
+# rather than rotate — ClickHouse holds the FD open and we don't want to
+# orphan it. We keep the file (so the next write goes to offset 0 cleanly)
+# instead of unlinking it.
+*/5 * * * * root for f in /var/log/clickhouse-server/stderr.log /var/log/clickhouse-server/stdout.log; do [ -f "$f" ] && [ "$(stat -c\%s "$f" 2>/dev/null || echo 0)" -gt 52428800 ] && : > "$f"; done
 CRON
 chmod 644 /etc/cron.d/bbs-scheduler
 cron
 
 echo "=== BBS Container Ready ==="
+
+# --- Hosted-mode ready callback ---
+# Best-effort POST so the hosted platform learns the container has
+# finished booting. Failures are logged but don't block startup.
+case "$(echo "${HOSTED:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes)
+        if [ -n "${PLATFORM_CALLBACK:-}" ]; then
+            BBS_VER=$(cat /var/www/bbs/VERSION 2>/dev/null | tr -d '[:space:]')
+            curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' \
+                -d "{\"event\":\"bbs_ready\",\"bbs_version\":\"$BBS_VER\",\"admin_pass_set\":true,\"platform_token_set\":true}" \
+                "$PLATFORM_CALLBACK" >/dev/null 2>&1 \
+                && echo "Posted bbs_ready to platform callback." \
+                || echo "Warning: platform callback POST to $PLATFORM_CALLBACK failed (non-fatal)."
+        fi
+        ;;
+esac
 
 exec apache2-foreground

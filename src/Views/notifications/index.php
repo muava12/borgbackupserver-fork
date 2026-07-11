@@ -1,5 +1,4 @@
-<div class="d-flex justify-content-between align-items-center mb-4">
-    <h4 class="mb-0">Notifications</h4>
+<div class="d-flex justify-content-end mb-3">
     <form method="POST" action="/notifications/read-all">
         <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
         <button type="submit" class="btn btn-outline-secondary btn-sm">
@@ -12,10 +11,10 @@
     <div class="text-muted text-center py-5">No notifications.</div>
 <?php else: ?>
 <div class="table-responsive">
-    <table class="table table-hover align-middle">
-        <thead class="table-light">
+    <table class="table table-sm table-hover align-middle small mb-0">
+        <thead>
             <tr>
-                <th style="width:40px"></th>
+                <th style="width:32px"></th>
                 <th>Message</th>
                 <th>Client</th>
                 <th>Severity</th>
@@ -39,8 +38,8 @@
                 $icon = $iconMap[$n['type']] ?? 'bi-bell text-secondary';
             ?>
             <tr class="<?= $rowClass ?>">
-                <td><i class="bi <?= $icon ?> fs-5"></i></td>
-                <td>
+                <td><i class="bi <?= $icon ?>"></i></td>
+                <td style="word-break: break-word; overflow-wrap: anywhere; min-width: 0;">
                     <?= htmlspecialchars($n['message']) ?>
                     <?php if ($n['occurrence_count'] > 1): ?>
                         <span class="badge bg-secondary ms-1"><?= (int)$n['occurrence_count'] ?> occurrences</span>
@@ -49,21 +48,21 @@
                 <td><?= htmlspecialchars($n['agent_name'] ?? '—') ?></td>
                 <td>
                     <?php if ($n['severity'] === 'critical'): ?>
-                        <span class="badge bg-danger">Critical</span>
+                        <span class="badge text-bg-danger">Critical</span>
                     <?php elseif ($n['severity'] === 'info'): ?>
-                        <span class="badge bg-info text-dark">Info</span>
+                        <span class="badge text-bg-primary">Info</span>
                     <?php else: ?>
-                        <span class="badge bg-warning text-dark">Warning</span>
+                        <span class="badge text-bg-warning">Warning</span>
                     <?php endif; ?>
                 </td>
                 <td class="small"><?= \BBS\Core\TimeHelper::format($n['last_occurred_at'], 'M j, g:i A') ?></td>
                 <td>
                     <?php if ($resolved): ?>
-                        <span class="badge bg-success">Resolved</span>
+                        <span class="badge text-bg-success">Resolved</span>
                     <?php elseif (!$unread): ?>
-                        <span class="badge bg-secondary">Read</span>
+                        <span class="badge text-bg-secondary">Read</span>
                     <?php else: ?>
-                        <span class="badge bg-info text-dark">New</span>
+                        <span class="badge text-bg-primary">New</span>
                     <?php endif; ?>
                 </td>
                 <td>

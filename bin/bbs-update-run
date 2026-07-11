@@ -45,11 +45,38 @@ echo "[5/9] Checking ClickHouse..."
 if command -v clickhouse-server &>/dev/null; then
     # Ensure config override is in place
     mkdir -p /etc/clickhouse-server/config.d
+    CH_OVERRIDE_CHANGED=0
+    CH_OVERRIDE_SRC="$BBS_DIR/config/clickhouse-server-override.xml"
+    CH_OVERRIDE_DST="/etc/clickhouse-server/config.d/bbs-override.xml"
     if [ -f "$BBS_DIR/config/clickhouse-server-override.xml" ]; then
-        cp "$BBS_DIR/config/clickhouse-server-override.xml" /etc/clickhouse-server/config.d/bbs-override.xml
+        if ! cmp -s "$CH_OVERRIDE_SRC" "$CH_OVERRIDE_DST"; then
+            cp "$CH_OVERRIDE_SRC" "$CH_OVERRIDE_DST"
+            CH_OVERRIDE_CHANGED=1
+        fi
     fi
     # Ensure service is running
-    systemctl is-active --quiet clickhouse-server || systemctl start clickhouse-server 2>/dev/null || true
+    if systemctl is-active --quiet clickhouse-server; then
+        if [ "$CH_OVERRIDE_CHANGED" -eq 1 ]; then
+            systemctl restart clickhouse-server 2>/dev/null || true
+            sleep 2
+        fi
+    else
+        systemctl start clickhouse-server 2>/dev/null || true
+        sleep 2
+    fi
+    # Drop system_log tables we suppress in the override. The remove="remove"
+    # directive only prevents ClickHouse from *creating* these tables on
+    # startup — it doesn't delete pre-existing ones. Installs predating
+    # v2.53.x carry the old tables forward, and each version of ClickHouse
+    # tends to add a few new ones. Idempotent drop matches entrypoint.sh
+    # on the Docker side so bare-metal and Docker stay in sync.
+    for tbl in trace_log text_log metric_log asynchronous_metric_log part_log \
+               processors_profile_log query_log query_thread_log query_views_log \
+               query_metric_log session_log opentelemetry_span_log \
+               asynchronous_insert_log backup_log s3_queue_log blob_storage_log \
+               background_schedule_pool_log error_log; do
+        clickhouse-client --query "DROP TABLE IF EXISTS system.$tbl" 2>/dev/null || true
+    done
     # Ensure database and tables exist (idempotent)
     clickhouse-client --query "CREATE DATABASE IF NOT EXISTS bbs" 2>/dev/null || true
     clickhouse-client -d bbs --multiquery < "$BBS_DIR/schema-clickhouse.sql" 2>/dev/null || true
@@ -85,7 +112,13 @@ for user in $(getent passwd | grep '^bbs-' | cut -d: -f1); do
         chown "$user":www-data "$home"
         chmod 750 "$home"
 
-        # .ssh dir strict ownership
+        # .ssh dir strict ownership. authorized_keys MUST be user-owned
+        # (root-owned authorized_keys is rejected by sshd's StrictModes
+        # on stock Ubuntu — sshd's privsep child can't read it as the
+        # user, and authentication fails with "Permission denied
+        # (publickey)"). The forced-command + 'restrict' directive in
+        # the file is what enforces the security model — chmod 600
+        # owned by the user is the standard, supported config.
         if [ -d "$home/.ssh" ]; then
             chown -R "$user":"$user" "$home/.ssh"
             chmod 700 "$home/.ssh"

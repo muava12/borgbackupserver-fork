@@ -47,6 +47,21 @@ class RemoteSshService
     }
 
     /**
+     * Decrypt the optional BorgBase API key. Empty or invalid values are treated as absent.
+     */
+    public function getBorgBaseApiKey(array $config): ?string
+    {
+        $encrypted = $config['borgbase_api_key_encrypted'] ?? null;
+        if (empty($encrypted)) return null;
+
+        try {
+            return Encryption::decrypt($encrypted);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
      * Build the SSH repo path for a given config and repo name.
      * Returns: ssh://user@host:port/base_path/repoName
      */
@@ -86,6 +101,7 @@ class RemoteSshService
                 '-o', 'StrictHostKeyChecking=no',
                 '-o', 'UserKnownHostsFile=/dev/null',
                 '-o', 'BatchMode=yes',
+                '-o', 'LogLevel=ERROR',
                 '-o', 'ConnectTimeout=10',
                 "{$config['remote_user']}@{$config['remote_host']}",
                 "{$borgBin} --version",
@@ -154,6 +170,16 @@ class RemoteSshService
 
         $cmd = array_merge(['borg'], $borgArgs);
 
+        // Inject --lock-wait after the subcommand so ops (compact/prune/
+        // check/info/list/delete) wait up to 10 min for the repo lock
+        // rather than failing immediately when a concurrent backup or
+        // another server-side task is still holding it. break-lock is the
+        // one case where --lock-wait is meaningless, so skip it there.
+        $subcmd = $borgArgs[0] ?? '';
+        if ($subcmd !== '' && $subcmd !== 'break-lock') {
+            array_splice($cmd, 2, 0, ['--lock-wait=600']);
+        }
+
         // Insert --remote-path after the subcommand if needed
         if ($borgRemotePath && count($borgArgs) >= 1) {
             array_splice($cmd, 2, 0, ['--remote-path=' . $borgRemotePath]);
@@ -165,6 +191,9 @@ class RemoteSshService
         }
         $env['BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK'] = 'yes';
         $env['BORG_RELOCATED_REPO_ACCESS_IS_OK'] = 'yes';
+        // Skip the interactive 'YES' prompt when running `check --repair`;
+        // borg only reads this env var for that subcommand.
+        $env['BORG_CHECK_I_KNOW_WHAT_I_AM_DOING'] = 'YES';
 
         return $this->runBorgWithKey($config, $cmd, $env);
     }
@@ -181,7 +210,7 @@ class RemoteSshService
             $keyFile = $this->writeTempKey($sshKey);
 
             $port = (int) ($config['remote_port'] ?? 22);
-            $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes";
+            $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
 
             $proc = proc_open($cmd, [
                 0 => ['pipe', 'r'],
@@ -227,6 +256,14 @@ class RemoteSshService
             $port = (int) ($config['remote_port'] ?? 22);
             $basePath = $config['remote_base_path'] ?: './';
 
+            // Defense in depth: the base path is embedded in a command string
+            // that runs on the REMOTE shell (proc_open's array form only
+            // protects the local side). Reject anything that isn't a plain
+            // POSIX path so shell metacharacters can't escape.
+            if (!preg_match('#^[A-Za-z0-9_./\-]+$#', $basePath)) {
+                return null;
+            }
+
             $sshCmd = [
                 'ssh',
                 '-i', $keyFile,
@@ -234,6 +271,7 @@ class RemoteSshService
                 '-o', 'StrictHostKeyChecking=no',
                 '-o', 'UserKnownHostsFile=/dev/null',
                 '-o', 'BatchMode=yes',
+                '-o', 'LogLevel=ERROR',
                 '-o', 'ConnectTimeout=10',
                 "{$config['remote_user']}@{$config['remote_host']}",
                 "df -k {$basePath}",
@@ -293,16 +331,269 @@ class RemoteSshService
     }
 
     /**
-     * Store disk usage data for a remote SSH config.
+     * Check BorgBase quota/usage via GraphQL and verify it belongs to this SSH user/repo name.
      */
-    public function updateDiskUsage(int $configId, ?array $diskData): void
+    public function getBorgBaseApiUsage(array $config, string $apiKey, ?string $repoName = null): array
+    {
+        $sshUser = trim((string) ($config['remote_user'] ?? ''));
+        $repoName = trim((string) ($repoName ?? $config['borgbase_repo_name'] ?? ''));
+
+        if ($sshUser === '' || $repoName === '') {
+            return ['success' => false, 'error' => 'BorgBase SSH user and repository name are required.'];
+        }
+
+        $response = $this->requestBorgBaseRepoList($apiKey);
+        if (!$response['success']) {
+            return $response;
+        }
+
+        foreach ($response['repos'] as $repo) {
+            $id = (string) ($repo['id'] ?? '');
+            $name = (string) ($repo['name'] ?? '');
+            if ($id !== $sshUser || $name !== $repoName) {
+                continue;
+            }
+
+            $quotaMb = (float) ($repo['quota'] ?? 0);
+            $usedMb = (float) ($repo['currentUsage'] ?? 0);
+            if ($quotaMb <= 0 || empty($repo['quotaEnabled'])) {
+                return ['success' => false, 'error' => 'No BorgBase quota set. Enable it in BorgBase or use Manual Quota.'];
+            }
+
+            // BorgBase returns quota and currentUsage as decimal MB.
+            $total = (int) round($quotaMb * 1000 * 1000);
+            $used = max(0, (int) round($usedMb * 1000 * 1000));
+            $free = max(0, $total - $used);
+
+            return [
+                'success' => true,
+                'repo' => $repo,
+                'disk' => [
+                    'total' => $total,
+                    'used' => $used,
+                    'free' => $free,
+                    'percent' => $total > 0 ? (int) round(($used / $total) * 100) : 0,
+                ],
+            ];
+        }
+
+        return ['success' => false, 'error' => 'No BorgBase repository matched both SSH user and repository name.'];
+    }
+
+    /**
+     * Use BorgBase-specific data when available. Falls back to manual quota + known repo sizes.
+     */
+    public function refreshBorgBaseDiskUsage(array $config): ?array
+    {
+        $apiKey = $this->getBorgBaseApiKey($config);
+        if ($apiKey && !empty($config['borgbase_repo_name'])) {
+            $usage = $this->getBorgBaseApiUsage($config, $apiKey, $config['borgbase_repo_name']);
+            if ($usage['success']) {
+                $this->updateDiskUsage((int) $config['id'], $usage['disk'], 'borgbase_api');
+                return $usage['disk'];
+            }
+        }
+
+        $manualGb = (float) ($config['borgbase_manual_quota_gb'] ?? 0);
+        if ($manualGb > 0) {
+            // Use decimal GB (× 1000³) to match the API path's decimal-MB
+            // conversion. Otherwise the same "10 GB" plan reads as 10.00 GB
+            // when sourced from the BorgBase API but 10.74 GB when entered
+            // manually — same number on screen, different bytes underneath.
+            $total = (int) round($manualGb * 1000 * 1000 * 1000);
+            $row = $this->db->fetchOne(
+                "SELECT COALESCE(SUM(size_bytes), 0) as used FROM repositories WHERE remote_ssh_config_id = ?",
+                [(int) $config['id']]
+            );
+            $used = max(0, (int) ($row['used'] ?? 0));
+            $diskData = [
+                'total' => $total,
+                'used' => $used,
+                'free' => max(0, $total - $used),
+                'percent' => $total > 0 ? (int) round(($used / $total) * 100) : 0,
+            ];
+            $this->updateDiskUsage((int) $config['id'], $diskData, 'manual');
+            return $diskData;
+        }
+
+        $this->updateDiskUsage((int) $config['id'], null, null);
+        return null;
+    }
+
+    /**
+     * Store disk usage data for a remote SSH config, including the source when known.
+     */
+    public function updateDiskUsage(int $configId, ?array $diskData, ?string $source = null): void
     {
         $this->db->update('remote_ssh_configs', [
             'disk_total_bytes' => $diskData ? $diskData['total'] : null,
             'disk_used_bytes' => $diskData ? $diskData['used'] : null,
             'disk_free_bytes' => $diskData ? $diskData['free'] : null,
             'disk_checked_at' => $this->db->now(),
+            'borgbase_usage_source' => $source,
         ], 'id = ?', [$configId]);
+    }
+
+    private function requestBorgBaseRepoList(string $apiKey): array
+    {
+        $payload = json_encode([
+            'query' => '{ repoList { id name quota quotaEnabled currentUsage lastModified } }',
+        ]);
+        if ($payload === false) {
+            return ['success' => false, 'error' => 'Failed to build BorgBase API request.'];
+        }
+
+        $headers = [
+            'Authorization: Bearer ' . $apiKey,
+            'Content-Type: application/json',
+        ];
+
+        $code = 0;
+        if (function_exists('curl_init')) {
+            $ch = curl_init('https://api.borgbase.com/graphql');
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_POSTFIELDS => $payload,
+                CURLOPT_TIMEOUT => 15,
+            ]);
+            $body = curl_exec($ch);
+            $err = curl_error($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($body === false) {
+                return ['success' => false, 'error' => $err ?: 'BorgBase API request failed.'];
+            }
+        } else {
+            $context = stream_context_create([
+                'http' => [
+                    'method' => 'POST',
+                    'header' => implode("\r\n", $headers),
+                    'content' => $payload,
+                    'timeout' => 15,
+                    'ignore_errors' => true,
+                ],
+            ]);
+            $body = @file_get_contents('https://api.borgbase.com/graphql', false, $context);
+            if ($body === false) {
+                return ['success' => false, 'error' => 'BorgBase API request failed.'];
+            }
+            foreach ($http_response_header ?? [] as $header) {
+                if (preg_match('#^HTTP/\S+\s+(\d{3})#', $header, $m)) {
+                    $code = (int) $m[1];
+                    break;
+                }
+            }
+        }
+
+        $json = json_decode($body, true);
+        if (!is_array($json)) {
+            if ($code !== 0 && ($code < 200 || $code >= 300)) {
+                return ['success' => false, 'error' => "BorgBase API returned HTTP {$code}."];
+            }
+            return ['success' => false, 'error' => 'BorgBase API returned invalid JSON.'];
+        }
+        if (!empty($json['errors'])) {
+            $message = $json['errors'][0]['message'] ?? 'BorgBase API returned an error.';
+            return ['success' => false, 'error' => $message];
+        }
+        if ($code !== 0 && ($code < 200 || $code >= 300)) {
+            return ['success' => false, 'error' => "BorgBase API returned HTTP {$code}."];
+        }
+
+        $repos = $json['data']['repoList'] ?? null;
+        if (!is_array($repos)) {
+            return ['success' => false, 'error' => 'BorgBase API response did not include repoList.'];
+        }
+
+        return ['success' => true, 'repos' => $repos];
+    }
+
+    /**
+     * Measure a single remote borg repository directory with `du -sk`.
+     * Returns bytes used on disk, or null if the path cannot be measured
+     * (e.g. BorgBase's borg-only shell rejects shell commands).
+     */
+    public function getRepositorySizeBytes(array $config, string $repoPath): ?int
+    {
+        $remotePath = $this->remoteFilesystemPathFromRepoUrl($repoPath);
+        if ($remotePath === null || $remotePath === '' || str_contains($remotePath, "\0")) {
+            return null;
+        }
+
+        $keyFile = null;
+        try {
+            $sshKey = $this->decryptKey($config);
+            $keyFile = $this->writeTempKey($sshKey);
+
+            $port = (int) ($config['remote_port'] ?? 22);
+            $sshCmd = [
+                'ssh',
+                '-i', $keyFile,
+                '-p', (string) $port,
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'UserKnownHostsFile=/dev/null',
+                '-o', 'BatchMode=yes',
+                '-o', 'LogLevel=ERROR',
+                '-o', 'ConnectTimeout=30',
+                "{$config['remote_user']}@{$config['remote_host']}",
+                'du -sk -- ' . escapeshellarg($remotePath),
+            ];
+
+            $proc = proc_open($sshCmd, [
+                0 => ['pipe', 'r'],
+                1 => ['pipe', 'w'],
+                2 => ['pipe', 'w'],
+            ], $pipes, null, $this->buildServerEnv());
+
+            if (!is_resource($proc)) {
+                return null;
+            }
+
+            fclose($pipes[0]);
+            $stdout = trim(stream_get_contents($pipes[1]));
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $exitCode = proc_close($proc);
+
+            if ($exitCode !== 0 || $stdout === '') {
+                return null;
+            }
+
+            $fields = preg_split('/\s+/', $stdout);
+            $kib = isset($fields[0]) && is_numeric($fields[0]) ? (int) $fields[0] : 0;
+            return $kib > 0 ? $kib * 1024 : 0;
+        } catch (\Throwable $e) {
+            return null;
+        } finally {
+            $this->cleanupTempKey($keyFile);
+        }
+    }
+
+    /**
+     * Convert a borg SSH URL to the remote filesystem path that `du` should
+     * measure. Borg conventions: ssh://user@host/relative → relative to home,
+     * ssh://user@host//absolute → absolute.
+     */
+    private function remoteFilesystemPathFromRepoUrl(string $repoPath): ?string
+    {
+        if (!str_starts_with($repoPath, 'ssh://')) {
+            return $repoPath;
+        }
+
+        $path = parse_url($repoPath, PHP_URL_PATH);
+        if (!is_string($path) || $path === '') {
+            return null;
+        }
+
+        $path = rawurldecode($path);
+        if (str_starts_with($path, '//')) {
+            return '/' . ltrim($path, '/');
+        }
+
+        return ltrim($path, '/');
     }
 
     /**
@@ -390,7 +681,7 @@ class RemoteSshService
         }
 
         $port = (int) ($config['remote_port'] ?? 22);
-        $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes";
+        $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
 
         $proc = proc_open($cmd, [
             0 => ['pipe', 'r'],

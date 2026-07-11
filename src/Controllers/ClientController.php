@@ -26,7 +26,7 @@ class ClientController extends Controller
             FROM agents a
             LEFT JOIN users u ON u.id = a.user_id
             WHERE {$where}
-            ORDER BY a.id DESC
+            ORDER BY a.name ASC, a.id DESC
         ", $params);
 
         // Aggregate stats for stat cards - reuse the same where clause
@@ -108,7 +108,11 @@ class ClientController extends Controller
               {$jobScope}
         ", $jobParams);
 
-        // Group task types into categories
+        // Group task types into categories. Failed jobs are split between
+        // "backup_failed" (actual data-loss risk) and "other_failed" (update
+        // jobs for sleeping clients, plugin tests, etc.) so a laptop that
+        // was offline at 5am doesn't paint the chart red like a backup
+        // disaster happened (#141).
         $categoryMap = [
             'backup' => 'backups',
             'restore' => 'restores', 'restore_mysql' => 'restores', 'restore_pg' => 'restores', 'restore_mongo' => 'restores',
@@ -121,9 +125,15 @@ class ClientController extends Controller
             $dt = new \DateTime($job['completed_at'], $utcTz);
             $dt->setTimezone($userTz);
             $dayKey = $dt->format('Y-m-d');
-            if (!isset($byDay[$dayKey])) $byDay[$dayKey] = ['backups' => 0, 's3_sync' => 0, 'failed' => 0];
+            if (!isset($byDay[$dayKey])) {
+                $byDay[$dayKey] = ['backups' => 0, 's3_sync' => 0, 'backup_failed' => 0, 'other_failed' => 0];
+            }
             if ($job['status'] === 'failed') {
-                $byDay[$dayKey]['failed']++;
+                if ($job['task_type'] === 'backup') {
+                    $byDay[$dayKey]['backup_failed']++;
+                } else {
+                    $byDay[$dayKey]['other_failed']++;
+                }
             } else {
                 $cat = $categoryMap[$job['task_type']] ?? null;
                 if ($cat && $cat !== 'restores') {
@@ -143,7 +153,8 @@ class ClientController extends Controller
                 'label' => $dt->format('D'),
                 'backups' => $byDay[$dayKey]['backups'] ?? 0,
                 's3_sync' => $byDay[$dayKey]['s3_sync'] ?? 0,
-                'failed' => $byDay[$dayKey]['failed'] ?? 0,
+                'backup_failed' => $byDay[$dayKey]['backup_failed'] ?? 0,
+                'other_failed'  => $byDay[$dayKey]['other_failed'] ?? 0,
             ];
         }
 
@@ -163,17 +174,8 @@ class ClientController extends Controller
             $storageByClient[] = ['name' => 'Other', 'size' => $otherSize];
         }
 
-        // Format total size for display
-        $totalSizeFormatted = '--';
-        if ($totalSize >= 1099511627776) {
-            $totalSizeFormatted = round($totalSize / 1099511627776, 1) . ' TB';
-        } elseif ($totalSize >= 1073741824) {
-            $totalSizeFormatted = round($totalSize / 1073741824, 1) . ' GB';
-        } elseif ($totalSize >= 1048576) {
-            $totalSizeFormatted = round($totalSize / 1048576, 1) . ' MB';
-        } elseif ($totalSize > 0) {
-            $totalSizeFormatted = round($totalSize / 1024, 1) . ' KB';
-        }
+        // Format total size for display (use ServerStats for consistency)
+        $totalSizeFormatted = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $totalSize) : '--';
 
         $this->view('clients/index', [
             'pageTitle' => 'Clients',
@@ -221,7 +223,8 @@ class ClientController extends Controller
 
         $id = $this->db->insert('agents', [
             'name' => $name,
-            'api_key' => $apiKey,
+            'api_key_hash' => hash('sha256', $apiKey),
+            'api_key_encrypted' => \BBS\Services\Encryption::encrypt($apiKey),
             'status' => 'setup',
             'user_id' => $userId,
         ]);
@@ -273,6 +276,13 @@ class ClientController extends Controller
             'message' => "Client created. SSH provisioned: user {$sshResult['unix_user']}, home {$sshResult['home_dir']}",
         ]);
 
+        // The owner gets access and all permissions on their client by
+        // default; an admin can back individual permissions off in the
+        // user's profile (#337)
+        if ($userId) {
+            (new PermissionService())->grantOwnerDefaults($userId, $id);
+        }
+
         $this->flash('success', 'Client created. To install, copy the Install Agent code and run it in a terminal on the client machine.');
         $this->redirect("/clients/{$id}?tab=install");
     }
@@ -288,10 +298,10 @@ class ClientController extends Controller
         }
 
         // Refresh archive_count from the archives table (cheap and always accurate).
-        // Do NOT touch size_bytes here — the scheduler updates it every 5 minutes
-        // from actual disk usage (du) which is the ground truth. Summing
-        // archives.deduplicated_size is always less than real on-disk size
-        // because it excludes borg repo metadata and uncompacted chunks.
+        // Do NOT touch size_bytes here — it's maintained by RepositorySizeService
+        // after backup/prune/compact/delete events. Summing archives.deduplicated_size
+        // is always less than real on-disk size because it excludes borg repo
+        // metadata and uncompacted chunks.
         $this->db->query("
             UPDATE repositories r SET
                 r.archive_count = (SELECT COUNT(*) FROM archives a WHERE a.repository_id = r.id)
@@ -410,54 +420,59 @@ class ClientController extends Controller
         $globalS3Bucket = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 's3_bucket'");
         $globalS3Configured = !empty($globalS3Bucket['value']);
 
-        // Repos with S3 sync enabled (via repository_s3_configs)
+        // Repos with S3 sync enabled (via repository_s3_configs) — a repo can
+        // replicate to several destinations, so aggregate per repo
         $s3SyncRepos = $this->db->fetchAll("
-            SELECT rsc.repository_id, rsc.plugin_config_id, rsc.last_sync_at as last_s3_sync, rsc.enabled
+            SELECT rsc.repository_id,
+                   COUNT(*) AS destinations,
+                   MAX(rsc.last_sync_at) AS last_s3_sync,
+                   MAX(rsc.enabled) AS enabled
             FROM repository_s3_configs rsc
             JOIN repositories r ON r.id = rsc.repository_id
             WHERE r.agent_id = ?
+            GROUP BY rsc.repository_id
         ", [$id]);
         $s3SyncByRepo = [];
         foreach ($s3SyncRepos as $sr) {
             $s3SyncByRepo[$sr['repository_id']] = [
                 'last_sync' => $sr['last_s3_sync'],
-                'plugin_config_id' => $sr['plugin_config_id'],
+                'destinations' => (int) $sr['destinations'],
                 'enabled' => $sr['enabled'],
             ];
         }
 
-        // Detect orphaned S3 repos (exist in S3 but not locally)
-        $s3Orphans = [];
-        $s3PluginConfigId = null;
-        // Get any S3 plugin config for this agent (for orphan detection)
-        $s3PluginConfig = $this->db->fetchOne("
+        // Detect orphaned S3 repos (exist in S3 but not locally). Checks every
+        // S3 destination config for this agent; an orphan remembers which
+        // destination it was found in so restore pulls from the right one.
+        $s3Orphans = []; // name => plugin_config_id
+        $agentS3Configs = $this->db->fetchAll("
             SELECT pc.id as plugin_config_id, pc.config
             FROM plugin_configs pc
             JOIN plugins p ON p.id = pc.plugin_id
             WHERE p.slug = 's3_sync' AND pc.agent_id = ?
-            LIMIT 1
         ", [$id]);
 
-        if ($s3PluginConfig) {
-            $s3PluginConfigId = $s3PluginConfig['plugin_config_id'];
-            $config = json_decode($s3PluginConfig['config'] ?? '{}', true) ?: [];
+        if (!empty($agentS3Configs)) {
             $s3Service = new S3SyncService();
-            $creds = $s3Service->resolveCredentials($config);
+            // Local repo names, sanitized the same way as S3
+            $localRepoNames = array_map(
+                fn($r) => preg_replace('/[^a-zA-Z0-9_-]/', '_', $r['name']),
+                $repositories
+            );
 
-            if (!empty($creds['bucket'])) {
+            foreach ($agentS3Configs as $s3PluginConfig) {
+                $config = json_decode($s3PluginConfig['config'] ?? '{}', true) ?: [];
+                $creds = $s3Service->resolveCredentials($config);
+                if (empty($creds['bucket'])) {
+                    continue;
+                }
                 $remoteResult = $s3Service->listRemoteRepos($agent['name'], $creds);
-                if ($remoteResult['success'] && !empty($remoteResult['repos'])) {
-                    // Get local repo names (sanitized the same way as S3)
-                    $localRepoNames = array_map(
-                        fn($r) => preg_replace('/[^a-zA-Z0-9_-]/', '_', $r['name']),
-                        $repositories
-                    );
-
-                    // Find repos that exist in S3 but not locally
-                    foreach ($remoteResult['repos'] as $remoteName) {
-                        if (!in_array($remoteName, $localRepoNames)) {
-                            $s3Orphans[] = $remoteName;
-                        }
+                if (!$remoteResult['success'] || empty($remoteResult['repos'])) {
+                    continue;
+                }
+                foreach ($remoteResult['repos'] as $remoteName) {
+                    if (!in_array($remoteName, $localRepoNames) && !isset($s3Orphans[$remoteName])) {
+                        $s3Orphans[$remoteName] = $s3PluginConfig['plugin_config_id'];
                     }
                 }
             }
@@ -486,7 +501,6 @@ class ClientController extends Controller
             'pluginConfigs' => $pluginConfigs,
             's3SyncByRepo' => $s3SyncByRepo,
             's3Orphans' => $s3Orphans,
-            's3PluginConfigId' => $s3PluginConfigId,
             'globalS3Configured' => $globalS3Configured,
             'remoteSshConfigs' => (new \BBS\Services\RemoteSshService())->getAll(),
             'storageLocations' => $this->db->fetchAll("SELECT * FROM storage_locations ORDER BY is_default DESC, label"),
@@ -509,9 +523,9 @@ class ClientController extends Controller
             ? \BBS\Core\TimeHelper::ago($agent['last_heartbeat'])
             : 'Never';
 
-        // Refresh archive_count from archives; size_bytes is maintained by the
-        // scheduler (every 5 min) from actual disk usage — don't overwrite it
-        // with SUM(deduplicated_size) which excludes repo metadata/uncompacted chunks.
+        // Refresh archive_count from archives; size_bytes is maintained by
+        // RepositorySizeService after backup/prune/compact/delete — don't overwrite
+        // it with SUM(deduplicated_size) which excludes repo metadata/uncompacted chunks.
         $this->db->query("
             UPDATE repositories r SET
                 r.archive_count = (SELECT COUNT(*) FROM archives a WHERE a.repository_id = r.id)
@@ -555,10 +569,7 @@ class ClientController extends Controller
         );
 
         // Format size
-        $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB'
-            : ($totalSize >= 1048576 ? round($totalSize / 1048576, 1) . ' MB'
-            : ($totalSize >= 1024 ? round($totalSize / 1024, 1) . ' KB'
-            : ($totalSize > 0 ? $totalSize . ' B' : '0')));
+        $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $totalSize) : '0';
 
         // Format next backup
         $nextRunLabel = '--';
@@ -584,8 +595,7 @@ class ClientController extends Controller
         }
 
         // Format avg duration
-        $avgDuration = (int) ($jobStats['avg_duration'] ?? 0);
-        $avgDurLabel = $avgDuration >= 60 ? floor($avgDuration / 60) . 'm ' . ($avgDuration % 60) . 's' : $avgDuration . 's';
+        $avgDurLabel = \BBS\Core\TimeHelper::duration((int) ($jobStats['avg_duration'] ?? 0));
 
         // Format last backup
         $lastBackupLabel = $lastJob ? \BBS\Core\TimeHelper::format($lastJob['completed_at'], 'M j g:ia') : '--';
@@ -699,6 +709,29 @@ class ClientController extends Controller
         } catch (\Exception $e) {
             $this->json(['catalog_available' => false]);
         }
+
+        $total = $ch->fetchOne(
+            "SELECT count() as cnt FROM file_catalog WHERE {$where}",
+            $params
+        );
+
+        // fetchAllOrdered: dodge the CH 26.5 ORDER BY..LIMIT lazy-materialization bug (#301)
+        $files = $ch->fetchAllOrdered(
+            "SELECT path as file_path, file_name, file_size, status,
+                    formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
+             FROM file_catalog
+             WHERE {$where}
+             ORDER BY path
+             LIMIT {$perPage} OFFSET {$offset}",
+            $params
+        );
+
+        $this->json([
+            'files' => $files,
+            'total' => (int) ($total['cnt'] ?? 0),
+            'page' => $page,
+            'pages' => max(1, ceil(($total['cnt'] ?? 0) / $perPage)),
+        ]);
     }
 
     /**
@@ -958,7 +991,7 @@ class ClientController extends Controller
         ]);
 
         $this->flash('success', 'Restore job queued. It will run when a slot is available.');
-        $this->redirect("/clients/{$id}?tab=restore");
+        $this->redirect("/queue/{$jobId}");
     }
 
     /**
@@ -1146,7 +1179,7 @@ class ClientController extends Controller
         ]);
 
         $this->flash('success', 'MySQL restore job queued. It will run when a slot is available.');
-        $this->redirect("/clients/{$id}?tab=restore");
+        $this->redirect("/queue/{$jobId}");
     }
 
     /**
@@ -1250,7 +1283,7 @@ class ClientController extends Controller
         ]);
 
         $this->flash('success', 'PostgreSQL restore job queued. It will run when a slot is available.');
-        $this->redirect("/clients/{$id}?tab=restore");
+        $this->redirect("/queue/{$jobId}");
     }
 
     /**
@@ -1353,7 +1386,7 @@ class ClientController extends Controller
         ]);
 
         $this->flash('success', 'MongoDB restore job queued. It will run when a slot is available.');
-        $this->redirect("/clients/{$id}?tab=restore");
+        $this->redirect("/queue/{$jobId}");
     }
 
     /**
@@ -1446,7 +1479,7 @@ class ClientController extends Controller
                 chmod($remoteSshKeyFile, 0600);
 
                 $port = (int) ($archive['remote_port'] ?? 22);
-                $env['BORG_RSH'] = "ssh -i {$remoteSshKeyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes";
+                $env['BORG_RSH'] = "ssh -i {$remoteSshKeyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
 
                 $cmd = ['borg', 'extract'];
                 if (!empty($archive['borg_remote_path'])) {
@@ -1465,10 +1498,11 @@ class ClientController extends Controller
                 // Local repos: Use SSH helper to run borg extract as the repo-owning user
                 // (www-data can't read repo files owned by the bbs-* user)
                 $sshUser = $agent['ssh_unix_user'] ?? '';
-                if (!empty($sshUser)) {
-                    // Pass passphrase as argument (sudo strips env vars)
+                $useHelper = !empty($sshUser);
+                if ($useHelper) {
+                    // Passphrase piped on stdin ("-" marker) so it's not in argv.
                     $passphrase = $env['BORG_PASSPHRASE'] ?? '';
-                    $cmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-extract', $sshUser, $tmpDir, $passphrase];
+                    $cmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-extract', $sshUser, $tmpDir, '-'];
                     $cmd = array_merge($cmd, $borgArgs);
 
                     $envStrings = null; // helper handles env; null inherits current env (for PATH)
@@ -1496,6 +1530,9 @@ class ClientController extends Controller
                 throw new \RuntimeException('Failed to run borg extract');
             }
 
+            if (!empty($useHelper)) {
+                fwrite($pipes[0], ($passphrase ?? '') . "\n");
+            }
             fclose($pipes[0]);
             $stdout = stream_get_contents($pipes[1]);
             $stderr = stream_get_contents($pipes[2]);
@@ -1667,6 +1704,13 @@ class ClientController extends Controller
 
         if (!empty($data)) {
             $this->db->update('agents', $data, 'id = ?', [$id]);
+
+            // A newly assigned owner gets access and all permissions by
+            // default, revocable in the user's profile (#337)
+            if (!empty($data['user_id']) && $data['user_id'] !== (int) ($agent['user_id'] ?? 0)) {
+                (new PermissionService())->grantOwnerDefaults($data['user_id'], $id);
+            }
+
             $this->flash('success', 'Client updated.');
         }
 
@@ -1675,13 +1719,20 @@ class ClientController extends Controller
 
     public function delete(int $id): void
     {
-        $this->requireAdmin();
+        $this->requireAuth();
         $this->verifyCsrf();
 
         $agent = $this->getAgent($id);
         if (!$agent) {
             $this->flash('danger', 'Client not found.');
             $this->redirect('/clients');
+        }
+
+        // Admins, or the client's owner — owners manage the full lifecycle
+        // of their own clients (#337)
+        if (!$this->isAdmin() && (int) ($agent['user_id'] ?? 0) !== (int) ($_SESSION['user_id'] ?? 0)) {
+            $this->flash('danger', 'Only an admin or the client\'s owner can delete it.');
+            $this->redirect("/clients/{$id}");
         }
 
         // Deprovision SSH user
@@ -1729,6 +1780,14 @@ class ClientController extends Controller
         // Use the new permission service to check access
         if (!$this->canAccessAgent($id)) {
             return null;
+        }
+
+        // Populate plaintext token for display (install command) from stored
+        // encrypted blob. Falls back silently if decrypt fails.
+        if (empty($agent['api_key']) && !empty($agent['api_key_encrypted'])) {
+            try {
+                $agent['api_key'] = \BBS\Services\Encryption::decrypt($agent['api_key_encrypted']);
+            } catch (\Throwable $e) { /* leave blank */ }
         }
 
         return $agent;
@@ -1789,5 +1848,122 @@ class ClientController extends Controller
 
         $this->flash('success', 'Agent update job queued for ' . $agent['name']);
         $this->redirect("/clients/{$id}");
+    }
+
+    /**
+     * POST /clients/{id}/browse — queue a list_dir task on the agent so
+     * the user can interactively pick backup directories from the plan-
+     * create modal. Body: { path, depth, show_hidden, show_all }.
+     * Returns either the task_id (poll /browse/{task_id} for the result)
+     * or the cached tree if the same params hit the per-agent cache.
+     */
+    public function browse(int $id): void
+    {
+        $this->requireAuth();
+        if (!$this->canAccessAgent($id)) {
+            $this->json(['error' => 'Access denied'], 403);
+        }
+        $this->verifyCsrf();
+
+        $agent = $this->db->fetchOne("SELECT id, name, status FROM agents WHERE id = ?", [$id]);
+        if (!$agent) {
+            $this->json(['error' => 'Agent not found'], 404);
+        }
+        if (($agent['status'] ?? 'offline') !== 'online') {
+            $this->json(['error' => 'Agent is offline; cannot browse filesystem'], 409);
+        }
+
+        $input = json_decode(file_get_contents('php://input'), true) ?: [];
+        $path = trim((string) ($input['path'] ?? '/'));
+        if ($path === '') $path = '/';
+        $depth = max(0, min(5, (int) ($input['depth'] ?? 2)));
+        $showHidden = !empty($input['show_hidden']);
+        $showAll    = !empty($input['show_all']);
+
+        $cache = \BBS\Services\Cache::getInstance();
+        $cacheKey = sprintf(
+            'browse_tree:%d:%s',
+            $id,
+            md5("{$path}|{$depth}|" . ($showHidden ? '1' : '0') . '|' . ($showAll ? '1' : '0'))
+        );
+        $cached = $cache->get($cacheKey);
+        if (is_array($cached)) {
+            // Sliding TTL — every access resets the clock
+            $cache->set($cacheKey, $cached, 900);
+            $this->json(['status' => 'completed', 'tree' => $cached, 'cached' => true]);
+            return;
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'task_type' => 'list_dir',
+            'status' => 'queued',
+            'status_message' => json_encode([
+                'path' => $path,
+                'depth' => $depth,
+                'show_hidden' => $showHidden,
+                'show_all' => $showAll,
+                'cache_key' => $cacheKey,
+            ]),
+        ]);
+
+        $this->json(['status' => 'pending', 'task_id' => $jobId]);
+    }
+
+    /**
+     * GET /clients/{id}/browse/{task_id} — poll for a browse() result.
+     * Returns pending until the agent reports back; then completed with
+     * the tree, which is also stashed in the params-keyed cache for
+     * 15 minutes so the next identical request short-circuits.
+     */
+    public function browsePoll(int $id, int $taskId): void
+    {
+        $this->requireAuth();
+        if (!$this->canAccessAgent($id)) {
+            $this->json(['error' => 'Access denied'], 403);
+        }
+
+        $job = $this->db->fetchOne(
+            "SELECT id, status, status_message, error_log, task_result FROM backup_jobs WHERE id = ? AND agent_id = ? AND task_type = 'list_dir'",
+            [$taskId, $id]
+        );
+        if (!$job) {
+            $this->json(['error' => 'Task not found'], 404);
+        }
+
+        if ($job['status'] === 'failed') {
+            $this->json(['status' => 'failed', 'error' => $job['error_log'] ?? 'list_dir failed']);
+            return;
+        }
+        if ($job['status'] !== 'completed') {
+            $this->json(['status' => 'pending']);
+            return;
+        }
+
+        // Primary source: the task_result column on the job row (always
+        // available regardless of cache state). Fall back to the cache
+        // for older rows that completed before the DB persistence was
+        // added.
+        $cache = \BBS\Services\Cache::getInstance();
+        $tree = null;
+        if (!empty($job['task_result'])) {
+            $decoded = json_decode($job['task_result'], true);
+            if (is_array($decoded)) $tree = $decoded;
+        }
+        if ($tree === null) {
+            $tree = $cache->get("browse_result:{$taskId}");
+        }
+        if (!is_array($tree)) {
+            $this->json(['status' => 'failed', 'error' => 'Result not available (may have expired)']);
+            return;
+        }
+
+        // Populate the per-params cache so repeat browses with the same
+        // params short-circuit. No-op if memcached isn't available.
+        $params = json_decode($job['status_message'] ?? '{}', true) ?: [];
+        if (!empty($params['cache_key'])) {
+            $cache->set($params['cache_key'], $tree, 900);
+        }
+        $this->json(['status' => 'completed', 'tree' => $tree]);
     }
 }

@@ -166,12 +166,29 @@ class RepositoryController extends Controller
         }
 
         // Run borg init via bbs-ssh-helper (runs as root, works on NFS and other
-        // filesystems where www-data may lack write access despite POSIX permissions)
+        // filesystems where www-data may lack write access despite POSIX permissions).
+        // Passphrase is piped on stdin ("-" marker) so it's not visible in `ps`.
         $initCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-init', $localPath, $encryption];
+        $passphraseToPipe = '';
         if ($encryption !== 'none' && !empty($passphrase)) {
-            $initCmd[] = $passphrase;
+            $initCmd[] = '-';
+            $passphraseToPipe = $passphrase;
         }
-        exec(implode(' ', array_map('escapeshellarg', $initCmd)) . ' 2>&1', $initOutput, $initRet);
+        $initOutput = [];
+        $initRet = 1;
+        $initProc = proc_open($initCmd, [
+            0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'],
+        ], $initPipes);
+        if (is_resource($initProc)) {
+            if ($passphraseToPipe !== '') fwrite($initPipes[0], $passphraseToPipe . "\n");
+            fclose($initPipes[0]);
+            $stdout = stream_get_contents($initPipes[1]);
+            $stderr = stream_get_contents($initPipes[2]);
+            fclose($initPipes[1]);
+            fclose($initPipes[2]);
+            $initRet = proc_close($initProc);
+            $initOutput = array_values(array_filter(explode("\n", trim($stdout . "\n" . $stderr))));
+        }
 
         if ($initRet !== 0) {
             $errorMsg = implode("\n", $initOutput);
@@ -346,31 +363,43 @@ class RepositoryController extends Controller
             }
         }
 
-        // Handle S3 deletion if requested
+        // Handle S3 deletion if requested — remove the offsite copy from
+        // every destination this repo replicates to
         $s3Deleted = false;
         $deleteFromS3 = !empty($_POST['delete_from_s3']);
-        $pluginConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
 
-        if ($deleteFromS3 && $pluginConfigId > 0) {
-            // Get plugin config and agent info
-            $pluginConfig = $this->db->fetchOne("SELECT config FROM plugin_configs WHERE id = ?", [$pluginConfigId]);
+        if ($deleteFromS3) {
+            $linkedConfigs = $this->db->fetchAll("
+                SELECT pc.id, pc.name, pc.config
+                FROM repository_s3_configs rsc
+                JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
+                WHERE rsc.repository_id = ?
+            ", [$id]);
+            // Legacy form fallback: an explicit plugin_config_id with no link rows
+            if (empty($linkedConfigs) && !empty($_POST['plugin_config_id'])) {
+                $legacy = $this->db->fetchOne("SELECT id, name, config FROM plugin_configs WHERE id = ?", [(int) $_POST['plugin_config_id']]);
+                if ($legacy) $linkedConfigs = [$legacy];
+            }
             $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$agentId]);
 
-            if ($pluginConfig && $agent) {
-                $config = json_decode($pluginConfig['config'], true) ?: [];
+            if (!empty($linkedConfigs) && $agent) {
                 $s3Service = new S3SyncService();
-                $creds = $s3Service->resolveCredentials($config);
+                $s3Deleted = true;
+                foreach ($linkedConfigs as $pluginConfig) {
+                    $config = json_decode($pluginConfig['config'], true) ?: [];
+                    $creds = $s3Service->resolveCredentials($config);
 
-                $result = $s3Service->deleteFromS3($repo, $agent, $creds);
-                $s3Deleted = $result['success'];
+                    $result = $s3Service->deleteFromS3($repo, $agent, $creds);
+                    if (!$result['success']) $s3Deleted = false;
 
-                $this->db->insert('server_log', [
-                    'agent_id' => $agentId,
-                    'level' => $s3Deleted ? 'info' : 'warning',
-                    'message' => $s3Deleted
-                        ? "S3 data deleted for repository \"{$repo['name']}\""
-                        : "Failed to delete S3 data for repository \"{$repo['name']}\": " . ($result['output'] ?? 'Unknown error'),
-                ]);
+                    $this->db->insert('server_log', [
+                        'agent_id' => $agentId,
+                        'level' => $result['success'] ? 'info' : 'warning',
+                        'message' => $result['success']
+                            ? "S3 data deleted for repository \"{$repo['name']}\" at destination \"{$pluginConfig['name']}\""
+                            : "Failed to delete S3 data for repository \"{$repo['name']}\" at destination \"{$pluginConfig['name']}\": " . ($result['output'] ?? 'Unknown error'),
+                    ]);
+                }
             }
         }
 
@@ -649,62 +678,57 @@ class RepositoryController extends Controller
             ORDER BY created_at DESC LIMIT 1
         ", [$id, $archive['created_at']]);
 
-        // ClickHouse stats
+        // ClickHouse stats — only the queries that finish quickly run inline.
+        // The "deleted vs previous archive" summary used to run a large
+        // anti-join here and could add multiple seconds on archives with
+        // millions of files, blocking initial page render. It's now served
+        // by a separate AJAX endpoint (archiveDeletedSummary).
         $statusBreakdown = [];
         $largestFiles = [];
-        $deletedCount = 0;
-        $deletedSize = 0;
-        $deletedFiles = [];
         $clickhouseAvailable = false;
 
         try {
             $ch = \BBS\Core\ClickHouse::getInstance();
-            if ($ch->isAvailable()) {
-                $clickhouseAvailable = true;
-                $aid = (int) $agentId;
-                $arid = (int) $archiveId;
+            $clickhouseAvailable = $ch->isAvailable();
+        } catch (\Exception $e) {
+            // ClickHouse unreachable — both stat panels just stay empty.
+        }
 
-                // Files by status
+        if ($clickhouseAvailable && isset($ch)) {
+            $aid = (int) $agentId;
+            $arid = (int) $archiveId;
+
+            // Files by status — cheap: scans only this archive, groups by
+            // status. Wrapped in its own try so a failure here doesn't also
+            // sink the Largest Files panel (or vice versa).
+            try {
                 $statusBreakdown = $ch->fetchAll(
                     "SELECT status, count() as cnt, sum(file_size) as total_size
                      FROM file_catalog
                      WHERE agent_id = {$aid} AND archive_id = {$arid} AND path != ''
                      GROUP BY status ORDER BY cnt DESC"
                 );
+            } catch (\Exception $e) {
+                error_log("archiveDetail statusBreakdown query failed (agent_id={$aid}, archive_id={$arid}): " . $e->getMessage());
+            }
 
-                // Largest files
-                $largestFiles = $ch->fetchAll(
+            // Largest files. Exclude status='X' (entries borg saw but skipped
+            // via exclude patterns) so they don't dominate the list — their
+            // size is irrelevant to the archive (#132). Cast to FixedString
+            // to keep strict ClickHouse versions happy with the comparison
+            // against the FixedString(1) status column. Routed through
+            // fetchAllOrdered to dodge the CH 26.5 ORDER BY..LIMIT bug (#301).
+            try {
+                $largestFiles = $ch->fetchAllOrdered(
                     "SELECT path, file_name, file_size, status
                      FROM file_catalog
                      WHERE agent_id = {$aid} AND archive_id = {$arid} AND path != ''
+                       AND status != toFixedString('X', 1)
                      ORDER BY file_size DESC LIMIT 20"
                 );
-
-                // Deleted files (compared to previous archive)
-                if ($prevArchive) {
-                    $prevId = (int) $prevArchive['id'];
-                    $delSummary = $ch->fetchOne(
-                        "SELECT count() as cnt, sum(file_size) as total_size
-                         FROM file_catalog
-                         WHERE agent_id = {$aid} AND archive_id = {$prevId} AND path != ''
-                           AND path NOT IN (SELECT path FROM file_catalog WHERE agent_id = {$aid} AND archive_id = {$arid})"
-                    );
-                    $deletedCount = (int) ($delSummary['cnt'] ?? 0);
-                    $deletedSize = (int) ($delSummary['total_size'] ?? 0);
-
-                    if ($deletedCount > 0 && $deletedCount <= 10000) {
-                        $deletedFiles = $ch->fetchAll(
-                            "SELECT path, file_name, file_size
-                             FROM file_catalog
-                             WHERE agent_id = {$aid} AND archive_id = {$prevId} AND path != ''
-                               AND path NOT IN (SELECT path FROM file_catalog WHERE agent_id = {$aid} AND archive_id = {$arid})
-                             ORDER BY file_size DESC LIMIT 50"
-                        );
-                    }
-                }
+            } catch (\Exception $e) {
+                error_log("archiveDetail largestFiles query failed (agent_id={$aid}, archive_id={$arid}): " . $e->getMessage());
             }
-        } catch (\Exception $e) {
-            // ClickHouse unavailable
         }
 
         $this->view('repositories/archive_detail', [
@@ -719,11 +743,74 @@ class RepositoryController extends Controller
             'prevArchive' => $prevArchive,
             'statusBreakdown' => $statusBreakdown,
             'largestFiles' => $largestFiles,
-            'deletedCount' => $deletedCount,
-            'deletedSize' => $deletedSize,
-            'deletedFiles' => $deletedFiles,
             'clickhouseAvailable' => $clickhouseAvailable,
         ]);
+    }
+
+    /**
+     * GET /clients/{agentId}/repo/{id}/archive/{archiveId}/deleted-summary
+     * Returns {count, size} of files that existed in the previous archive
+     * but not this one. Deferred from the initial page render because the
+     * anti-join can be slow on large archives.
+     */
+    public function archiveDeletedSummary(int $agentId, int $id, int $archiveId): void
+    {
+        $this->requireAuth();
+        if (!$this->canAccessAgent($agentId)) {
+            $this->json(['error' => 'forbidden'], 403);
+        }
+
+        $archive = $this->db->fetchOne(
+            "SELECT id, created_at FROM archives WHERE id = ? AND repository_id = ?",
+            [$archiveId, $id]
+        );
+        if (!$archive) {
+            $this->json(['error' => 'not_found'], 404);
+        }
+
+        $prevArchive = $this->db->fetchOne("
+            SELECT id FROM archives
+            WHERE repository_id = ? AND created_at < ?
+            ORDER BY created_at DESC LIMIT 1
+        ", [$id, $archive['created_at']]);
+
+        if (!$prevArchive) {
+            $this->json(['count' => 0, 'size' => 0, 'has_prev' => false]);
+        }
+
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            if (!$ch->isAvailable()) {
+                $this->json(['count' => 0, 'size' => 0, 'has_prev' => true, 'error' => 'clickhouse_unavailable']);
+            }
+            $aid  = (int) $agentId;
+            $curr = (int) $archiveId;
+            $prev = (int) $prevArchive['id'];
+
+            // LEFT ANTI JOIN is what ClickHouse wants here — scans both archives
+            // once and streams paths that don't appear in the current archive.
+            // Much cheaper than NOT IN with a subquery on millions of rows.
+            $row = $ch->fetchOne(
+                "SELECT count() AS cnt, sum(file_size) AS total_size
+                 FROM (
+                     SELECT path, file_size
+                     FROM file_catalog
+                     WHERE agent_id = {$aid} AND archive_id = {$prev} AND path != ''
+                 ) AS prev
+                 LEFT ANTI JOIN (
+                     SELECT path
+                     FROM file_catalog
+                     WHERE agent_id = {$aid} AND archive_id = {$curr} AND path != ''
+                 ) AS curr USING (path)"
+            );
+            $this->json([
+                'count'    => (int) ($row['cnt'] ?? 0),
+                'size'     => (int) ($row['total_size'] ?? 0),
+                'has_prev' => true,
+            ]);
+        } catch (\Exception $e) {
+            $this->json(['count' => 0, 'size' => 0, 'has_prev' => true, 'error' => 'clickhouse_error']);
+        }
     }
 
     /**
@@ -762,39 +849,46 @@ class RepositoryController extends Controller
                 $this->json(['files' => [], 'total' => 0]);
             }
 
+            // All variable values are bound via the ClickHouse adapter's `?`
+            // parameter binding to prevent injection. Integer IDs are still
+            // interpolated directly (ints are cast above, safe by design).
+            $searchPattern = $search !== '' ? '%' . $search . '%' : null;
+
             // Deleted files = present in previous archive but not in current
             if ($status === 'deleted' && $prevArchiveId > 0) {
                 $where = "agent_id = {$aid} AND archive_id = {$prevArchiveId} AND path != ''
                           AND path NOT IN (SELECT path FROM file_catalog WHERE agent_id = {$aid} AND archive_id = {$arid})";
-                if ($search !== '') {
-                    $searchEsc = addslashes($search);
-                    $where .= " AND path LIKE '%{$searchEsc}%'";
+                $params = [];
+                if ($searchPattern !== null) {
+                    $where .= " AND path LIKE ?";
+                    $params[] = $searchPattern;
                 }
 
-                $countRow = $ch->fetchOne("SELECT count() as cnt FROM file_catalog WHERE {$where}");
+                $countRow = $ch->fetchOne("SELECT count() as cnt FROM file_catalog WHERE {$where}", $params);
                 $total = (int) ($countRow['cnt'] ?? 0);
 
-                $files = $ch->fetchAll("SELECT path, file_name, file_size, 'deleted' as status FROM file_catalog WHERE {$where} ORDER BY path LIMIT {$perPage} OFFSET {$offset}");
+                $files = $ch->fetchAllOrdered("SELECT path, file_name, file_size, 'deleted' as status FROM file_catalog WHERE {$where} ORDER BY path LIMIT {$perPage} OFFSET {$offset}", $params);
             } else {
                 $where = "agent_id = {$aid} AND archive_id = {$arid} AND path != ''";
+                $params = [];
                 // Filter out non-file statuses unless specifically requested
                 $nonFileStatuses = ['D', 'S', 'H', 'X', 'B', 'F', 'E'];
                 if ($status !== '' && !in_array($status, $nonFileStatuses)) {
-                    $statusEsc = addslashes($status);
-                    $where .= " AND status = '{$statusEsc}'";
+                    $where .= " AND status = ?";
+                    $params[] = $status;
                 } elseif ($status === '') {
                     // "All" tab: only show real files
                     $where .= " AND status NOT IN ('D','S','H','X','B','F','E')";
                 }
-                if ($search !== '') {
-                    $searchEsc = addslashes($search);
-                    $where .= " AND path LIKE '%{$searchEsc}%'";
+                if ($searchPattern !== null) {
+                    $where .= " AND path LIKE ?";
+                    $params[] = $searchPattern;
                 }
 
-                $countRow = $ch->fetchOne("SELECT count() as cnt FROM file_catalog WHERE {$where}");
+                $countRow = $ch->fetchOne("SELECT count() as cnt FROM file_catalog WHERE {$where}", $params);
                 $total = (int) ($countRow['cnt'] ?? 0);
 
-                $files = $ch->fetchAll("SELECT path, file_name, file_size, status FROM file_catalog WHERE {$where} ORDER BY path LIMIT {$perPage} OFFSET {$offset}");
+                $files = $ch->fetchAllOrdered("SELECT path, file_name, file_size, status FROM file_catalog WHERE {$where} ORDER BY path LIMIT {$perPage} OFFSET {$offset}", $params);
             }
 
             $this->json(['files' => $files, 'total' => $total, 'page' => $page]);
@@ -1005,26 +1099,30 @@ class RepositoryController extends Controller
             ORDER BY queued_at DESC LIMIT 20
         ", [$id]);
 
-        // Check if repo has S3 sync enabled (via repository_s3_configs) — only for local repos
-        $s3SyncInfo = null;
+        // S3 destinations linked to this repo (a repo can replicate to
+        // several, #263) — only for local repos
+        $s3SyncConfigs = [];
         $s3PluginConfigs = [];
         if (($repo['storage_type'] ?? 'local') === 'local') {
-            $s3SyncInfo = $this->db->fetchOne("
+            $s3SyncConfigs = $this->db->fetchAll("
                 SELECT rsc.plugin_config_id, pc.name as config_name,
                        rsc.last_sync_at as last_s3_sync, rsc.enabled
                 FROM repository_s3_configs rsc
                 JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
                 WHERE rsc.repository_id = ?
+                ORDER BY pc.name
             ", [$id]);
 
-            // Get available S3 plugin configs for this agent (for "Enable S3 Sync" option)
+            // S3 plugin configs for this agent not yet linked to this repo
+            // (candidates for "Add destination")
             $s3PluginConfigs = $this->db->fetchAll("
                 SELECT pc.id, pc.name
                 FROM plugin_configs pc
                 JOIN plugins p ON p.id = pc.plugin_id
                 WHERE p.slug = 's3_sync' AND pc.agent_id = ?
+                  AND pc.id NOT IN (SELECT plugin_config_id FROM repository_s3_configs WHERE repository_id = ?)
                 ORDER BY pc.name
-            ", [$agentId]);
+            ", [$agentId, $id]);
         }
 
         // Check for active jobs on this repo
@@ -1070,7 +1168,7 @@ class RepositoryController extends Controller
             'archives' => $archives,
             'plans' => $plans,
             'recentJobs' => $recentJobs,
-            's3SyncInfo' => $s3SyncInfo,
+            's3SyncConfigs' => $s3SyncConfigs,
             's3PluginConfigs' => $s3PluginConfigs,
             'activeJob' => $activeJob,
             'totalSize' => $totalSize,
@@ -1110,12 +1208,27 @@ class RepositoryController extends Controller
         // Require repo_maintenance permission for S3 restore
         $this->requirePermission(PermissionService::REPO_MAINTENANCE, $agentId);
 
-        // Get S3 config for this repo from repository_s3_configs
-        $s3Config = $this->db->fetchOne("
-            SELECT plugin_config_id
-            FROM repository_s3_configs
-            WHERE repository_id = ?
-        ", [$id]);
+        // Which destination to restore from: the posted one, validated
+        // against this repo's links — or the repo's only destination
+        $requestedConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
+        if ($requestedConfigId > 0) {
+            $s3Config = $this->db->fetchOne("
+                SELECT plugin_config_id
+                FROM repository_s3_configs
+                WHERE repository_id = ? AND plugin_config_id = ?
+            ", [$id, $requestedConfigId]);
+        } else {
+            $links = $this->db->fetchAll("
+                SELECT plugin_config_id
+                FROM repository_s3_configs
+                WHERE repository_id = ?
+            ", [$id]);
+            if (count($links) > 1) {
+                $this->flash('danger', 'This repository syncs to multiple S3 destinations — pick which one to restore from.');
+                $this->redirect("/clients/{$agentId}/repo/{$id}");
+            }
+            $s3Config = $links[0] ?? null;
+        }
 
         if (!$s3Config) {
             $this->flash('danger', 'This repository does not have S3 sync configured.');
@@ -1373,20 +1486,18 @@ class RepositoryController extends Controller
             $this->redirect("/clients/{$agentId}/repo/{$id}");
         }
 
-        // Check if config already exists for this repo
+        // A repo can replicate to several destinations — add this one if
+        // it isn't linked yet, re-enable it if it is
         $existing = $this->db->fetchOne(
-            "SELECT id FROM repository_s3_configs WHERE repository_id = ?",
-            [$id]
+            "SELECT id, enabled FROM repository_s3_configs WHERE repository_id = ? AND plugin_config_id = ?",
+            [$id, $pluginConfigId]
         );
 
         if ($existing) {
-            // Update existing config
             $this->db->update('repository_s3_configs', [
-                'plugin_config_id' => $pluginConfigId,
                 'enabled' => 1,
             ], 'id = ?', [$existing['id']]);
         } else {
-            // Create new config
             $this->db->insert('repository_s3_configs', [
                 'repository_id' => $id,
                 'plugin_config_id' => $pluginConfigId,
@@ -1397,10 +1508,10 @@ class RepositoryController extends Controller
         $this->db->insert('server_log', [
             'agent_id' => $agentId,
             'level' => 'info',
-            'message' => "S3 sync enabled for repository \"{$repo['name']}\" using config \"{$pluginConfig['name']}\"",
+            'message' => "S3 sync enabled for repository \"{$repo['name']}\" to destination \"{$pluginConfig['name']}\"",
         ]);
 
-        $this->flash('success', "S3 sync enabled for repository \"{$repo['name']}\".");
+        $this->flash('success', "S3 destination \"{$pluginConfig['name']}\" added for repository \"{$repo['name']}\".");
         $this->redirect("/clients/{$agentId}/repo/{$id}");
     }
 
@@ -1420,16 +1531,25 @@ class RepositoryController extends Controller
 
         $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
 
-        // Delete the S3 config (data remains in S3 bucket)
-        $this->db->delete('repository_s3_configs', 'repository_id = ?', [$id]);
+        // Remove one destination when specified, all of them otherwise
+        // (data remains in the S3 bucket either way)
+        $pluginConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
+        $destLabel = '';
+        if ($pluginConfigId > 0) {
+            $dest = $this->db->fetchOne("SELECT name FROM plugin_configs WHERE id = ?", [$pluginConfigId]);
+            $destLabel = $dest ? " to \"{$dest['name']}\"" : '';
+            $this->db->delete('repository_s3_configs', 'repository_id = ? AND plugin_config_id = ?', [$id, $pluginConfigId]);
+        } else {
+            $this->db->delete('repository_s3_configs', 'repository_id = ?', [$id]);
+        }
 
         $this->db->insert('server_log', [
             'agent_id' => $agentId,
             'level' => 'info',
-            'message' => "S3 sync disabled for repository \"{$repo['name']}\" (data remains in S3)",
+            'message' => "S3 sync{$destLabel} disabled for repository \"{$repo['name']}\" (data remains in S3)",
         ]);
 
-        $this->flash('success', "S3 sync disabled for repository \"{$repo['name']}\". Data remains in S3.");
+        $this->flash('success', "S3 sync{$destLabel} disabled for repository \"{$repo['name']}\". Data remains in S3.");
         $this->redirect("/clients/{$agentId}/repo/{$id}");
     }
 
@@ -1515,7 +1635,7 @@ class RepositoryController extends Controller
 
             $localPath = rtrim($location['path'], '/') . '/' . $agentId . '/' . $name;
 
-            $helperCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'verify-repo', $passphrase, $localPath];
+            $helperCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'verify-repo', '-', $localPath];
             $proc = proc_open($helperCmd, [
                 0 => ['pipe', 'r'],
                 1 => ['pipe', 'w'],
@@ -1526,6 +1646,7 @@ class RepositoryController extends Controller
             $stderr = '';
             $exitCode = -1;
             if (is_resource($proc)) {
+                fwrite($pipes[0], ($passphrase ?? '') . "\n");
                 fclose($pipes[0]);
                 $output = stream_get_contents($pipes[1]);
                 $stderr = stream_get_contents($pipes[2]);
@@ -1620,6 +1741,8 @@ class RepositoryController extends Controller
 
         if ($storageType === 'remote_ssh') {
             $this->importRemoteSsh($agentId, $name, $encryption, $passphrase, $remoteSshConfigId);
+        } else {
+            $this->importLocal($agentId, $agent, $name, $encryption, $passphrase, $storageLocationId);
         }
     }
 
@@ -1762,5 +1885,324 @@ class RepositoryController extends Controller
 
         $this->flash('success', "Repository \"{$name}\" imported from {$config['remote_host']}. A catalog sync has been queued.");
         $this->redirect("/clients/{$agentId}?tab=repos");
+    }
+
+    /**
+     * Resolve a local storage location with the same fallback chain used by
+     * repo creation and import: explicit id → default row → storage_path setting.
+     */
+    private function resolveLocalLocation(?int $storageLocationId): array
+    {
+        $location = null;
+        if ($storageLocationId) {
+            $location = $this->db->fetchOne("SELECT * FROM storage_locations WHERE id = ?", [$storageLocationId]);
+        }
+        if (!$location) {
+            $location = $this->db->fetchOne("SELECT * FROM storage_locations WHERE is_default = 1");
+        }
+        if (!$location) {
+            $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
+            $location = ['id' => null, 'path' => $storageSetting['value'] ?? '/var/bbs', 'is_default' => 1];
+        }
+        return $location;
+    }
+
+    /**
+     * Run a bbs-ssh-helper command, returning [exitCode, stdout, stderr].
+     */
+    private function runHelper(array $args, ?string $stdin = null): array
+    {
+        $cmd = array_merge(['sudo', '/usr/local/bin/bbs-ssh-helper'], $args);
+        $proc = proc_open($cmd, [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ], $pipes);
+        if (!is_resource($proc)) {
+            return [-1, '', 'failed to start helper'];
+        }
+        if ($stdin !== null) {
+            fwrite($pipes[0], $stdin);
+        }
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit = proc_close($proc);
+        return [$exit, $stdout, $stderr];
+    }
+
+    /**
+     * All canonical local-repo directories currently registered, so scans
+     * can hide repos BBS already knows about.
+     */
+    private function registeredLocalRepoPaths(): array
+    {
+        $default = $this->resolveLocalLocation(null);
+        $rows = $this->db->fetchAll(
+            "SELECT r.agent_id, r.name, sl.path AS loc_path
+             FROM repositories r
+             LEFT JOIN storage_locations sl ON sl.id = r.storage_location_id
+             WHERE r.storage_type = 'local'"
+        );
+        $paths = [];
+        foreach ($rows as $r) {
+            $base = rtrim($r['loc_path'] ?: $default['path'], '/');
+            $paths[] = "{$base}/{$r['agent_id']}/{$r['name']}";
+        }
+        return $paths;
+    }
+
+    /**
+     * Validate that a scan/adopt source path is inside a configured storage
+     * location (or the default storage path) and free of traversal tricks.
+     * Returns the normalized path, or null if invalid.
+     */
+    private function validateSourcePath(string $path): ?string
+    {
+        $path = rtrim(trim($path), '/');
+        if ($path === '' || $path[0] !== '/' || str_contains($path, '..')) {
+            return null;
+        }
+        $bases = array_map(
+            fn($l) => rtrim($l['path'], '/'),
+            $this->db->fetchAll("SELECT path FROM storage_locations")
+        );
+        $bases[] = rtrim($this->resolveLocalLocation(null)['path'], '/');
+        foreach ($bases as $base) {
+            if ($base !== '' && str_starts_with($path . '/', $base . '/')) {
+                return $path;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * AJAX: Scan storage locations for borg repositories BBS doesn't know about.
+     * POST /repositories/scan
+     */
+    public function scanRepos(): void
+    {
+        $this->requireAuth();
+        if (!$this->isAdmin()) {
+            $this->json(['status' => 'error', 'error' => 'Admin access required.'], 403);
+            return;
+        }
+
+        $locations = $this->db->fetchAll("SELECT * FROM storage_locations ORDER BY is_default DESC, label");
+        if (empty($locations)) {
+            $locations = [$this->resolveLocalLocation(null) + ['label' => 'Default storage']];
+        }
+
+        $registered = $this->registeredLocalRepoPaths();
+        $candidates = [];
+
+        foreach ($locations as $loc) {
+            [$exit, $out, ] = $this->runHelper(['find-repos', rtrim($loc['path'], '/')]);
+            if ($exit !== 0) {
+                continue; // location missing on disk etc. — skip silently
+            }
+            foreach (explode("\n", trim($out)) as $line) {
+                if ($line === '') continue;
+                $repo = json_decode($line, true);
+                if (!is_array($repo) || empty($repo['path'])) continue;
+                $normalized = rtrim($repo['path'], '/');
+                if (in_array($normalized, $registered, true)) continue;
+
+                $candidates[] = [
+                    'path' => $normalized,
+                    'name' => $repo['name'] ?? basename($normalized),
+                    'size_bytes' => (int) ($repo['size_bytes'] ?? 0),
+                    'size_label' => \BBS\Services\ServerStats::formatBytes((int) ($repo['size_bytes'] ?? 0)),
+                    'modified' => !empty($repo['mtime']) ? date('Y-m-d H:i', (int) $repo['mtime']) : '',
+                    'key_in_repo' => (int) ($repo['key_in_repo'] ?? 0) === 1,
+                    'storage_location_id' => $loc['id'] ?? null,
+                    'location_label' => $loc['label'] ?? '',
+                ];
+            }
+        }
+
+        $this->json(['status' => 'ok', 'candidates' => $candidates]);
+    }
+
+    /**
+     * AJAX: Verify an adoption candidate and preview the move it requires.
+     * Returns a plain-language statement of exactly what will happen —
+     * source path, destination path, rename vs copy, sizes, free space.
+     * POST /repositories/adopt/verify
+     */
+    public function verifyAdopt(): void
+    {
+        $this->requireAuth();
+        if (!$this->isAdmin()) {
+            $this->json(['status' => 'error', 'error' => 'Admin access required.'], 403);
+            return;
+        }
+
+        $agentId = (int) ($_POST['agent_id'] ?? 0);
+        $name = $this->sanitizePathName(trim($_POST['name'] ?? ''));
+        $passphrase = $_POST['passphrase'] ?? '';
+        $storageLocationId = !empty($_POST['storage_location_id']) ? (int) $_POST['storage_location_id'] : null;
+        $sourcePath = $this->validateSourcePath($_POST['source_path'] ?? '');
+
+        if (empty($name) || empty($agentId)) {
+            $this->json(['status' => 'error', 'error' => 'Repository name and client are required. Names can only contain letters, numbers, hyphens, and underscores.']);
+            return;
+        }
+        if ($sourcePath === null) {
+            $this->json(['status' => 'error', 'error' => 'Source path must be inside a configured storage location.']);
+            return;
+        }
+
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$agentId]);
+        if (!$agent || !$this->canAccessAgent($agentId)) {
+            $this->json(['status' => 'error', 'error' => 'Access denied.']);
+            return;
+        }
+
+        $existing = $this->db->fetchOne(
+            "SELECT id FROM repositories WHERE agent_id = ? AND name = ?",
+            [$agentId, $name]
+        );
+        if ($existing) {
+            $this->json(['status' => 'error', 'error' => "A repository named \"{$name}\" already exists for this client."]);
+            return;
+        }
+
+        // Verify it's a real borg repo and the passphrase works
+        [$exit, $out, $err] = $this->runHelper(['verify-repo', '-', $sourcePath], $passphrase . "\n");
+        if ($exit !== 0) {
+            $errorMsg = trim($err ?: $out);
+            if (str_contains($errorMsg, 'passphrase') || str_contains($errorMsg, 'Passphrase')) {
+                $errorMsg = 'Incorrect passphrase for this repository.';
+            } elseif (stripos($errorMsg, 'key file') !== false || stripos($errorMsg, 'keyfile') !== false) {
+                $errorMsg = 'This repository uses keyfile encryption — its key is stored outside the repository '
+                    . '(in ~/.config/borg/keys on the machine that created it) and was not found. '
+                    . 'Migrate the key file first, or export/import the key with borg key export/import.';
+            } elseif (str_contains($errorMsg, 'not a valid repository') || str_contains($errorMsg, 'does not exist')) {
+                $errorMsg = "No valid borg repository found at: {$sourcePath}";
+            }
+            $this->json(['status' => 'error', 'error' => $errorMsg ?: 'Failed to verify repository.']);
+            return;
+        }
+
+        $infoData = json_decode($out, true);
+        if (!$infoData) {
+            $this->json(['status' => 'error', 'error' => 'Failed to parse repository info. Is this a valid borg repository?']);
+            return;
+        }
+        $encryption = $infoData['encryption']['mode'] ?? 'unknown';
+        if (str_starts_with($encryption, 'keyfile')) {
+            $this->json(['status' => 'error', 'error' => 'This repository uses keyfile encryption — the key lives outside the repository, so backups and restores would fail after adoption. Convert it to repokey (borg key change-location) before importing.']);
+            return;
+        }
+        $archiveCount = count($infoData['archives'] ?? []);
+
+        // Destination and move preview
+        $location = $this->resolveLocalLocation($storageLocationId);
+        $destPath = rtrim($location['path'], '/') . '/' . $agentId . '/' . $name;
+
+        $move = [
+            'from' => $sourcePath,
+            'to' => $destPath,
+            'required' => $sourcePath !== $destPath,
+            'same_fs' => true,
+            'fits' => true,
+            'size_label' => '',
+            'free_label' => '',
+        ];
+
+        if ($move['required']) {
+            [$mExit, $mOut, $mErr] = $this->runHelper(['check-move', $sourcePath, $destPath]);
+            $check = $mExit === 0 ? json_decode(trim($mOut), true) : null;
+            if (!is_array($check)) {
+                $this->json(['status' => 'error', 'error' => 'Could not check the move: ' . trim($mErr ?: $mOut)]);
+                return;
+            }
+            $move['same_fs'] = (int) $check['same_fs'] === 1;
+            $move['fits'] = (int) $check['fits'] === 1;
+            $move['size_label'] = \BBS\Services\ServerStats::formatBytes((int) $check['src_bytes']);
+            $move['free_label'] = \BBS\Services\ServerStats::formatBytes((int) $check['free_bytes']);
+        }
+
+        $this->json([
+            'status' => 'ok',
+            'encryption' => $encryption,
+            'archive_count' => $archiveCount,
+            'move' => $move,
+        ]);
+    }
+
+    /**
+     * Adopt a repository found by scan: move it into the canonical
+     * <storage location>/<agent_id>/<name> spot, then register it exactly
+     * like a normal import (perms, ssh-gate paths, catalog sync).
+     * POST /repositories/adopt
+     */
+    public function adopt(): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        $agentId = (int) ($_POST['agent_id'] ?? 0);
+        $name = $this->sanitizePathName(trim($_POST['name'] ?? ''));
+        $encryption = $_POST['encryption'] ?? 'unknown';
+        $passphrase = $_POST['passphrase'] ?? '';
+        $storageLocationId = !empty($_POST['storage_location_id']) ? (int) $_POST['storage_location_id'] : null;
+        $sourcePath = $this->validateSourcePath($_POST['source_path'] ?? '');
+
+        if (!$this->isAdmin()) {
+            $this->flash('danger', 'Admin access required.');
+            $this->redirect("/clients/{$agentId}?tab=repos");
+            return;
+        }
+        if (empty($name) || empty($agentId) || $sourcePath === null) {
+            $this->flash('danger', 'Repository name, client, and a valid source path are required.');
+            $this->redirect("/clients/{$agentId}?tab=repos");
+            return;
+        }
+
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$agentId]);
+        if (!$agent || !$this->canAccessAgent($agentId)) {
+            $this->flash('danger', 'Access denied.');
+            $this->redirect('/clients');
+            return;
+        }
+        $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
+
+        $existing = $this->db->fetchOne(
+            "SELECT id FROM repositories WHERE agent_id = ? AND name = ?",
+            [$agentId, $name]
+        );
+        if ($existing) {
+            $this->flash('warning', "Repository \"{$name}\" already exists.");
+            $this->redirect("/clients/{$agentId}?tab=repos");
+            return;
+        }
+
+        $location = $this->resolveLocalLocation($storageLocationId);
+        $destPath = rtrim($location['path'], '/') . '/' . $agentId . '/' . $name;
+
+        if ($sourcePath !== $destPath) {
+            // Cross-filesystem moves copy the whole repo — don't let PHP's
+            // execution limit kill it halfway.
+            set_time_limit(0);
+            [$exit, $out, $err] = $this->runHelper(['move-repo', $sourcePath, $destPath]);
+            if ($exit !== 0) {
+                $this->flash('danger', 'Move failed — repository was NOT imported: ' . trim($err ?: $out));
+                $this->redirect("/clients/{$agentId}?tab=repos");
+                return;
+            }
+            $this->db->insert('server_log', [
+                'agent_id' => $agentId,
+                'level' => 'info',
+                'message' => "Repository \"{$name}\" moved for adoption: {$sourcePath} -> {$destPath}",
+            ]);
+        }
+
+        // From here the repo sits at the canonical path — register it through
+        // the standard import path (DB row, perms, ssh-gate paths, catalog sync).
+        $this->importLocal($agentId, $agent, $name, $encryption, $passphrase, $storageLocationId);
     }
 }

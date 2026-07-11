@@ -1,6 +1,45 @@
+/* Card header gradient — used on dashboard / schedules / archive detail.
+   In DARK mode this is the signature deep-navy hero header; in LIGHT mode
+   it intentionally collapses to the same neutral surface as the standard
+   .card-header so the page palette stays cohesive — no jarring dark
+   block sitting in an otherwise light layout. */
+.card-head-gradient {
+    background-color: #f1f3f5;
+    color: var(--bs-body-color);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+.card-head-gradient i { color: var(--bs-primary); }
+[data-bs-theme="dark"] .card-head-gradient {
+    /* Flat — same #202b3f used by .card-header in dark mode so every
+       header on every page is visually identical. */
+    background: #202b3f;
+    color: #fff;
+    border-bottom: 1px solid rgb(24 24 25);
+}
+[data-bs-theme="dark"] .card-head-gradient .text-muted { color: rgba(255, 255, 255, 0.7) !important; }
+[data-bs-theme="dark"] .card-head-gradient i { color: #9ec5fe; }
+
+/* The previous .metric-tile / .v2 .metric-tile rule set was retired in
+   2.53.x — all stat blocks now use the icon-on-left card pattern (see
+   .metric-card-* and .stat-icon below). */
+
+/* Global dropdown + tooltip escape fix. Issue #161 and several predecessors:
+   Bootstrap cards and other containers use overflow:hidden (for rounded
+   corners), which clips dropdown menus that pop out of them. The
+   companion JS in layouts/app.php sets data-bs-strategy="fixed" on every
+   dropdown so Popper uses position:fixed and the menu renders in the
+   top-level stacking context. This rule guarantees the menu sits above
+   everything else once it's shown. */
+.dropdown-menu.show,
+.tooltip.show,
+.popover.show {
+    z-index: 2147483647 !important;
+}
+
 /* Font & nav color variables */
 :root {
     --bs-body-font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    --bs-box-shadow-sm: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.375);
     --bbs-nav-bg: #2c3e50;
     --bbs-nav-color: rgba(255, 255, 255, 0.7);
     --bbs-nav-hover-bg: rgba(255, 255, 255, 0.1);
@@ -148,14 +187,29 @@ html, body {
 
 /* Sidebar */
 .sidebar {
-    width: 90px;
-    height: calc(100vh - 56px);
+    width: 98px;
+    height: calc(100vh - 64px);
     background-color: var(--bbs-nav-bg);
     position: fixed;
-    top: 56px;
+    top: 64px;
     left: 0;
     overflow-y: auto;
     z-index: 1020;
+}
+
+/* Version pill at the bottom of the sidebar. The sidebar background is
+   always dark navy regardless of theme (--bbs-nav-bg = #2c3e50 light /
+   #16191d dark), so the pill uses light-on-dark colors hardcoded. The
+   previous Bootstrap text-body-secondary token resolved to a midtone
+   gray in light mode, which read as illegible against the dark navy. */
+.sidebar-version-pill {
+    color: rgba(255, 255, 255, 0.78);
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    font-weight: 500;
+    font-size: 0.65rem;
+    padding: 3px 9px;
+    letter-spacing: 0.02em;
 }
 
 .sidebar-link {
@@ -188,7 +242,7 @@ html, body {
 
 /* Topbar */
 .topbar {
-    height: 56px;
+    height: 64px;
     background-color: var(--bbs-topbar-bg);
     position: fixed;
     top: 0;
@@ -196,10 +250,21 @@ html, body {
     right: 0;
     z-index: 1030;
     padding-left: 0 !important;
+    /* Allow the mascot logo to hang below the topbar so the robot's
+       hands appear to grab the edge of the page header. */
+    overflow: visible;
 }
 
 .main-content {
-    margin-top: 56px;
+    margin-top: 64px;
+    /* Without min-width:0 a flex child default-sizes to its content's
+       intrinsic width, so a single long unbreakable string (a borg file
+       path, a sidebar progress message) anywhere on the page can blow
+       the column past the viewport and trigger horizontal scroll
+       (#108, #209, #233). min-width:0 lets the column shrink and lets
+       descendants like .text-truncate / overflow-wrap actually do their
+       jobs. */
+    min-width: 0;
 }
 
 .topbar .navbar-text {
@@ -218,12 +283,45 @@ html, body {
 
 .topbar .navbar-brand {
     background-color: transparent;
-    height: 56px;
+    height: 64px;
     flex-shrink: 0;
+    position: relative;
+    overflow: visible;
 }
 
 .topbar-logo {
-    width: 90px;
+    width: 98px;
+    overflow: visible;
+}
+
+/* Mascot logo. Width-anchored at ~97px so it sits close to the 90px
+   sidebar column with just a few pixels of overflow on the right.
+   At the artwork's 3:2 aspect this gives ~65px tall — barely past
+   the 64px topbar, so the robot's hands appear to brush the edge
+   between the topbar and the page content without dominating.
+   pointer-events: none keeps the navbar-brand link clickable. */
+.topbar-mascot {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 115px;
+    height: auto;
+    z-index: 1031;
+    pointer-events: none;
+}
+
+/* Custom brand logos uploaded via Settings → Branding don't share the
+   default mascot's "peek over the edge of the topbar" geometry. They get
+   constrained to the navbar height and contained without distortion (#261). */
+.topbar-brand-logo {
+    max-height: 58px;
+    max-width: 92px;
+    height: auto;
+    width: auto;
+    padding: 3px;
+    object-fit: contain;
+    z-index: 1031;
+    pointer-events: none;
 }
 
 /* Mobile bottom navigation */
@@ -239,7 +337,10 @@ html, body {
     z-index: 1040;
     padding: 4px 0;
     padding-bottom: calc(4px + env(safe-area-inset-bottom));
-    box-shadow: 0 -2px 10px rgba(0,0,0,0.15);
+    /* Thin lighter top border for definition against the page, plus a
+       stronger upward shadow so the bar clearly separates from content. */
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.35), 0 -1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .mobile-nav-item {
@@ -254,6 +355,10 @@ html, body {
     transition: color 0.2s;
     flex: 1;
     text-align: center;
+    /* Reset <button> defaults so the More trigger looks identical to the <a> items */
+    background: transparent;
+    border: 0;
+    font-family: inherit;
 }
 
 .mobile-nav-item i {
@@ -269,10 +374,28 @@ html, body {
     color: var(--bbs-nav-hover-color);
 }
 
+/* Mobile "More" bottom sheet — auto-size to content so it doesn't grab the
+   whole screen for just a handful of items. Extra padding at the bottom
+   keeps the last row above the phone's home indicator. */
+.offcanvas-bottom.mobile-more-sheet {
+    height: auto;
+    max-height: 70vh;
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+}
+.offcanvas-bottom.mobile-more-sheet .offcanvas-body {
+    padding-bottom: env(safe-area-inset-bottom);
+}
+.offcanvas-bottom.mobile-more-sheet .list-group-item {
+    padding: 0.85rem 1rem;
+    border-left: 0;
+    border-right: 0;
+}
+
 /* Offset main content for fixed sidebar on desktop */
 @media (min-width: 768px) {
     .main-content {
-        margin-left: 90px;
+        margin-left: 98px;
     }
 }
 
@@ -283,39 +406,47 @@ html, body {
         min-width: 0;
         overflow-x: hidden;
     }
+    /* Hide the logo entirely on mobile — bottom-nav handles navigation
+       and the page-title gets the full topbar width. */
+    .topbar .navbar-brand,
     .topbar-logo {
-        width: 64px;
-        padding: 0 8px !important;
+        display: none !important;
     }
-    .topbar .navbar-brand {
-        width: 64px;
-        padding: 0 !important;
-    }
-    .topbar .navbar-brand img {
-        height: 28px !important;
+    .topbar .navbar-text {
+        margin-left: 0.75rem !important;
     }
 }
 
-/* Stat cards */
+/* Stat cards. Hover effect uses box-shadow only — NOT transform.
+   A `transform` on a parent creates a new stacking context, which traps
+   `position: fixed` dropdown menus inside the card and defeats the
+   global dropdown escape fix (issue #161). */
 .stat-card {
-    transition: transform 0.15s;
+    transition: box-shadow 0.15s;
 }
 
 .stat-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 .25rem .75rem rgba(0,0,0,.15) !important;
+    box-shadow: 0 .35rem 1rem rgba(0,0,0,.18) !important;
 }
 
 a .stat-card {
     cursor: pointer;
 }
 
-/* Tables */
+/* Tables. Headers AND body cells both use 0.775rem site-wide; cell padding
+   tightened from Bootstrap's default 0.5rem to 0.3rem so rows pack denser
+   without changing the row layout. Headers are mixed case (not ALL CAPS). */
+.table {
+    font-size: 0.775rem;
+}
+.table > :not(caption) > * > * {
+    padding: 0.3rem 0.3rem;
+}
 .table th {
     font-weight: 600;
-    font-size: 0.85rem;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    font-size: 0.775rem;
+    text-transform: none;
+    letter-spacing: 0;
     color: #6c757d;
 }
 
@@ -330,9 +461,16 @@ a .stat-card {
     font-size: 0.7rem;
 }
 
-/* Badge overrides */
+/* Badge / pill overrides — site-wide consistency.
+   - font-weight 500 (not bold) so badges read as labels, not emphasis.
+   - text-transform: capitalize gives every pill Title Case without having
+     to touch each rendering site (CSS leaves acronyms and already-cap
+     characters alone, so "API" stays "API" and "S3 sync" becomes "S3 Sync").
+   Per-page .text-uppercase overrides still win if a view needs the caps
+   look (e.g. the dashboard section labels). */
 .badge {
     font-weight: 500;
+    text-transform: capitalize;
 }
 
 /* Login page */
@@ -347,8 +485,22 @@ body.bg-body-secondary {
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06), 0 0 12px rgba(0, 0, 0, 0.03);
 }
 
+/* Standard card-header — subtle neutral surface in both themes so every
+   card on every page has the same visual treatment unless it's an
+   explicit "hero" card (.card-head-gradient) or a status alert
+   (.bg-warning / .bg-danger). Was previously inconsistent: settings used
+   bg-primary bg-opacity-10 (light blue), clients used bg-body
+   (transparent), dashboard used card-head-gradient (dark navy). */
 .card-header {
-    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+    background-color: #f1f3f5;
+    color: var(--bs-body-color);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    /* Shrunk from Bootstrap's default 1rem to ~14px (0.875rem) site-wide
+       per UX feedback — the previous size felt too heavy for headers
+       that mostly carry a title + an icon. Applies to all pages
+       (dashboard, schedules, settings, etc.); wins over Bootstrap's
+       default without per-card overrides. */
+    font-size: 0.875rem;
 }
 
 .card.card-no-outline {
@@ -437,7 +589,9 @@ body.bg-body-secondary {
     border-bottom: 2px solid var(--bs-border-color);
     padding-bottom: 0;
     flex-wrap: nowrap;
-    overflow-x: hidden;
+    /* No overflow clipping: setting overflow-x makes the browser compute
+       overflow-y to 'auto', and the nav-links' -2px margin-bottom then
+       triggers a stray vertical scrollbar on the sub-nav bar (#323). */
 }
 .storage-subnav .nav-link {
     color: var(--bs-secondary-color);
@@ -480,15 +634,17 @@ body.bg-body-secondary {
     flex-shrink: 0;
 }
 
-/* Repo cards - dark header style */
+/* Repo cards - dark header style. Hover uses box-shadow only — NOT
+   transform. A `transform` creates a stacking context that traps
+   `position: fixed` dropdown menus inside the card, defeating the
+   global dropdown escape fix (issue #161). */
 .repo-card {
-    transition: transform 0.15s;
+    transition: box-shadow 0.15s;
     overflow: visible !important;
 }
 
 .repo-card:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 .2rem .5rem rgba(0,0,0,.1) !important;
+    box-shadow: 0 .25rem .75rem rgba(0,0,0,.14) !important;
 }
 
 .repo-card .dropdown-menu {
@@ -523,14 +679,14 @@ body.bg-body-secondary {
     background: linear-gradient(135deg, #4a6a8a 0%, #3a5570 100%);
 }
 
-/* Schedule cards */
+/* Schedule cards. Hover uses box-shadow only (see repo-card note). */
 .schedule-card {
     overflow: visible !important;
-    transition: transform 0.15s;
+    transition: box-shadow 0.15s;
 }
 
 .schedule-card:hover {
-    transform: translateY(-1px);
+    box-shadow: 0 .25rem .75rem rgba(0,0,0,.14) !important;
 }
 
 .schedule-card .dropdown-menu {
@@ -832,16 +988,24 @@ body.bg-body-secondary {
 [data-bs-theme="dark"] .card {
     border: 1px solid rgba(255, 255, 255, 0.05) !important;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-    background-color: #212529;
+    background-color: #111214;
 }
 
 [data-bs-theme="dark"] .card-header {
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    background-color: #212529;
+    /* Universal dark-mode header color — also applied to
+       .card-head-gradient below, plus .table th, so every header on
+       every page is visually identical. */
+    background-color: #202b3f;
+    color: #fff;
+    border-bottom: 1px solid rgb(24 24 25);
 }
 
 [data-bs-theme="dark"] .table th {
-    color: #8b929a;
+    /* Match the card header color so a table on a page reads as a
+       continuation of the header above it. */
+    background-color: #202b3f;
+    color: #d6dbe1;
+    border-bottom-color: rgb(24 24 25);
 }
 
 [data-bs-theme="dark"] .table-light {
@@ -923,6 +1087,12 @@ body.bg-body-secondary {
 [data-bs-theme="dark"] .metric-card-success { background-color: rgba(25,135,84,0.08); }
 [data-bs-theme="dark"] .metric-card-warning { background-color: rgba(255,193,7,0.08); }
 [data-bs-theme="dark"] .metric-card-danger { background-color: rgba(220,53,69,0.08); }
+
+/* Anchor wrapper for clickable metric cards (e.g. dashboard hero tiles).
+   Lifts the inner card on hover so it still feels interactive even though
+   the card markup is the same as the non-clickable /clients tiles. */
+.metric-card-link .card { transition: transform 0.15s ease, filter 0.15s ease; }
+.metric-card-link:hover .card { transform: translateY(-1px); filter: brightness(1.05); }
 
 /* Dashed placeholder / "add" cards */
 .card-dashed {

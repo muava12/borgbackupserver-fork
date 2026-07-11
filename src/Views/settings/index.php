@@ -1,13 +1,8 @@
 <?php
+// The 'remote' / 'offsite' / 'storage' tab redirect to /storage-locations
+// is handled in SettingsController::index() before any output starts.
+// Anything reaching this view falls through to a normal settings tab.
 $activeTab = $_GET['tab'] ?? 'general';
-// Backwards compat: map old tab names to new consolidated tabs
-if (in_array($activeTab, ['remote', 'offsite', 'storage'])) {
-    // Storage moved to /storage-locations
-    $section = $_GET['section'] ?? '';
-    if ($activeTab === 'offsite') $section = 's3';
-    header('Location: /storage-locations' . ($section === 's3' ? '?section=s3' : ''));
-    exit;
-}
 if ($activeTab === 'borg') { $activeTab = 'updates'; $updatesSection = 'borg'; }
 if ($activeTab === 'updates') { $updatesSection = $updatesSection ?? ($_GET['section'] ?? 'software'); }
 ?>
@@ -78,7 +73,7 @@ $updateAvailable = $updateService->isUpdateAvailable();
     <div class="row g-4">
         <div class="col-lg-6">
             <div class="card border-0 shadow-sm">
-                <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-server me-1"></i> Server
                 </div>
                 <div class="card-body">
@@ -124,7 +119,7 @@ $updateAvailable = $updateService->isUpdateAvailable();
             </div>
 
             <div class="card border-0 shadow-sm mt-4">
-                <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-incognito me-1"></i> Agent
                 </div>
                 <div class="card-body">
@@ -138,13 +133,68 @@ $updateAvailable = $updateService->isUpdateAvailable();
                         <input type="number" class="form-control" name="stall_timeout_minutes" value="<?= htmlspecialchars($settings['stall_timeout_minutes'] ?? '120') ?>" min="10" max="1440">
                         <div class="form-text">Kill backup jobs with no progress after this many minutes. Set higher for large files. Default: 120 (2 hours).</div>
                     </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Weekly Compact Schedule</label>
+                        <?php
+                            $compactDay  = (int) ($settings['auto_compact_day'] ?? 6);
+                            $compactHour = (int) ($settings['auto_compact_hour'] ?? 2);
+                            $dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+                        ?>
+                        <div class="d-flex gap-2">
+                            <select class="form-select" name="auto_compact_day">
+                                <?php foreach ($dayNames as $i => $dn): ?>
+                                <option value="<?= $i ?>"<?= $i === $compactDay ? ' selected' : '' ?>><?= $dn ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <select class="form-select" name="auto_compact_hour">
+                                <?php for ($h = 0; $h < 24; $h++): ?>
+                                <option value="<?= $h ?>"<?= $h === $compactHour ? ' selected' : '' ?>><?= sprintf('%02d:00', $h) ?></option>
+                                <?php endfor; ?>
+                            </select>
+                        </div>
+                        <div class="form-text">When repositories are auto-compacted (reclaims freed space) each week. Runs at or after this time on the chosen day, so storage that isn't powered on 24/7 still gets compacted. Default: Saturday 02:00.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Notify When Agent Offline (minutes)</label>
+                        <input type="number" class="form-control" name="agent_offline_notify_minutes" value="<?= htmlspecialchars($settings['agent_offline_notify_minutes'] ?? '5') ?>" min="1" max="60">
+                        <div class="form-text">Wait this long before firing an "agent offline" notification or push. Brief network blips and short laptop suspends never become alerts. The agent still <em>shows</em> as offline immediately on dashboards — only the outbound notification is delayed. Default: 5.</div>
+                    </div>
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="auto_retry_failed_backups" value="1"
+                                   id="autoRetryFailed" <?= (($settings['auto_retry_failed_backups'] ?? '1') === '1') ? 'checked' : '' ?>>
+                            <label class="form-check-label fw-semibold" for="autoRetryFailed">
+                                Auto-retry backups when agent goes offline
+                            </label>
+                        </div>
+                        <div class="form-text">
+                            If a backup fails because the agent disconnects mid-run (laptop closed, network drop), automatically re-queue it so it picks up when the agent reconnects. Real errors (borg path missing, repo locked, etc.) are not retried.
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Max Retry Attempts</label>
+                        <input type="number" class="form-control" name="auto_retry_max_attempts" value="<?= htmlspecialchars($settings['auto_retry_max_attempts'] ?? '3') ?>" min="1" max="10">
+                        <div class="form-text">Cap on offline-induced retries per plan. Once exhausted, a final email is sent (bypassing dedup) so persistent failures aren't hidden. Default: 3.</div>
+                    </div>
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="auto_update_agents" value="1"
+                                   id="autoUpdateAgents" <?= (($settings['auto_update_agents'] ?? '1') === '1') ? 'checked' : '' ?>>
+                            <label class="form-check-label fw-semibold" for="autoUpdateAgents">
+                                Auto-update agents when BBS updates
+                            </label>
+                        </div>
+                        <div class="form-text">
+                            After BBS updates to a new version, automatically queue an agent update for every outdated, online client so agents stay in sync. Updates the agent script through the normal mechanism. Default: on.
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
 
         <div class="col-lg-6">
             <div class="card border-0 shadow-sm">
-                <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-shield-lock me-1"></i> Security
                 </div>
                 <div class="card-body">
@@ -191,7 +241,7 @@ $updateAvailable = $updateService->isUpdateAvailable();
             </div>
 
             <div class="card border-0 shadow-sm mt-4">
-                <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-shield-check me-1"></i> Server Backups
                 </div>
                 <div class="card-body">
@@ -231,8 +281,12 @@ $updateAvailable = $updateService->isUpdateAvailable();
                     </div>
                     <div class="alert alert-info mb-0 small">
                         <i class="bi bi-info-circle me-1"></i>
+                        <?php if (\BBS\Core\Config::isHosted()): ?>
+                        To back up your server settings off-site, make sure you've added S3 Storage in your Hosted Account.
+                        <?php else: ?>
                         Server backups include the database, configuration, and SSH host keys &mdash; <strong>not repository data</strong>.
                         To protect your backup repositories, configure <a href="/settings?tab=offsite" class="alert-link">S3 Offsite Sync</a>.
+                        <?php endif; ?>
                     </div>
                 </div>
             </div>
@@ -240,7 +294,7 @@ $updateAvailable = $updateService->isUpdateAvailable();
     </div>
 
     <div class="card border-0 shadow-sm mt-4">
-        <div class="card-header bg-body fw-semibold">
+        <div class="card-header fw-semibold">
             <i class="bi bi-bar-chart me-1"></i> Usage Statistics
         </div>
         <div class="card-body">
@@ -267,10 +321,19 @@ $updateAvailable = $updateService->isUpdateAvailable();
 
 <!-- Email Settings Tab -->
 <?php if ($activeTab === 'notifications'): ?>
+<?php if (!empty($smtpWarning)): ?>
+<div class="alert alert-warning d-flex align-items-start mb-4" role="alert">
+    <i class="bi bi-exclamation-triangle-fill me-2 mt-1"></i>
+    <div>
+        <strong>Email notifications won't actually send.</strong>
+        One or more <em>Email on …</em> toggles below are enabled, but SMTP isn't configured yet — failure events fire the in-app notification only and the email is silently skipped. Fill in the SMTP card below and click <em>Test SMTP</em> to verify.
+    </div>
+</div>
+<?php endif; ?>
 <div class="row g-4">
     <div class="col-lg-7">
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-envelope me-1"></i> SMTP Configuration
             </div>
             <div class="card-body">
@@ -295,12 +358,34 @@ $updateAvailable = $updateService->isUpdateAvailable();
                         </div>
                         <div class="col-md-6">
                             <label class="form-label fw-semibold">SMTP Password</label>
-                            <input type="password" class="form-control" name="smtp_pass" value="<?= htmlspecialchars($settings['smtp_pass'] ?? '') ?>">
+                            <input type="password" class="form-control" name="smtp_pass"
+                                   autocomplete="new-password"
+                                   placeholder="<?= !empty($settings['smtp_pass']) ? '(unchanged if empty)' : '' ?>">
                         </div>
                     </div>
-                    <div class="mb-4">
-                        <label class="form-label fw-semibold">From Address</label>
-                        <input type="email" class="form-control" name="smtp_from" value="<?= htmlspecialchars($settings['smtp_from'] ?? '') ?>" placeholder="backups@example.com">
+                    <?php
+                    // Default encryption choice based on port when smtp_secure is unset.
+                    $smtpPortForDefault = (int) ($settings['smtp_port'] ?? 587);
+                    $smtpSecureDefault = match ($smtpPortForDefault) {
+                        465 => 'ssl',
+                        25 => 'none',
+                        default => 'starttls',
+                    };
+                    $smtpSecure = $settings['smtp_secure'] ?? $smtpSecureDefault;
+                    ?>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-semibold">Encryption</label>
+                            <select class="form-select" name="smtp_secure">
+                                <option value="starttls" <?= $smtpSecure === 'starttls' ? 'selected' : '' ?>>STARTTLS (typically port 587)</option>
+                                <option value="ssl" <?= $smtpSecure === 'ssl' ? 'selected' : '' ?>>SSL/TLS (typically port 465)</option>
+                                <option value="none" <?= $smtpSecure === 'none' ? 'selected' : '' ?>>None (plaintext)</option>
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label fw-semibold">From Address</label>
+                            <input type="email" class="form-control" name="smtp_from" value="<?= htmlspecialchars($settings['smtp_from'] ?? '') ?>" placeholder="backups@example.com">
+                        </div>
                     </div>
 
                     <div class="d-flex align-items-center gap-3">
@@ -318,6 +403,34 @@ $updateAvailable = $updateService->isUpdateAvailable();
     </div>
 
     <div class="col-lg-5">
+        <div class="card border-0 shadow-sm mb-3">
+            <div class="card-header fw-semibold">
+                <i class="bi bi-bell me-1"></i> In-App Notifications
+            </div>
+            <div class="card-body">
+                <form method="POST" action="/settings">
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                    <input type="hidden" name="_tab" value="notifications">
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" role="switch"
+                               id="inapp_notify_success_events" name="inapp_notify_success_events" value="1"
+                               <?= ($settings['inapp_notify_success_events'] ?? '0') === '1' ? 'checked' : '' ?>>
+                        <label class="form-check-label" for="inapp_notify_success_events">
+                            Show successful backups / restores in the notification bell
+                        </label>
+                    </div>
+                    <p class="small text-muted mb-3">
+                        Off by default. When off, only failures, agent-offline, storage-low, and other
+                        alert-worthy events show up in the bell menu — so routine success messages
+                        don't pile up and bury real issues. Email and push notifications stay
+                        independent of this setting.
+                    </p>
+                    <button type="submit" class="btn btn-sm btn-warning">
+                        <i class="bi bi-check-lg me-1"></i> Save
+                    </button>
+                </form>
+            </div>
+        </div>
         <div class="card border-0 bg-body-secondary">
             <div class="card-body">
                 <h6 class="card-title"><i class="bi bi-lightbulb me-1 text-warning"></i> Tip</h6>
@@ -342,6 +455,7 @@ $updateAvailable = $updateService->isUpdateAvailable();
 $eventGroups = [
     'Backups' => [
         'backup_completed' => 'Backup Completed',
+        'backup_warning' => 'Backup Completed with Warnings',
         'backup_failed' => 'Backup Failed',
     ],
     'Restores' => [
@@ -384,6 +498,7 @@ $eventColors = [
     'repo_check_failed' => 'danger',
     's3_sync_failed' => 'danger',
     // Warning events - orange/warning
+    'backup_warning' => 'warning',
     'agent_offline' => 'warning',
     'storage_low' => 'warning',
     'missed_schedule' => 'warning',
@@ -417,7 +532,7 @@ unset($ns);
                     <div class="row">
                         <div class="col-md-6">
                             <strong>Discord:</strong> discord://webhook_id/webhook_token<br>
-                            <strong>Telegram:</strong> tgram://bot_token/chat_id<br>
+                            <strong>Telegram:</strong> tgram://bot_token/chat_id[:thread]<br>
                             <strong>Slack:</strong> slack://tokenA/tokenB/tokenC<br>
                             <strong>Pushover:</strong> pover://user@token
                         </div>
@@ -442,7 +557,7 @@ unset($ns);
 <!-- Add Service Form (Collapse) -->
 <div class="collapse mb-4" id="addServiceForm">
     <div class="card border-0 shadow-sm">
-        <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+        <div class="card-header fw-semibold">
             <i class="bi bi-plus-circle me-1"></i> Add Notification Service
         </div>
         <div class="card-body">
@@ -927,11 +1042,15 @@ const serviceSchemas = {
         label: 'Telegram',
         fields: [
             { name: 'bot_token', label: 'Bot Token', type: 'text', required: true, placeholder: '123456789:ABCdefGHI...', width: 'col-md-6' },
-            { name: 'chat_id', label: 'Chat ID', type: 'text', required: true, placeholder: '-1001234567890', width: 'col-md-6' }
+            { name: 'chat_id', label: 'Chat ID', type: 'text', required: true, placeholder: '-1001234567890', width: 'col-md-4' },
+            { name: 'thread', label: 'Thread (optional)', type: 'text', placeholder: '1234567', width: 'col-md-2' }
         ],
-        help: 'Create a bot via @BotFather, then get chat ID by messaging @userinfobot or from group info',
+        help: 'Create a bot via @BotFather, then get chat ID by messaging @userinfobot or from group info. Use Thread for a Telegram topic ID.',
         build: function(f) {
-            return `tgram://${f.bot_token || ''}/${f.chat_id || ''}`;
+            const chatId = f.chat_id || '';
+            const thread = (f.thread || '').trim();
+            const target = thread ? `${chatId}:${encodeURIComponent(thread)}` : chatId;
+            return `tgram://${f.bot_token || ''}/${target}`;
         }
     },
     pover: {
@@ -1151,7 +1270,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
 <!-- Templates Tab -->
 <?php if ($activeTab === 'templates'): ?>
 <div class="card border-0 shadow-sm">
-    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+    <div class="card-header fw-semibold">
         <i class="bi bi-clipboard-check me-1"></i> Backup Templates
     </div>
     <div class="card-body">
@@ -1377,7 +1496,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
 <!-- Authentication Tab -->
 <?php if ($activeTab === 'auth'): ?>
 <div class="card border-0 shadow-sm">
-    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+    <div class="card-header fw-semibold">
         <i class="bi bi-shield-lock me-1"></i> Single Sign-On (OIDC)
     </div>
     <div class="card-body">
@@ -1485,7 +1604,7 @@ document.getElementById('oidcNewUserPolicy').addEventListener('change', function
 <!-- Branding Tab -->
 <?php if ($activeTab === 'branding'): ?>
 <div class="card border-0 shadow-sm">
-    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+    <div class="card-header fw-semibold">
         <i class="bi bi-palette me-1"></i> Branding
     </div>
     <div class="card-body">
@@ -1495,12 +1614,19 @@ document.getElementById('oidcNewUserPolicy').addEventListener('change', function
             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
             <input type="hidden" name="branding_icon_data" id="brandingIconData">
             <input type="hidden" name="branding_login_logo_data" id="brandingLoginLogoData">
+            <input type="hidden" name="branding_app_icon_data" id="brandingAppIconData">
 
             <!-- Navbar Icon -->
             <div class="row mb-4">
-                <div class="col-md-8">
+                <div class="col-md-7">
                     <h6><i class="bi bi-image me-1"></i> Navbar Icon</h6>
-                    <p class="text-muted small">Square transparent PNG shown in the top-left corner. Will be resized to 120x120px max.</p>
+                    <p class="text-muted small">
+                        Transparent PNG shown in the top-left corner of every page (sits in a ~115×100px slot
+                        and overflows slightly into the page header). Also reused as the small header logo on
+                        the <strong>mobile login screen</strong>, since the wider Login Page Logo would crowd a
+                        phone-width pane. Wide landscape artwork works best. Will be resized to fit within
+                        360×200 pixels max.
+                    </p>
                     <input type="file" class="form-control form-control-sm" id="iconFileInput" accept="image/png">
                     <div class="small text-muted mt-1" id="iconDimensions"></div>
                     <?php if (!empty($settings['branding_icon'])): ?>
@@ -1510,14 +1636,17 @@ document.getElementById('oidcNewUserPolicy').addEventListener('change', function
                     </div>
                     <?php endif; ?>
                 </div>
-                <div class="col-md-4 text-center">
+                <div class="col-md-5 text-center">
                     <label class="form-label small text-muted">Preview</label>
-                    <div class="p-3 rounded <?= ($_SESSION['theme'] ?? 'dark') === 'dark' ? 'bg-dark' : 'bg-body-secondary' ?>">
-                        <img id="iconPreview" src="<?= !empty($settings['branding_icon']) ? 'data:image/png;base64,' . $settings['branding_icon'] : '/images/borg_icon_dark.png' ?>" alt="Icon preview" style="height: 36px;">
-                        <?php if (empty($settings['branding_icon'])): ?>
-                        <div class="text-muted small mt-1" id="iconDefaultLabel">Default</div>
-                        <?php endif; ?>
+                    <div class="p-3 rounded bg-dark d-flex align-items-center justify-content-center" style="min-height: 130px;">
+                        <img id="iconPreview"
+                             src="<?= !empty($settings['branding_icon']) ? 'data:image/png;base64,' . $settings['branding_icon'] : '/images/bbs-logo-mascot.png' ?>"
+                             alt="Icon preview"
+                             style="max-width: 180px; max-height: 110px; width: auto; height: auto;">
                     </div>
+                    <?php if (empty($settings['branding_icon'])): ?>
+                    <div class="text-muted small mt-1" id="iconDefaultLabel">Default — Borg Backup Server mascot</div>
+                    <?php endif; ?>
                 </div>
             </div>
 
@@ -1525,9 +1654,9 @@ document.getElementById('oidcNewUserPolicy').addEventListener('change', function
 
             <!-- Login Logo -->
             <div class="row mb-4">
-                <div class="col-md-8">
+                <div class="col-md-7">
                     <h6><i class="bi bi-card-image me-1"></i> Login Page Logo</h6>
-                    <p class="text-muted small">Transparent PNG displayed on the login page. Will be resized to fit within 475 x 100 pixels.</p>
+                    <p class="text-muted small">Transparent PNG displayed on the left half of the login screen. Square or near-square artwork works best — fills a column up to about 500px wide. Will be resized to fit within 800×800 pixels max.</p>
                     <input type="file" class="form-control form-control-sm" id="loginLogoFileInput" accept="image/png">
                     <div class="small text-muted mt-1" id="loginLogoDimensions"></div>
                     <?php if (!empty($settings['branding_login_logo'])): ?>
@@ -1537,23 +1666,65 @@ document.getElementById('oidcNewUserPolicy').addEventListener('change', function
                     </div>
                     <?php endif; ?>
                 </div>
-                <div class="col-md-4 text-center">
+                <div class="col-md-5 text-center">
                     <label class="form-label small text-muted">Preview</label>
-                    <div class="p-3 rounded <?= ($_SESSION['theme'] ?? 'dark') === 'dark' ? 'bg-dark' : 'bg-body-secondary' ?>">
-                        <img id="loginLogoPreview" src="<?= !empty($settings['branding_login_logo']) ? 'data:image/png;base64,' . $settings['branding_login_logo'] : '/images/borg_icon_dark.png' ?>" alt="Login logo preview" style="<?= !empty($settings['branding_login_logo']) ? 'max-width:300px;max-height:80px;' : 'max-width:80px;' ?>">
-                        <?php if (empty($settings['branding_login_logo'])): ?>
-                        <div class="text-muted small mt-1" id="loginLogoDefaultLabel">Default</div>
-                        <?php endif; ?>
+                    <div class="p-3 rounded bg-dark d-flex align-items-center justify-content-center" style="min-height: 280px;">
+                        <img id="loginLogoPreview"
+                             src="<?= !empty($settings['branding_login_logo']) ? 'data:image/png;base64,' . $settings['branding_login_logo'] : '/images/login-logo.png' ?>"
+                             alt="Login logo preview"
+                             style="max-width: 100%; max-height: 260px; width: auto; height: auto;">
                     </div>
+                    <?php if (empty($settings['branding_login_logo'])): ?>
+                    <div class="text-muted small mt-1" id="loginLogoDefaultLabel">Default — Borg Backup Server mascot</div>
+                    <?php endif; ?>
                 </div>
             </div>
 
             <hr>
 
-            <!-- Login Page Theme -->
+            <!-- App Icon / Favicon — single source for browser tab, Apple
+                 home-screen, and PWA. Resized on the fly by BrandingController. -->
+            <div class="row mb-4">
+                <div class="col-md-7">
+                    <h6><i class="bi bi-app-indicator me-1"></i> App Icon / Favorite Icon</h6>
+                    <p class="text-muted small">
+                        Square <strong>transparent PNG</strong> used as the app icon everywhere a browser or
+                        OS asks for one — browser tab favicon, Apple home-screen icon, Android / PWA install
+                        tile. Upload one high-resolution image; BBS resizes it on demand to every required
+                        size (16, 32, 48, 96, 180, 192, 512). <strong>Recommended: 512×512 transparent PNG.</strong>
+                        Anything smaller will look soft on retina screens.
+                    </p>
+                    <input type="file" class="form-control form-control-sm" id="appIconFileInput" accept="image/png">
+                    <div class="small text-muted mt-1" id="appIconDimensions"></div>
+                    <?php if (!empty($settings['branding_app_icon'])): ?>
+                    <div class="form-check mt-2">
+                        <input class="form-check-input" type="checkbox" name="remove_branding_app_icon" value="1" id="removeAppIcon">
+                        <label class="form-check-label small" for="removeAppIcon">Remove custom app icon (revert to default)</label>
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <div class="col-md-5 text-center">
+                    <label class="form-label small text-muted">Preview</label>
+                    <div class="p-3 rounded bg-dark d-flex align-items-center justify-content-center" style="min-height: 200px;">
+                        <img id="appIconPreview"
+                             src="<?= !empty($settings['branding_app_icon']) ? 'data:image/png;base64,' . $settings['branding_app_icon'] : '/branding/icon/192' ?>"
+                             alt="App icon preview"
+                             style="max-width: 160px; max-height: 160px; width: auto; height: auto;">
+                    </div>
+                    <?php if (empty($settings['branding_app_icon'])): ?>
+                    <div class="text-muted small mt-1" id="appIconDefaultLabel">Default — Borg Backup Server mascot</div>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <hr>
+
             <div class="mb-4">
                 <h6><i class="bi bi-moon-stars me-1"></i> Login Page Theme</h6>
-                <p class="text-muted small">Override the login page theme independently. Useful when your logo only works well on a specific background.</p>
+                <p class="text-muted small">
+                    Override the login page theme independently. Useful when your branding only reads well on
+                    a specific background. The default ("Use Default Theme") follows the system theme.
+                </p>
                 <select class="form-select" name="branding_login_theme" style="max-width: 300px;">
                     <?php $loginTheme = $settings['branding_login_theme'] ?? 'default'; ?>
                     <option value="default" <?= $loginTheme === 'default' ? 'selected' : '' ?>>Use Default Theme</option>
@@ -1596,9 +1767,12 @@ function resizeImage(file, maxW, maxH, callback) {
 
 document.getElementById('iconFileInput').addEventListener('change', function() {
     if (!this.files[0]) return;
-    resizeImage(this.files[0], 120, 120, function(dataUrl, w, h) {
-        document.getElementById('iconPreview').src = dataUrl;
-        document.getElementById('iconPreview').style.height = '36px';
+    // Bumped from 120x120 to 360x200 — the new topbar slot is wider and
+    // benefits from higher-res source artwork, especially on retina screens.
+    resizeImage(this.files[0], 360, 200, function(dataUrl, w, h) {
+        var preview = document.getElementById('iconPreview');
+        preview.src = dataUrl;
+        // Let CSS sizing take over — preview's max-width/height already set inline.
         document.getElementById('brandingIconData').value = dataUrl.split(',')[1];
         document.getElementById('iconDimensions').textContent = 'Resized to ' + w + 'x' + h + 'px';
         var lbl = document.getElementById('iconDefaultLabel');
@@ -1608,14 +1782,28 @@ document.getElementById('iconFileInput').addEventListener('change', function() {
 
 document.getElementById('loginLogoFileInput').addEventListener('change', function() {
     if (!this.files[0]) return;
-    resizeImage(this.files[0], 475, 100, function(dataUrl, w, h) {
+    // Bumped from 475x100 to 800x800 — the new login layout uses square /
+    // near-square artwork that fills its column, not a wide banner.
+    resizeImage(this.files[0], 800, 800, function(dataUrl, w, h) {
         var preview = document.getElementById('loginLogoPreview');
         preview.src = dataUrl;
-        preview.style.maxWidth = '300px';
-        preview.style.maxHeight = '80px';
         document.getElementById('brandingLoginLogoData').value = dataUrl.split(',')[1];
         document.getElementById('loginLogoDimensions').textContent = 'Resized to ' + w + 'x' + h + 'px';
         var lbl = document.getElementById('loginLogoDefaultLabel');
+        if (lbl) lbl.style.display = 'none';
+    });
+});
+
+document.getElementById('appIconFileInput').addEventListener('change', function() {
+    if (!this.files[0]) return;
+    // 512×512 cap matches our biggest derived size (PWA icon-512). Anything
+    // larger than that just bloats the DB row without improving rendering.
+    resizeImage(this.files[0], 512, 512, function(dataUrl, w, h) {
+        var preview = document.getElementById('appIconPreview');
+        preview.src = dataUrl;
+        document.getElementById('brandingAppIconData').value = dataUrl.split(',')[1];
+        document.getElementById('appIconDimensions').textContent = 'Resized to ' + w + 'x' + h + 'px';
+        var lbl = document.getElementById('appIconDefaultLabel');
         if (lbl) lbl.style.display = 'none';
     });
 });
@@ -1625,7 +1813,7 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
 <!-- API Tab -->
 <?php if ($activeTab === 'api'): ?>
 <div class="card border-0 shadow-sm">
-    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+    <div class="card-header fw-semibold">
         <i class="bi bi-key me-1"></i> API Tokens
     </div>
     <div class="card-body">
@@ -1638,7 +1826,7 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
                 <strong>New API Token</strong> — copy it now, it will not be shown again:
                 <div class="mt-1">
                     <code id="newTokenValue" class="user-select-all fs-6"><?= htmlspecialchars($_SESSION['new_api_token']) ?></code>
-                    <button type="button" class="btn btn-sm btn-outline-success ms-2" onclick="navigator.clipboard.writeText(document.getElementById('newTokenValue').textContent).then(() => { this.innerHTML = '<i class=\'bi bi-check\'></i> Copied'; })">
+                    <button type="button" class="btn btn-sm btn-outline-success ms-2" onclick="BBS.copyText(document.getElementById('newTokenValue').textContent).then(() => { this.innerHTML = '<i class=\'bi bi-check\'></i> Copied'; })">
                         <i class="bi bi-clipboard"></i> Copy
                     </button>
                 </div>
@@ -1662,7 +1850,12 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
                 <tbody>
                     <?php foreach ($apiTokens as $token): ?>
                     <tr>
-                        <td class="fw-semibold"><i class="bi bi-key me-1 text-muted"></i><?= htmlspecialchars($token['name']) ?></td>
+                        <td class="fw-semibold">
+                            <i class="bi bi-key me-1 text-muted"></i><?= htmlspecialchars($token['name']) ?>
+                            <?php if (!empty($token['can_read_secrets'])): ?>
+                            <span class="badge bg-warning text-dark ms-2" title="This token can read repository passphrases and S3 credentials"><i class="bi bi-eye me-1"></i>secrets</span>
+                            <?php endif; ?>
+                        </td>
                         <td class="small text-muted"><?= htmlspecialchars($token['username']) ?></td>
                         <td class="small text-muted"><?= \BBS\Core\TimeHelper::format($token['created_at'], 'M j, Y') ?></td>
                         <td class="small text-muted"><?= $token['last_used_at'] ? \BBS\Core\TimeHelper::format($token['last_used_at'], 'M j, Y g:i A') : '<span class="text-muted">never</span>' ?></td>
@@ -1687,6 +1880,13 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
                     <label class="form-label fw-semibold">Token Name</label>
                     <input type="text" class="form-control" name="name" required placeholder="e.g. ansible-provisioner">
                 </div>
+                <div class="col-md-6">
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" name="can_read_secrets" value="1" id="canReadSecrets">
+                        <label class="form-check-label fw-semibold" for="canReadSecrets">Display Secrets</label>
+                    </div>
+                    <div class="form-text small">Allows this token to return repository passphrases and S3 credentials in API responses (e.g. <code>?include_secrets=1</code> on <code>GET&nbsp;/api/v1/repositories</code>). Leave unchecked unless you specifically need an escrow / disaster-recovery export.</div>
+                </div>
                 <div class="col-md-2">
                     <button type="submit" class="btn btn-success w-100"><i class="bi bi-plus-circle me-1"></i>Create Token</button>
                 </div>
@@ -1696,7 +1896,7 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
 </div>
 
 <div class="card border-0 shadow-sm mt-4">
-    <div class="card-header bg-body fw-semibold">
+    <div class="card-header fw-semibold">
         <i class="bi bi-book me-1"></i> API Reference
     </div>
     <div class="card-body">
@@ -1707,9 +1907,11 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
                 <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
             </thead>
             <tbody>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/summary</code></td><td>Summary of each client's backup plans and latest backup result</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients</code></td><td>List all clients</td></tr>
                 <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients</code></td><td>Create a client (returns api_key for agent install)</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}</code></td><td>Get client details with repos &amp; plans</td></tr>
+                <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/clients/{id}</code></td><td>Rename a client: <code>{"name": "new-name"}</code></td></tr>
                 <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}</code></td><td>Delete a client</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/repositories</code></td><td>List repositories</td></tr>
                 <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/repositories</code></td><td>Create a repository</td></tr>
@@ -1736,6 +1938,28 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
                 <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plugin-configs</code></td><td>Create a plugin config</td></tr>
                 <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Storage</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/storage</code></td><td>List local &amp; remote SSH storage locations</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/storage</code></td><td>Register a new local storage location: <code>{"label": "...", "path": "/abs/path", "is_default": false}</code></td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/storage/capacity</code></td><td>Provisioned / used / free bytes for the default storage location</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Repositories (cross-client)</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/repositories</code></td><td>List every repository across every client. Add <code>?include_secrets=1</code> to also return the decrypted passphrase (requires Display Secrets token).</td></tr>
+                <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/repositories/{repo_id}/s3-sync</code></td><td>Toggle per-repository S3 off-site sync: <code>{"enabled": true|false}</code></td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">S3 Off-site Sync</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/s3-credentials</code></td><td>Read the global S3 configuration (endpoint / region / bucket / path_prefix / configured). Add <code>?include_secrets=1</code> to also return <code>access_key</code> + <code>secret_key</code> (requires Display Secrets token).</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/s3-credentials</code></td><td>Set the global S3 configuration: <code>{"endpoint": "...", "region": "...", "bucket": "...", "access_key": "...", "secret_key": "...", "path_prefix": ""}</code></td></tr>
+                <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/s3-credentials</code></td><td>Clear the global S3 configuration and disable per-repo S3 sync on every repository</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Users</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/users</code></td><td>List all BBS users</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/users</code></td><td>Create a user: <code>{"username", "email", "password", "role": "admin|user"}</code></td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/users/{id}</code></td><td>Get one user</td></tr>
+                <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/users/{id}</code></td><td>Update email / password / role / all_clients / timezone / time_format. Pass <code>reset_totp:true</code> to clear 2FA.</td></tr>
+                <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/users/{id}</code></td><td>Delete a user (refuses to delete the last admin or the token's own user)</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Server Log</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/log</code></td><td>Read server_log entries. Filters: <code>?level=info|warning|error</code>, <code>?agent_id=N</code>, <code>?since=YYYY-MM-DD HH:MM:SS</code>, <code>?limit=N&amp;offset=N</code> (limit max 500, default 100).</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Schedules</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/schedules</code></td><td>Flat list of every plan with its schedule, next_run, last_run, last_status, and last_completed_at across all clients</td></tr>
+                <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Maintenance</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/maintenance</code></td><td>Read the maintenance-mode flag</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/maintenance</code></td><td>Toggle maintenance mode: <code>{"enabled": true|false}</code> (pauses agent dispatch)</td></tr>
             </tbody>
         </table>
 
@@ -1745,6 +1969,12 @@ document.getElementById('loginLogoFileInput').addEventListener('change', functio
   -H "Authorization: Bearer bbs_tok_..." \
   -H "Content-Type: application/json" \
   -d '{"name": "web-server-01"}'</code></pre>
+        </div>
+
+        <div class="mt-3">
+            <p class="small text-muted mb-1"><strong>Example: Backup summary</strong></p>
+            <pre class="bg-body-secondary p-2 rounded small mb-0"><code>curl https://your-server/api/v1/summary \
+  -H "Authorization: Bearer bbs_tok_..."</code></pre>
         </div>
 
         <div class="mt-3">
@@ -1796,7 +2026,7 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
 <div class="row g-4">
     <div class="col-lg-6">
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-box-seam me-1"></i> Borg Version Updater
             </div>
             <div class="card-body">
@@ -1910,7 +2140,7 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
 
     <div class="col-lg-6">
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold d-flex justify-content-between align-items-center">
+            <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-pc-display me-1"></i> Client Borg Versions</span>
                 <?php if (!empty($allAgents)): ?>
                 <form method="POST" action="/settings/borg/update-all"
@@ -2001,7 +2231,7 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
         <?php if ($updateMode === 'server' && !empty($serverVersions)): ?>
         <!-- Server-hosted binaries info -->
         <div class="card border-0 shadow-sm mt-4">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-hdd me-1"></i> Available Server Binaries
             </div>
             <div class="card-body">
@@ -2137,7 +2367,7 @@ $outdatedCount = count($outdatedAgents);
 <div class="row g-4">
     <div class="col-lg-6">
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+            <div class="card-header fw-semibold">
                 Borg Backup Server Version
             </div>
             <div class="card-body">
@@ -2211,7 +2441,7 @@ docker compose up -d</pre>
         <div id="agent-updates-card">
         <?php if ($bundledAgentVersion): ?>
         <div class="card border-0 shadow-sm mt-4">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold d-flex justify-content-between align-items-center">
+            <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-pc-display me-1"></i> BBS Client</span>
                 <span class="badge bg-success" id="agent-bundled-ver">v<?= htmlspecialchars($bundledAgentVersion) ?></span>
             </div>
@@ -2253,7 +2483,7 @@ docker compose up -d</pre>
     <?php if (!empty($latest['notes'])): ?>
     <div class="col-lg-6">
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-journal-text me-1"></i> Release Notes
                 <?php if (!empty($latest['url'])): ?>
                     <a href="<?= htmlspecialchars($latest['url']) ?>" target="_blank" class="float-end small text-decoration-none">
@@ -2275,7 +2505,7 @@ docker compose up -d</pre>
 <div class="row g-4">
     <div class="col-lg-6">
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-git me-1"></i> Developer Sync
             </div>
             <div class="card-body">
@@ -2297,7 +2527,7 @@ docker compose up -d</pre>
 
 <?php if ($upgradeResult): ?>
 <div class="card border-0 shadow-sm mt-4">
-    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+    <div class="card-header fw-semibold">
         <i class="bi bi-terminal me-1"></i> Upgrade Log
     </div>
     <div class="card-body">
@@ -2385,7 +2615,7 @@ document.getElementById('btnTestSmtp')?.addEventListener('click', function() {
         .then(function(data) {
             btn.disabled = false;
             if (data.success) {
-                result.textContent = 'Success';
+                result.textContent = data.message || 'Success — test email sent';
                 result.className = 'ms-2 small text-success fw-semibold';
             } else {
                 result.textContent = 'Failed: ' + data.error;

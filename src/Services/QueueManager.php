@@ -88,23 +88,34 @@ class QueueManager
         // Get queued jobs ordered by queued_at (FIFO)
         // No LIMIT — we may skip busy-repo jobs and need to see more candidates
         $queuedJobs = $this->db->fetchAll("
-            SELECT bj.*, bj.plugin_config_id, bp.directories, bp.excludes, bp.advanced_options,
+            SELECT bj.*, bj.plugin_config_id, bp.name as plan_name, bp.directories, bp.excludes, bp.advanced_options,
                    bp.prune_minutes, bp.prune_hours, bp.prune_days,
                    bp.prune_weeks, bp.prune_months, bp.prune_years,
                    r.path as repo_path, r.encryption, r.passphrase_encrypted, r.name as repo_name,
                    r.agent_id as repo_agent_id, r.storage_type, r.remote_ssh_config_id,
                    rsc.remote_host, rsc.remote_port, rsc.remote_user, rsc.remote_base_path,
                    rsc.ssh_private_key_encrypted as remote_ssh_key_encrypted,
-                   rsc.borg_remote_path
+                   rsc.borg_remote_path,
+                   a.name as agent_name,
+                   a.status as agent_status
             FROM backup_jobs bj
             LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
             LEFT JOIN repositories r ON r.id = bj.repository_id
             LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
+            LEFT JOIN agents a ON a.id = bj.agent_id
             WHERE bj.status = 'queued'
             ORDER BY
                 CASE WHEN bj.task_type IN ('catalog_rebuild', 'catalog_rebuild_full') THEN 1 ELSE 0 END,
                 bj.queued_at ASC
         ");
+
+        // Task types that require the agent to be online to run. Server-side
+        // tasks (prune/compact/catalog/etc.) run by the scheduler itself —
+        // they don't care about the agent's connection state.
+        $agentBoundTypes = [
+            'backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo',
+            'update_borg', 'update_agent', 'plugin_test', 'list_dir',
+        ];
 
         $promoted = [];
         $promotedCount = 0;
@@ -136,6 +147,17 @@ class QueueManager
 
             // In maintenance mode, only promote server-side jobs (not backups/restores)
             if ($maintenanceMode && !in_array($job['task_type'], $serverSideTypes) && !$isManagement) {
+                continue;
+            }
+
+            // Don't promote agent-bound jobs (backup, restore, plugin_test, etc.)
+            // when the agent is offline — promoting to 'sent' would just cause
+            // the scheduler's offline sweep to fail-and-retry on every tick,
+            // burning through the retry budget while the client is unreachable
+            // (#281). Wait for the agent to come back online; it'll be picked
+            // up on the next scheduler pass once the heartbeat resumes.
+            if (in_array($job['task_type'], $agentBoundTypes)
+                && ($job['agent_status'] ?? 'online') !== 'online') {
                 continue;
             }
 
@@ -218,6 +240,13 @@ class QueueManager
                     'job_id' => $job['id'],
                     'archive_name' => $archiveName,
                     'directories' => $plan['directories'],
+                    // Context exposed to shell_hook plugin scripts (#250).
+                    // The agent injects these as BBS_* env vars when running
+                    // pre/post hooks so scripts can target the right repo and
+                    // archive without parsing the borg command argv.
+                    'repo_path' => $repo['path'] ?? '',
+                    'plan_name' => $job['plan_name'] ?? '',
+                    'client_name' => $job['agent_name'] ?? '',
                 ];
                 if (!empty($plugins)) {
                     $extra['plugins'] = $plugins;
@@ -276,6 +305,21 @@ class QueueManager
                     'job_id' => $job['id'],
                     'plugin' => $testPayload,
                 ];
+            } elseif ($job['task_type'] === 'list_dir') {
+                // Browse-filesystem requests from the plan-create modal.
+                // Params (path / depth / show_hidden / show_all / follow_symlinks)
+                // were stashed in status_message as JSON at queue time.
+                $params = json_decode($job['status_message'] ?? '{}', true) ?: [];
+                $taskPayload = [
+                    'task' => 'list_dir',
+                    'job_id' => $job['id'],
+                    'path' => $params['path'] ?? '/',
+                    'depth' => (int) ($params['depth'] ?? 2),
+                    'show_hidden' => !empty($params['show_hidden']),
+                    'show_all' => !empty($params['show_all']),
+                    'follow_symlinks' => !empty($params['follow_symlinks']),
+                    'max_entries' => (int) ($params['max_entries'] ?? 5000),
+                ];
             }
 
             if ($taskPayload) {
@@ -293,7 +337,16 @@ class QueueManager
                 ]);
 
                 $promoted[] = $job;
-                $promotedCount++;
+
+                // Management tasks (update_borg, update_agent) bypass the
+                // slot count on the way in — they must also bypass it on
+                // the way out. Otherwise a batch of queued agent updates
+                // (especially for offline agents that can never pick them
+                // up) eats every slot in this iteration and a backup later
+                // in FIFO order hits the `break` below. #206
+                if (!$isManagement) {
+                    $promotedCount++;
+                }
 
                 // Mark this repo and plan as busy for remaining iterations
                 if ($job['repository_id']) {
@@ -316,17 +369,19 @@ class QueueManager
     public function getTasksForAgent(int $agentId): array
     {
         $jobs = $this->db->fetchAll("
-            SELECT bj.*, bj.plugin_config_id, bp.directories, bp.excludes, bp.advanced_options,
+            SELECT bj.*, bj.plugin_config_id, bp.name as plan_name, bp.directories, bp.excludes, bp.advanced_options,
                    bp.prune_minutes, bp.prune_hours, bp.prune_days,
                    bp.prune_weeks, bp.prune_months, bp.prune_years,
                    r.path as repo_path, r.encryption, r.passphrase_encrypted, r.name as repo_name,
                    r.storage_type, r.remote_ssh_config_id,
                    rsc.remote_port, rsc.ssh_private_key_encrypted as remote_ssh_key_encrypted,
-                   rsc.borg_remote_path
+                   rsc.borg_remote_path,
+                   a.name as agent_name
             FROM backup_jobs bj
             LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
             LEFT JOIN repositories r ON r.id = bj.repository_id
             LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
+            LEFT JOIN agents a ON a.id = bj.agent_id
             WHERE bj.agent_id = ?
               AND bj.status = 'sent'
               AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full')
@@ -386,6 +441,13 @@ class QueueManager
                     'job_id' => $job['id'],
                     'archive_name' => $archiveName,
                     'directories' => $plan['directories'],
+                    // Context exposed to shell_hook plugin scripts (#250).
+                    // The agent injects these as BBS_* env vars when running
+                    // pre/post hooks so scripts can target the right repo and
+                    // archive without parsing the borg command argv.
+                    'repo_path' => $repo['path'] ?? '',
+                    'plan_name' => $job['plan_name'] ?? '',
+                    'client_name' => $job['agent_name'] ?? '',
                 ];
                 if (!empty($plugins)) {
                     $extra['plugins'] = $plugins;
@@ -429,6 +491,21 @@ class QueueManager
                     'task' => 'plugin_test',
                     'job_id' => $job['id'],
                     'plugin' => $testPayload,
+                ];
+            } elseif ($job['task_type'] === 'list_dir') {
+                // Browse-filesystem request from the plan-create modal.
+                // Params (path / depth / show_hidden / show_all) were
+                // serialized to status_message at queue time.
+                $params = json_decode($job['status_message'] ?? '{}', true) ?: [];
+                $tasks[] = [
+                    'task' => 'list_dir',
+                    'job_id' => $job['id'],
+                    'path' => $params['path'] ?? '/',
+                    'depth' => (int) ($params['depth'] ?? 2),
+                    'show_hidden' => !empty($params['show_hidden']),
+                    'show_all' => !empty($params['show_all']),
+                    'follow_symlinks' => !empty($params['follow_symlinks']),
+                    'max_entries' => (int) ($params['max_entries'] ?? 5000),
                 ];
             }
         }
@@ -491,13 +568,20 @@ class QueueManager
 
         $repo = ['path' => $archive['repo_path'], 'passphrase_encrypted' => $archive['passphrase_encrypted']];
 
-        // Windows drive-letter restore: paths like C/Users/... need --strip-components 1
-        // to remove the drive prefix, with cwd set to the drive root (e.g. C:\)
+        // Windows drive-letter restore (#167). Borg archives from Windows
+        // clients store paths like "C/Users/marcp/file.txt" — the drive
+        // letter is the first path segment. Our catalog indexer prepends a
+        // leading slash for uniform display ("/C/Users/..."), so paths
+        // arriving from the UI may or may not have that slash. Either way,
+        // buildExtractCommand ltrims it before passing to borg, so the borg-
+        // side path is always "C/Users/...". --strip-components=1 removes
+        // that drive-letter segment and cwd=<drive>:\ routes the write back
+        // to the original absolute location.
         $stripComponents = 0;
         if (!$destination && !empty($paths)) {
             $driveLetter = null;
             foreach ($paths as $p) {
-                if (preg_match('/^([A-Za-z])\//', $p, $m)) {
+                if (preg_match('#^/?([A-Za-z])/#', $p, $m)) {
                     $driveLetter = strtoupper($m[1]);
                     break;
                 }

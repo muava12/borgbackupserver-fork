@@ -65,8 +65,8 @@
 <div class="row g-3 mb-4">
     <div class="col-md-6">
         <div class="card border-0 shadow-sm h-100">
-            <div class="card-header bg-body fw-semibold border-0">
-                <i class="bi bi-bar-chart me-1"></i> Backup Activity (7 days)
+            <div class="card-header fw-semibold border-0">
+                <i class="bi bi-bar-chart me-1"></i> Activity (7 days)
             </div>
             <div class="card-body py-2">
                 <canvas id="activityChart" height="160"></canvas>
@@ -75,7 +75,7 @@
     </div>
     <div class="col-md-6">
         <div class="card border-0 shadow-sm h-100">
-            <div class="card-header bg-body fw-semibold border-0">
+            <div class="card-header fw-semibold border-0">
                 <i class="bi bi-pie-chart me-1"></i> Storage by Client
             </div>
             <div class="card-body py-2 d-flex align-items-center justify-content-center">
@@ -138,7 +138,7 @@
                             <?php endif; ?>
                         </td>
                         <td>
-                            <?= htmlspecialchars($agent['agent_version'] ?? '--') ?>
+                            <?= !empty($agent['agent_version']) ? 'v' . htmlspecialchars($agent['agent_version']) : '--' ?>
                             <?php if ($latestVersion && !empty($agent['agent_version']) && $agent['agent_version'] !== $latestVersion): ?>
                                 <form method="POST" action="/clients/<?= $agent['id'] ?>/update-agent" class="d-inline" onclick="event.stopPropagation()">
                                     <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -147,14 +147,7 @@
                             <?php endif; ?>
                         </td>
                         <td><?= number_format($agent['restore_points']) ?></td>
-                        <td><?php
-                            $sz = (int) $agent['total_size'];
-                            if ($sz >= 1099511627776) echo round($sz / 1099511627776, 1) . ' TB';
-                            elseif ($sz >= 1073741824) echo round($sz / 1073741824, 1) . ' GB';
-                            elseif ($sz >= 1048576) echo round($sz / 1048576, 1) . ' MB';
-                            elseif ($sz > 0) echo round($sz / 1024, 1) . ' KB';
-                            else echo '--';
-                        ?></td>
+                        <td><?php $sz = (int) $agent['total_size']; echo $sz > 0 ? \BBS\Services\ServerStats::formatBytes($sz) : '--'; ?></td>
                         <td><?= $agent['schedule_count'] ?></td>
                         <td><?= $agent['repo_count'] ?></td>
                         <td><?= htmlspecialchars($agent['owner_name'] ?? '--') ?></td>
@@ -227,14 +220,17 @@ document.getElementById('clientSearch').addEventListener('input', function() {
     });
 });
 </script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="/assets/chartjs/chart.umd.min.js"></script>
 <script>
 (function() {
     const _dk = document.documentElement.getAttribute('data-bs-theme') === 'dark';
     const _tc = _dk ? '#8b929a' : '#6c757d';
     const _gc = _dk ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)';
 
-    // Backup Activity Chart (7 days)
+    // Activity Chart (7 days). Failed jobs are split into "Backup Failed"
+    // (red — actual data risk) and "Other Failed" (amber — updates that
+    // couldn't run because the client was asleep, plugin tests, etc.) per
+    // #141 so a single red bar no longer implies a backup disaster.
     const activityData = <?= json_encode($chartActivity) ?>;
     const actCtx = document.getElementById('activityChart');
     if (actCtx) {
@@ -246,19 +242,25 @@ document.getElementById('clientSearch').addEventListener('input', function() {
                     {
                         label: 'Backups',
                         data: activityData.map(d => d.backups),
-                        backgroundColor: 'rgba(54, 162, 235, 0.7)',
+                        backgroundColor: 'rgba(54, 162, 235, 0.75)',
                         borderRadius: 3,
                     },
                     {
                         label: 'S3 Sync',
                         data: activityData.map(d => d.s3_sync),
-                        backgroundColor: 'rgba(75, 192, 192, 0.7)',
+                        backgroundColor: 'rgba(75, 192, 192, 0.75)',
                         borderRadius: 3,
                     },
                     {
-                        label: 'Failed',
-                        data: activityData.map(d => d.failed),
+                        label: 'Backup Failed',
+                        data: activityData.map(d => d.backup_failed),
                         backgroundColor: '#c0392b',
+                        borderRadius: 3,
+                    },
+                    {
+                        label: 'Other Failed',
+                        data: activityData.map(d => d.other_failed),
+                        backgroundColor: 'rgba(241, 196, 15, 0.85)',
                         borderRadius: 3,
                     }
                 ]
@@ -301,10 +303,11 @@ document.getElementById('clientSearch').addEventListener('input', function() {
                             label: function(ctx) {
                                 let bytes = ctx.raw;
                                 let label = ctx.label || '';
-                                if (bytes >= 1099511627776) return label + ': ' + (bytes / 1099511627776).toFixed(1) + ' TB';
-                                if (bytes >= 1073741824) return label + ': ' + (bytes / 1073741824).toFixed(1) + ' GB';
-                                if (bytes >= 1048576) return label + ': ' + (bytes / 1048576).toFixed(1) + ' MB';
-                                return label + ': ' + (bytes / 1024).toFixed(1) + ' KB';
+                                const s = '\u00A0';
+                                if (bytes >= 1099511627776) return label + ': ' + (bytes / 1099511627776).toFixed(1) + s + 'TB';
+                                if (bytes >= 1073741824) return label + ': ' + (bytes / 1073741824).toFixed(1) + s + 'GB';
+                                if (bytes >= 1048576) return label + ': ' + (bytes / 1048576).toFixed(1) + s + 'MB';
+                                return label + ': ' + (bytes / 1024).toFixed(1) + s + 'KB';
                             }
                         }
                     }

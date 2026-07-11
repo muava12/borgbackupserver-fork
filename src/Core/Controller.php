@@ -20,8 +20,10 @@ class Controller
 
     protected function authView(string $template, array $data = []): void
     {
-        // Load branding and theme settings for auth pages
-        $brandingRows = $this->db->fetchAll("SELECT `key`, `value` FROM settings WHERE `key` IN ('default_theme', 'branding_login_logo', 'branding_login_theme')");
+        // Load branding and theme settings for auth pages. branding_icon is the
+        // small navbar logo, reused on the mobile login header (the big
+        // login_logo is too large for a phone-width pane).
+        $brandingRows = $this->db->fetchAll("SELECT `key`, `value` FROM settings WHERE `key` IN ('default_theme', 'branding_login_logo', 'branding_login_theme', 'branding_icon')");
         $brandSettings = [];
         foreach ($brandingRows as $row) {
             $brandSettings[$row['key']] = $row['value'];
@@ -34,6 +36,9 @@ class Controller
         }
         if (!isset($data['loginLogo'])) {
             $data['loginLogo'] = $brandSettings['branding_login_logo'] ?? null;
+        }
+        if (!isset($data['brandingIcon'])) {
+            $data['brandingIcon'] = $brandSettings['branding_icon'] ?? null;
         }
         extract($data);
         $viewPath = dirname(__DIR__) . '/Views/';
@@ -100,8 +105,24 @@ class Controller
     }
 
     /**
+     * Send 404 if hosted mode is active. Used by storage-management and
+     * remote-SSH controllers — those surfaces are intentionally invisible
+     * to customers of a managed-service deployment. 404 (not 403) so a
+     * curious customer can't even confirm the surface exists.
+     */
+    protected function denyIfHosted(): void
+    {
+        if (\BBS\Core\Config::isHosted()) {
+            http_response_code(404);
+            echo 'Not found';
+            exit;
+        }
+    }
+
+    /**
      * Authenticate via Bearer token for admin API endpoints.
-     * Returns the user record associated with the token.
+     * Returns the user record associated with the token, including
+     * the token's `kind` (user|platform) so endpoints can scope access.
      */
     protected function requireApiToken(): array
     {
@@ -141,7 +162,39 @@ class Controller
             'id' => $apiToken['user_id'],
             'token_id' => $apiToken['id'],
             'token_name' => $apiToken['name'],
+            'token_kind' => $apiToken['kind'] ?? 'user',
+            'can_read_secrets' => !empty($apiToken['can_read_secrets']),
         ];
+    }
+
+    /**
+     * True if this token may return secret material in API responses.
+     * Platform tokens (hosted-managed master key) always qualify;
+     * regular user tokens need the `can_read_secrets` flag set explicitly
+     * at create time. Use this to gate any endpoint that returns
+     * passphrases, S3 credentials, encryption keys, etc.
+     */
+    protected function tokenCanReadSecrets(array $ctx): bool
+    {
+        if (($ctx['token_kind'] ?? 'user') === 'platform') {
+            return true;
+        }
+        return !empty($ctx['can_read_secrets']);
+    }
+
+    /**
+     * Like requireApiToken(), but additionally enforces that the token
+     * is the hosted-platform token (kind='platform'). Used to gate
+     * endpoints that should NEVER be callable by a customer-minted
+     * admin token (e.g. S3 credentials, platform-token rotation).
+     */
+    protected function requirePlatformApiToken(): array
+    {
+        $ctx = $this->requireApiToken();
+        if (($ctx['token_kind'] ?? 'user') !== 'platform') {
+            $this->json(['error' => 'This endpoint requires the platform token.'], 403);
+        }
+        return $ctx;
     }
 
     protected function currentUser(): ?array
@@ -219,7 +272,10 @@ class Controller
 
     protected function verifyCsrf(): void
     {
-        $token = $_POST['csrf_token'] ?? '';
+        // Form posts put it in $_POST; JSON fetch calls send it as a header.
+        $token = $_POST['csrf_token']
+            ?? $_SERVER['HTTP_X_CSRF_TOKEN']
+            ?? '';
         if (!hash_equals($this->csrfToken(), $token)) {
             http_response_code(403);
             echo 'Invalid CSRF token';

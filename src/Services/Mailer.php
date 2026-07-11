@@ -8,6 +8,7 @@ class Mailer
 {
     private string $host;
     private int $port;
+    private string $secure;
     private string $username;
     private string $password;
     private string $fromEmail;
@@ -25,8 +26,25 @@ class Mailer
 
         $this->host = $settings['smtp_host'] ?? '';
         $this->port = (int) ($settings['smtp_port'] ?? 587);
+        $this->secure = $settings['smtp_secure'] ?? self::inferSecure($this->port);
         $this->username = $settings['smtp_user'] ?? '';
-        $this->password = $settings['smtp_pass'] ?? '';
+        // SMTP password is stored encrypted. Legacy plaintext values auto-upgrade:
+        // if decrypt() throws, we treat the raw value as plaintext and re-save
+        // it encrypted for next time.
+        $rawPass = $settings['smtp_pass'] ?? '';
+        $this->password = '';
+        if ($rawPass !== '') {
+            try {
+                $this->password = Encryption::decrypt($rawPass);
+            } catch (\Throwable $e) {
+                $this->password = $rawPass;
+                try {
+                    $db->update('settings',
+                        ['value' => Encryption::encrypt($rawPass)],
+                        "`key` = ?", ['smtp_pass']);
+                } catch (\Throwable $e2) { /* non-fatal */ }
+            }
+        }
         $this->fromEmail = $settings['smtp_from'] ?? $settings['smtp_from_email'] ?? '';
         $this->fromName = $settings['smtp_from_name'] ?? 'Borg Backup Server';
         $this->enabled = !empty($this->host) && !empty($this->fromEmail);
@@ -38,7 +56,9 @@ class Mailer
     }
 
     /**
-     * Send an email using SMTP with STARTTLS.
+     * Send an email using SMTP. Honors the configured smtp_secure mode:
+     * 'ssl' (implicit TLS, typically port 465), 'starttls' (upgrade in-band,
+     * typically port 587), or 'none' (plaintext, port 25).
      */
     public function send(string $to, string $subject, string $body): bool
     {
@@ -47,7 +67,8 @@ class Mailer
         }
 
         try {
-            $socket = @fsockopen($this->host, $this->port, $errno, $errstr, 10);
+            $connHost = $this->secure === 'ssl' ? "ssl://{$this->host}" : $this->host;
+            $socket = @fsockopen($connHost, $this->port, $errno, $errstr, 10);
             if (!$socket) {
                 error_log("SMTP connect failed: {$errstr} ({$errno})");
                 return false;
@@ -56,8 +77,7 @@ class Mailer
             $this->readResponse($socket);
             $this->sendCommand($socket, "EHLO " . gethostname());
 
-            // STARTTLS if port 587
-            if ($this->port === 587) {
+            if ($this->secure === 'starttls') {
                 $this->sendCommand($socket, "STARTTLS");
                 stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT);
                 $this->sendCommand($socket, "EHLO " . gethostname());
@@ -98,28 +118,67 @@ class Mailer
     }
 
     /**
-     * Send a backup failure notification.
+     * Send a task-failure notification. Subject/body reflect the task type
+     * ('backup', 'update_borg', 'check', ...) so an update_borg failure
+     * isn't delivered as "Backup Failed" (#185).
      */
-    public function notifyFailure(string $agentName, int $jobId, string $error): void
+    public function notifyFailure(string $agentName, int $jobId, string $error, string $taskType = 'backup'): void
     {
         if (!$this->enabled) return;
 
         $db = Database::getInstance();
 
-        // Get admin emails
-        $admins = $db->fetchAll("SELECT email FROM users WHERE role = 'admin' AND email != ''");
+        $admins = $db->fetchAll("SELECT email, timezone FROM users WHERE role = 'admin' AND email != ''");
 
-        $subject = "[BBS] Backup Failed: {$agentName} (Job #{$jobId})";
-        $body = "A backup job has failed.\n\n"
-              . "Client: {$agentName}\n"
-              . "Job ID: #{$jobId}\n"
-              . "Time: " . date('Y-m-d H:i:s') . "\n\n"
-              . "Error:\n{$error}\n\n"
-              . "-- Borg Backup Server";
+        $label = self::taskLabel($taskType);
+        $subject = "[BBS] {$label} Failed: {$agentName} (Job #{$jobId})";
 
         foreach ($admins as $admin) {
+            try {
+                $dt = new \DateTime('now', new \DateTimeZone('UTC'));
+                $dt->setTimezone(new \DateTimeZone($admin['timezone'] ?: 'UTC'));
+            } catch (\Exception $e) {
+                $dt = new \DateTime('now', new \DateTimeZone('UTC'));
+            }
+            $body = "{$label} failed for client \"{$agentName}\".\n\n"
+                  . "Client: {$agentName}\n"
+                  . "Job ID: #{$jobId} ({$label})\n"
+                  . "Time: " . $dt->format('Y-m-d H:i:s T') . "\n\n"
+                  . "Error:\n{$error}\n\n"
+                  . "-- Borg Backup Server";
             $this->send($admin['email'], $subject, $body);
         }
+    }
+
+    private static function taskLabel(string $taskType): string
+    {
+        static $labels = [
+            'backup'               => 'Backup',
+            'restore'              => 'Restore',
+            'check'                => 'Repository Check',
+            'prune'                => 'Prune',
+            'compact'              => 'Compact',
+            'update_borg'          => 'Borg Update',
+            'update_agent'         => 'Agent Update',
+            's3_sync'              => 'S3 Sync',
+            's3_restore'           => 'S3 Restore',
+            'repo_repair'          => 'Repository Repair',
+            'break_lock'           => 'Break Lock',
+            'catalog_sync'         => 'Catalog Sync',
+            'catalog_rebuild'      => 'Catalog Rebuild',
+            'catalog_rebuild_full' => 'Catalog Rebuild',
+            'archive_delete'       => 'Archive Delete',
+        ];
+        return $labels[$taskType] ?? ucfirst(str_replace('_', ' ', $taskType));
+    }
+
+    public static function inferSecure(int $port): string
+    {
+        return match ($port) {
+            465 => 'ssl',
+            25 => 'none',
+            default => 'starttls',
+        };
     }
 
     private function sendCommand($socket, string $command): string

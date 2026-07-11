@@ -1,8 +1,5 @@
 <?php
-$sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB'
-    : ($totalSize >= 1048576 ? round($totalSize / 1048576, 1) . ' MB'
-    : ($totalSize >= 1024 ? round($totalSize / 1024, 1) . ' KB'
-    : ($totalSize > 0 ? $totalSize . ' B' : '0')));
+$sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $totalSize) : '0';
 ?>
 
 <!-- Breadcrumb -->
@@ -23,9 +20,9 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                 <h4 class="mb-0">
                     <i class="bi bi-archive text-primary me-2"></i><span id="repoNameDisplay"><?= htmlspecialchars($repo['name']) ?></span>
                     <?php if (($repo['storage_type'] ?? 'local') === 'remote_ssh'): ?>
-                    <span class="badge bg-info ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd-network me-1"></i>Remote SSH</span>
+                    <span class="badge text-bg-info ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd-network me-1"></i>Remote SSH</span>
                     <?php else: ?>
-                    <span class="badge bg-secondary ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd me-1"></i>Local</span>
+                    <span class="badge text-bg-secondary ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd me-1"></i>Local</span>
                     <button type="button" class="btn btn-sm btn-link text-muted p-0 ms-2" id="renameToggle" title="Rename repository"><i class="bi bi-pencil"></i></button>
                     <?php endif; ?>
                 </h4>
@@ -44,7 +41,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                 <?php endif; ?>
             </div>
             <?php if ($activeJob): ?>
-            <span class="badge bg-info"><i class="bi bi-hourglass-split me-1"></i>Active: <?= $activeJob['task_type'] ?></span>
+            <span class="badge text-bg-info"><i class="bi bi-hourglass-split me-1"></i>Active: <?= $activeJob['task_type'] ?></span>
             <?php endif; ?>
         </div>
 
@@ -103,44 +100,94 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
 <div class="row g-4">
     <!-- Repository Info & Recent Jobs (Left) -->
     <div class="col-lg-6">
-        <?php if (($repo['storage_type'] ?? 'local') !== 'remote_ssh' && $s3SyncInfo): ?>
+        <?php if (($repo['storage_type'] ?? 'local') !== 'remote_ssh' && (!empty($s3SyncConfigs) || !empty($s3PluginConfigs))): ?>
         <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-body fw-semibold d-flex justify-content-between align-items-center">
-                <span><i class="bi bi-cloud text-info me-1"></i> S3 Offsite Mirror</span>
-                <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-config/delete" class="d-inline" data-confirm="Disable S3 sync?&#10;&#10;The repository will no longer sync to S3 after backups. Data already in S3 will remain.">
-                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                    <button type="submit" class="btn btn-sm btn-outline-secondary">
-                        <i class="bi bi-cloud-slash me-1"></i>Disable
-                    </button>
-                </form>
+            <div class="card-header fw-semibold">
+                <i class="bi bi-cloud <?= !empty($s3SyncConfigs) ? 'text-info' : 'text-muted' ?> me-1"></i> S3 Offsite Mirror
             </div>
             <div class="card-body">
-                <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded mb-3">
+                <?php if (!empty($s3SyncConfigs)): ?>
+                <!-- Destination list — a repo can replicate to several S3 destinations -->
+                <?php foreach ($s3SyncConfigs as $dest): ?>
+                <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded mb-2">
                     <div class="text-info" style="font-size: 1.5rem;">
                         <i class="bi bi-cloud-check"></i>
                     </div>
-                    <div>
-                        <h6 class="mb-1">Replicated to S3</h6>
+                    <div class="flex-grow-1">
+                        <h6 class="mb-1"><?= htmlspecialchars($dest['config_name']) ?></h6>
                         <p class="text-muted small mb-0">
-                            <?php if ($s3SyncInfo['config_name']): ?>
-                            Config: <strong><?= htmlspecialchars($s3SyncInfo['config_name']) ?></strong><br>
-                            <?php endif; ?>
-                            Last sync: <strong><?= $s3SyncInfo['last_s3_sync'] ? \BBS\Core\TimeHelper::ago($s3SyncInfo['last_s3_sync']) : 'Never' ?></strong>
+                            Last sync: <strong><?= $dest['last_s3_sync'] ? \BBS\Core\TimeHelper::ago($dest['last_s3_sync']) : 'Never' ?></strong>
                         </p>
                     </div>
+                    <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-config/delete" class="d-inline" data-confirm="Stop syncing to &quot;<?= htmlspecialchars($dest['config_name'], ENT_QUOTES) ?>&quot;?&#10;&#10;The repository will no longer sync to this destination after backups. Data already in S3 will remain.">
+                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                        <input type="hidden" name="plugin_config_id" value="<?= $dest['plugin_config_id'] ?>">
+                        <button type="submit" class="btn btn-sm btn-outline-secondary">
+                            <i class="bi bi-cloud-slash me-1"></i>Remove
+                        </button>
+                    </form>
                 </div>
+                <?php endforeach; ?>
+                <?php endif; ?>
 
-                <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded">
+                <?php if (empty($s3PluginConfigs) && !empty($s3SyncConfigs)): ?>
+                <div class="form-text mt-2">
+                    <i class="bi bi-info-circle me-1"></i>
+                    To replicate to another S3 destination, create another <em>S3 Offsite Sync</em>
+                    configuration on the <a href="/clients/<?= $agentId ?>?tab=plugins">client's Plugins tab</a>
+                    (e.g. with a second provider's credentials), then attach it here.
+                </div>
+                <?php endif; ?>
+
+                <?php if (!empty($s3PluginConfigs)): ?>
+                <!-- Add a(nother) destination -->
+                <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-config" class="<?= !empty($s3SyncConfigs) ? 'mt-3' : '' ?>">
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                    <?php if (empty($s3SyncConfigs)): ?>
+                    <p class="text-muted small mb-3">Enable S3 sync to automatically replicate this repository to S3 storage after each backup prune. You can add more than one destination.</p>
+                    <?php endif; ?>
+                    <div class="row g-2 align-items-end">
+                        <div class="col-auto">
+                            <label class="form-label small"><?= !empty($s3SyncConfigs) ? 'Add another destination' : 'S3 Configuration' ?></label>
+                            <select name="plugin_config_id" class="form-select form-select-sm" required>
+                                <?php foreach ($s3PluginConfigs as $cfg): ?>
+                                <option value="<?= $cfg['id'] ?>"><?= htmlspecialchars($cfg['name']) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div class="col-auto">
+                            <button type="submit" class="btn btn-sm btn-info">
+                                <i class="bi bi-cloud-plus me-1"></i><?= !empty($s3SyncConfigs) ? 'Add Destination' : 'Enable S3 Sync' ?>
+                            </button>
+                        </div>
+                    </div>
+                </form>
+                <?php endif; ?>
+
+                <?php if (!empty($s3SyncConfigs)): ?>
+                <!-- Restore from S3 -->
+                <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded mt-3">
                     <div class="text-primary" style="font-size: 1.5rem;">
                         <i class="bi bi-cloud-download"></i>
                     </div>
                     <div class="flex-grow-1">
                         <h6 class="mb-1">Restore from S3</h6>
                         <p class="text-muted small mb-2">Download repository data from S3 back to the server. Use this to recover from local data loss or sync issues.</p>
+                        <?php if (count($s3SyncConfigs) > 1): ?>
+                        <div class="mb-2" style="max-width: 280px;">
+                            <label class="form-label small mb-1">Restore from destination</label>
+                            <select class="form-select form-select-sm" id="s3RestoreSource" onchange="document.querySelectorAll('.s3-restore-source').forEach(el => el.value = this.value)">
+                                <?php foreach ($s3SyncConfigs as $dest): ?>
+                                <option value="<?= $dest['plugin_config_id'] ?>"><?= htmlspecialchars($dest['config_name']) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <?php endif; ?>
                         <div class="d-flex gap-2 flex-wrap align-items-end">
                             <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-restore" class="d-inline" data-confirm="Restore (replace) from S3?&#10;&#10;This will download the repository data from S3 and OVERWRITE local files.">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <input type="hidden" name="mode" value="replace">
+                                <input type="hidden" name="plugin_config_id" class="s3-restore-source" value="<?= $s3SyncConfigs[0]['plugin_config_id'] ?>">
                                 <button type="submit" class="btn btn-sm btn-outline-primary" <?= $activeJob ? 'disabled' : '' ?>>
                                     <i class="bi bi-arrow-repeat me-1"></i>Restore (replace)
                                 </button>
@@ -148,6 +195,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                             <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-restore" class="d-inline" data-confirm="Restore (copy) from S3?&#10;&#10;This will create a NEW repository and download data from S3.">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <input type="hidden" name="mode" value="copy">
+                                <input type="hidden" name="plugin_config_id" class="s3-restore-source" value="<?= $s3SyncConfigs[0]['plugin_config_id'] ?>">
                                 <div class="input-group input-group-sm" style="width: auto;">
                                     <input type="text" name="copy_name" class="form-control form-control-sm" placeholder="New repo name" value="<?= htmlspecialchars($repo['name']) ?>-copy" style="width: 140px;" required <?= $activeJob ? 'disabled' : '' ?>>
                                     <button type="submit" class="btn btn-outline-secondary" <?= $activeJob ? 'disabled' : '' ?>>
@@ -158,40 +206,14 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                         </div>
                     </div>
                 </div>
-            </div>
-        </div>
-        <?php elseif (($repo['storage_type'] ?? 'local') !== 'remote_ssh' && !empty($s3PluginConfigs)): ?>
-        <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-body fw-semibold">
-                <i class="bi bi-cloud text-muted me-1"></i> S3 Offsite Mirror
-            </div>
-            <div class="card-body">
-                <p class="text-muted small mb-3">Enable S3 sync to automatically replicate this repository to S3 storage after each backup prune.</p>
-                <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-config">
-                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                    <div class="row g-2 align-items-end">
-                        <div class="col-auto">
-                            <label class="form-label small">S3 Configuration</label>
-                            <select name="plugin_config_id" class="form-select form-select-sm" required>
-                                <?php foreach ($s3PluginConfigs as $cfg): ?>
-                                <option value="<?= $cfg['id'] ?>"><?= htmlspecialchars($cfg['name']) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div class="col-auto">
-                            <button type="submit" class="btn btn-sm btn-info">
-                                <i class="bi bi-cloud-plus me-1"></i>Enable S3 Sync
-                            </button>
-                        </div>
-                    </div>
-                </form>
+                <?php endif; ?>
             </div>
         </div>
         <?php endif; ?>
 
         <!-- Repository Info -->
         <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-body fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-info-circle me-1"></i> Repository Info
             </div>
             <div class="card-body">
@@ -230,11 +252,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                     $saved = $totalOriginal - $totalDedup;
                     if ($saved > 0) {
                         $fmtBytes = function(int $b) {
-                            if ($b >= 1099511627776) return round($b / 1099511627776, 1) . ' TB';
-                            if ($b >= 1073741824) return round($b / 1073741824, 1) . ' GB';
-                            if ($b >= 1048576) return round($b / 1048576, 1) . ' MB';
-                            if ($b >= 1024) return round($b / 1024, 1) . ' KB';
-                            return $b . ' B';
+                            return \BBS\Services\ServerStats::formatBytes($b);
                         };
                         $dedupSaved = $fmtBytes($saved) . ' saved';
                     }
@@ -308,7 +326,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
         <!-- Recent Jobs -->
         <?php if (!empty($recentJobs)): ?>
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-body fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-clock-history me-1"></i> Recent Jobs
             </div>
             <div class="card-body p-0">
@@ -331,21 +349,22 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                                 <td><?= $job['task_type'] ?></td>
                                 <td>
                                     <?php
-                                    $statusColor = match($job['status']) {
-                                        'completed' => 'success',
-                                        'failed' => 'danger',
-                                        'running' => 'info',
-                                        'sent' => 'primary',
-                                        'queued' => 'warning',
-                                        default => 'secondary',
+                                    // Full class tokens with text-color pairings so warning/info
+                                    // badges stay readable on light fills (#169).
+                                    $statusBadge = match($job['status']) {
+                                        'completed' => 'bg-success',
+                                        'failed'    => 'bg-danger',
+                                        'running'   => 'bg-info text-dark',
+                                        'sent'      => 'bg-primary',
+                                        'queued'    => 'bg-warning text-dark',
+                                        default     => 'bg-secondary',
                                     };
                                     ?>
-                                    <span class="badge bg-<?= $statusColor ?>"><?= $job['status'] ?></span>
+                                    <span class="badge <?= $statusBadge ?>"><?= $job['status'] ?></span>
                                 </td>
                                 <td>
                                     <?php
-                                    $d = $job['duration_seconds'] ?? 0;
-                                    echo $d > 0 ? ($d >= 60 ? floor($d / 60) . 'm ' . ($d % 60) . 's' : $d . 's') : '--';
+                                    echo \BBS\Core\TimeHelper::duration((int) ($job['duration_seconds'] ?? 0));
                                     ?>
                                 </td>
                             </tr>
@@ -361,7 +380,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
     <!-- Maintenance Actions (Right) -->
     <div class="col-lg-6">
         <div class="card border-0 shadow-sm">
-            <div class="card-header bg-body fw-semibold">
+            <div class="card-header fw-semibold">
                 <i class="bi bi-tools me-1"></i> Maintenance
             </div>
             <div class="card-body">
@@ -472,7 +491,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
 
 <!-- Archives -->
 <div class="card border-0 shadow-sm mt-4" id="archives-section">
-    <div class="card-header bg-body fw-semibold d-flex justify-content-between align-items-center">
+    <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
         <span><i class="bi bi-stack me-1"></i> Recovery Points (<?= $archiveCount ?>)</span>
     </div>
     <div class="card-body p-0">
@@ -493,12 +512,8 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
                 </thead>
                 <tbody>
                     <?php foreach ($archives as $ar):
-                        $origLabel = $ar['original_size'] >= 1073741824 ? round($ar['original_size'] / 1073741824, 1) . ' GB'
-                            : ($ar['original_size'] >= 1048576 ? round($ar['original_size'] / 1048576, 1) . ' MB'
-                            : round($ar['original_size'] / 1024, 1) . ' KB');
-                        $dedupLabel = $ar['deduplicated_size'] >= 1073741824 ? round($ar['deduplicated_size'] / 1073741824, 1) . ' GB'
-                            : ($ar['deduplicated_size'] >= 1048576 ? round($ar['deduplicated_size'] / 1048576, 1) . ' MB'
-                            : round($ar['deduplicated_size'] / 1024, 1) . ' KB');
+                        $origLabel = \BBS\Services\ServerStats::formatBytes((int) $ar['original_size']);
+                        $dedupLabel = \BBS\Services\ServerStats::formatBytes((int) $ar['deduplicated_size']);
                     ?>
                     <tr style="cursor:pointer" onclick="window.location='/clients/<?= $repo['agent_id'] ?>/repo/<?= $repo['id'] ?>/archive/<?= $ar['id'] ?>'">
                         <td>
@@ -567,7 +582,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
 <?php if ($this->isAdmin()): ?>
 <hr class="mt-4 mb-0">
 <div class="card border-0 shadow-sm mt-4 border-danger">
-    <div class="card-header bg-body fw-semibold text-danger">
+    <div class="card-header fw-semibold text-danger">
         <i class="bi bi-exclamation-triangle me-1"></i> Danger Zone
     </div>
     <div class="card-body">
@@ -589,13 +604,12 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
             <?php else: ?>
             <form method="POST" action="/repositories/<?= $repo['id'] ?>/delete" id="deleteRepoForm">
                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                <?php if (($repo['storage_type'] ?? 'local') !== 'remote_ssh' && $s3SyncInfo): ?>
+                <?php if (($repo['storage_type'] ?? 'local') !== 'remote_ssh' && !empty($s3SyncConfigs)): ?>
                 <div class="form-check mb-2">
                     <input class="form-check-input" type="checkbox" name="delete_from_s3" id="deleteFromS3" value="1">
                     <label class="form-check-label small" for="deleteFromS3">
-                        <i class="bi bi-cloud text-info me-1"></i>Also delete from S3 offsite storage
+                        <i class="bi bi-cloud text-info me-1"></i>Also delete from S3 offsite storage<?= count($s3SyncConfigs) > 1 ? ' (all ' . count($s3SyncConfigs) . ' destinations)' : '' ?>
                     </label>
-                    <input type="hidden" name="plugin_config_id" value="<?= $s3SyncInfo['plugin_config_id'] ?>">
                 </div>
                 <?php endif; ?>
                 <button type="submit" class="btn btn-outline-danger">
@@ -638,7 +652,7 @@ $sizeLabel = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB
 
     if (copyBtn) {
         copyBtn.addEventListener('click', function() {
-            navigator.clipboard.writeText(el.dataset.passphrase).then(function() {
+            BBS.copyText(el.dataset.passphrase).then(function() {
                 var icon = copyBtn.querySelector('i');
                 icon.className = 'bi bi-check';
                 setTimeout(function() { icon.className = 'bi bi-clipboard'; }, 1500);

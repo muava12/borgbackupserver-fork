@@ -8,15 +8,189 @@ use BBS\Services\ServerStats;
 
 class DashboardController extends Controller
 {
+    /** Category → task_type list, for filtering the Recently Completed panel. */
+    private const RECENT_JOB_CATEGORIES = [
+        'backup'  => ['backup'],
+        'restore' => ['restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 's3_restore'],
+        'prune'   => ['prune'],
+        'compact' => ['compact'],
+        's3'      => ['s3_sync'],
+        'other'   => [
+            'check', 'repo_check', 'repo_repair', 'break_lock',
+            'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full',
+            'archive_delete', 'update_borg', 'update_agent', 'plugin_test',
+        ],
+    ];
+
     public function index(): void
     {
         $this->requireAuth();
 
         $data = $this->getDashboardData();
         $data = array_merge($data, $this->getSlowStats());
+        $data = array_merge($data, $this->getDashboardExtras());
         $data['pageTitle'] = 'Dashboard';
 
+        // Scheduler heartbeat staleness. The cron scheduler stamps
+        // 'scheduler_last_run' every minute; when it goes stale the cron is
+        // dead or misconfigured, which silently strands server-side jobs
+        // (prune/compact/catalog) in the queue while agent backups keep
+        // working via the poll endpoint (#307). Only warn once agents exist,
+        // so a brand-new install doesn't nag before the first cron tick.
+        $data['schedulerLastRun'] = null;
+        $data['schedulerStale'] = false;
+        $agentCount = (int) ($this->db->fetchOne("SELECT COUNT(*) AS c FROM agents")['c'] ?? 0);
+        if ($agentCount > 0) {
+            $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'scheduler_last_run'");
+            $data['schedulerLastRun'] = $row['value'] ?? null;
+            // The heartbeat is written in UTC (scheduler.php forces UTC), so
+            // parse it as UTC rather than the web process's default timezone.
+            $lastTs = 0;
+            if ($data['schedulerLastRun']) {
+                $lastTs = (new \DateTime($data['schedulerLastRun'], new \DateTimeZone('UTC')))->getTimestamp();
+            }
+            $data['schedulerStale'] = (time() - $lastTs) > 600; // >10 min (10+ missed runs)
+        }
+
         $this->view('dashboard/index', $data);
+    }
+
+    /** Data unique to the dashboard — per-location storage, server identity, global totals. */
+    private function getDashboardExtras(): array
+    {
+        // --- Storage locations: per-location df + repo/archive counts ---
+        $locations = $this->db->fetchAll("
+            SELECT sl.id, sl.label, sl.path, sl.is_default,
+                   (SELECT COUNT(*) FROM repositories r
+                     WHERE (r.storage_location_id = sl.id)
+                        OR (sl.is_default = 1 AND r.storage_location_id IS NULL
+                            AND (r.storage_type = 'local' OR r.storage_type IS NULL))) AS repo_count,
+                   (SELECT COALESCE(SUM(size_bytes), 0) FROM repositories r
+                     WHERE (r.storage_location_id = sl.id)
+                        OR (sl.is_default = 1 AND r.storage_location_id IS NULL
+                            AND (r.storage_type = 'local' OR r.storage_type IS NULL))) AS repo_bytes
+            FROM storage_locations sl
+            ORDER BY sl.is_default DESC, sl.label
+        ");
+        $storageLocations = [];
+        foreach ($locations as $loc) {
+            $disk = ServerStats::getDiskUsage($loc['path']);
+            $storageLocations[] = [
+                'kind' => 'local',
+                'id' => (int) $loc['id'],
+                'label' => $loc['label'] ?: $loc['path'],
+                'path' => $loc['path'],
+                'is_default' => (bool) $loc['is_default'],
+                'repo_count' => (int) $loc['repo_count'],
+                'repo_bytes' => (int) $loc['repo_bytes'],
+                'disk_total' => $disk['total'] ?? null,
+                'disk_used' => $disk['used'] ?? null,
+                'disk_free' => $disk['free'] ?? null,
+                'disk_percent' => $disk['percent'] ?? null,
+            ];
+        }
+
+        // --- Remote SSH storage ---
+        $remotes = $this->db->fetchAll("
+            SELECT id, name, provider, remote_host, remote_user, disk_total_bytes, disk_used_bytes, disk_free_bytes, disk_checked_at, borgbase_usage_source,
+                   (SELECT COUNT(*) FROM repositories r WHERE r.remote_ssh_config_id = remote_ssh_configs.id) AS repo_count,
+                   (SELECT COALESCE(SUM(size_bytes), 0) FROM repositories r WHERE r.remote_ssh_config_id = remote_ssh_configs.id) AS repo_bytes
+            FROM remote_ssh_configs
+            ORDER BY name
+        ");
+        foreach ($remotes as $rc) {
+            $total = $rc['disk_total_bytes'] !== null ? (int) $rc['disk_total_bytes'] : null;
+            $used  = $rc['disk_used_bytes']  !== null ? (int) $rc['disk_used_bytes']  : null;
+            $free  = $rc['disk_free_bytes']  !== null ? (int) $rc['disk_free_bytes']  : null;
+            $pct   = ($total && $used !== null) ? round(($used / $total) * 100, 1) : null;
+            $storageLocations[] = [
+                'kind' => 'remote',
+                'provider' => $rc['provider'] ?? null,
+                'id' => (int) $rc['id'],
+                'label' => $rc['name'],
+                'path' => $rc['remote_user'] . '@' . $rc['remote_host'],
+                'is_default' => false,
+                'repo_count' => (int) $rc['repo_count'],
+                'repo_bytes' => (int) $rc['repo_bytes'],
+                'disk_total' => $total,
+                'disk_used' => $used,
+                'disk_free' => $free,
+                'disk_percent' => $pct,
+                'borgbase_usage_source' => $rc['borgbase_usage_source'] ?? null,
+            ];
+        }
+
+        // --- Global totals (for the summary tile) ---
+        [$agentWhere, $agentParams] = $this->getAgentWhereClause('a');
+        $archiveCountRow = $this->db->fetchOne("
+            SELECT COUNT(*) AS c
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            JOIN agents a ON a.id = r.agent_id
+            WHERE {$agentWhere}
+        ", $agentParams);
+        // Two separate sums — a JOIN between repos and archives would inflate
+        // size_bytes (repos.size_bytes counted once per joined archive row).
+        $origRow = $this->db->fetchOne("
+            SELECT COALESCE(SUM(ar.original_size), 0) AS orig
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            JOIN agents a ON a.id = r.agent_id
+            WHERE {$agentWhere}
+        ", $agentParams);
+        $diskRow = $this->db->fetchOne("
+            SELECT COALESCE(SUM(r.size_bytes), 0) AS on_disk
+            FROM repositories r
+            JOIN agents a ON a.id = r.agent_id
+            WHERE {$agentWhere}
+        ", $agentParams);
+        $lastBackup = $this->db->fetchOne("
+            SELECT bj.completed_at, a.name AS agent_name
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.task_type = 'backup' AND bj.status = 'completed' AND {$agentWhere}
+            ORDER BY bj.completed_at DESC LIMIT 1
+        ", $agentParams);
+        $backups24hRow = $this->db->fetchOne("
+            SELECT COUNT(*) AS c
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.task_type = 'backup' AND bj.status = 'completed'
+              AND bj.completed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+              AND {$agentWhere}
+        ", $agentParams);
+
+        // --- Server identity ---
+        $bbsVersion = (new \BBS\Services\UpdateService())->getCurrentVersion();
+        $osName = 'Linux';
+        if (is_readable('/etc/os-release')) {
+            $info = @parse_ini_file('/etc/os-release');
+            if ($info && !empty($info['PRETTY_NAME'])) $osName = $info['PRETTY_NAME'];
+        }
+        $uptimeSec = null;
+        if (is_readable('/proc/uptime')) {
+            $u = @file_get_contents('/proc/uptime');
+            if ($u) $uptimeSec = (int) explode(' ', trim($u))[0];
+        }
+        $hostnameSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
+        $serverHost = $hostnameSetting['value'] ?? gethostname();
+
+        // MySQL storage breakdown (for the MariaDB card visual)
+        $mysqlStorage = $this->isAdmin() ? ServerStats::getMysqlStorage() : null;
+
+        return [
+            'storageLocations' => $storageLocations,
+            'totalArchiveCount' => (int) ($archiveCountRow['c'] ?? 0),
+            'totalOriginalBytes' => (int) ($origRow['orig'] ?? 0),
+            'totalDiskBytes' => (int) ($diskRow['on_disk'] ?? 0),
+            'lastBackup' => $lastBackup ?: null,
+            'backupsLast24h' => (int) ($backups24hRow['c'] ?? 0),
+            'bbsVersion' => $bbsVersion,
+            'osName' => $osName,
+            'uptimeSec' => $uptimeSec,
+            'serverHost' => $serverHost,
+            'mysqlStorage' => $mysqlStorage,
+        ];
     }
 
     /**
@@ -29,12 +203,166 @@ class DashboardController extends Controller
     }
 
     /**
+     * GET /dashboard/health-json — lightweight CPU/memory/partition poll for
+     * the Server Health card (every ~15s). Server-side formats the values so
+     * the JS only has to swap text.
+     */
+    public function apiHealthJson(): void
+    {
+        $this->requireAuth();
+        if (!$this->isAdmin()) {
+            $this->json(['error' => 'admin only'], 403);
+        }
+        $cpu = ServerStats::getCpuLoad();
+        $mem = ServerStats::getMemory();
+        $partitions = ServerStats::getPartitions();
+        $net = ServerStats::getNetworkThroughput();
+
+        // Standardize df-style single-letter units to "GB"/"TB"/etc.
+        $dfFix = function (string $s): string {
+            if (preg_match('/^([\d.]+)([TGMK])$/', $s, $m)) return $m[1] . "\u{00A0}" . $m[2] . 'B';
+            return $s;
+        };
+
+        // Featured partition for the health card. Hosted mode: track the
+        // default storage_locations row (the platform-managed mount, usually
+        // /mnt/repos). Non-hosted: /var/bbs, falling back to /. The full
+        // partition list lives in the Storage Locations card.
+        $disk = null;
+        if (\BBS\Core\Config::isHosted()) {
+            $defaultRow = $this->db->fetchOne("SELECT path FROM storage_locations WHERE is_default = 1");
+            if ($defaultRow && !empty($defaultRow['path'])) {
+                $defaultPath = rtrim($defaultRow['path'], '/') ?: '/';
+                foreach ($partitions as $p) {
+                    if (($p['mount'] ?? '') === $defaultPath) { $disk = $p; break; }
+                }
+                if (!$disk) {
+                    $du = ServerStats::getDiskUsage($defaultPath);
+                    if ($du) {
+                        $disk = [
+                            'mount'   => $defaultPath,
+                            'size'    => ServerStats::formatDfSize($du['total']),
+                            'used'    => ServerStats::formatDfSize($du['used']),
+                            'percent' => $du['percent'],
+                        ];
+                    }
+                }
+            }
+        }
+        if (!$disk) {
+            foreach ($partitions as $p) {
+                if (($p['mount'] ?? '') === '/var/bbs') { $disk = $p; break; }
+            }
+        }
+        if (!$disk) {
+            foreach ($partitions as $p) {
+                if (($p['mount'] ?? '') === '/') { $disk = $p; break; }
+            }
+        }
+
+        $this->json([
+            'cpu' => [
+                'percent' => $cpu['percent'] ?? 0,
+                '1min' => $cpu['1min'] ?? 0,
+                'cores' => $cpu['cores'] ?? 1,
+            ],
+            'memory' => [
+                'percent' => $mem['percent'] ?? 0,
+                'used_label' => ServerStats::formatBytes($mem['used'] ?? 0),
+                'total_label' => ServerStats::formatBytes($mem['total'] ?? 0),
+                'pair_label' => ServerStats::formatBytesPair((int) ($mem['used'] ?? 0), (int) ($mem['total'] ?? 0)),
+            ],
+            'net' => $net ? [
+                'rx_bps' => $net['rx_bps'],
+                'tx_bps' => $net['tx_bps'],
+                'rx_label' => ServerStats::formatRate($net['rx_bps']),
+                'tx_label' => ServerStats::formatRate($net['tx_bps']),
+            ] : null,
+            'disk' => $disk ? [
+                'mount' => $disk['mount'],
+                'percent' => $disk['percent'] ?? 0,
+                'size_label' => ServerStats::dfPairLabel($disk['used'] ?? '0', $disk['size'] ?? '0'),
+            ] : null,
+        ]);
+    }
+
+    /**
      * GET /dashboard/stats-json — slow stats (ClickHouse, server health), polled every 60s.
      */
     public function apiStatsJson(): void
     {
         $this->requireAuth();
         $this->json($this->getSlowStats());
+    }
+
+    /**
+     * GET /dashboard/active-json — fast poll (~10s) for the things the user
+     * watches in real time: active/queued job table + the top tile counts
+     * (clients online, running/queued, errors). Trimmed payload — no charts,
+     * no recent jobs, no archive totals — so it's cheap to call frequently.
+     */
+    public function apiActiveJson(): void
+    {
+        $this->requireAuth();
+
+        [$agentWhere, $agentParams] = $this->getAgentWhereClause('a');
+        $jobScope = $agentWhere === '1=1' ? '' : "AND {$agentWhere}";
+
+        $agentCount = (int) ($this->db->fetchOne(
+            "SELECT COUNT(*) as cnt FROM agents a WHERE {$agentWhere}",
+            $agentParams
+        )['cnt'] ?? 0);
+
+        $onlineCount = (int) ($this->db->fetchOne(
+            "SELECT COUNT(*) as cnt FROM agents a WHERE status = 'online' AND {$agentWhere}",
+            $agentParams
+        )['cnt'] ?? 0);
+
+        $activeJobs = $this->db->fetchAll("
+            SELECT bj.id, bj.task_type, bj.status, bj.files_total, bj.files_processed,
+                   a.name as agent_name, r.name as repo_name
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            LEFT JOIN repositories r ON r.id = bj.repository_id
+            WHERE bj.status IN ('queued', 'running', 'sent') {$jobScope}
+            ORDER BY bj.queued_at ASC
+        ", $agentParams);
+
+        $runningJobs = 0;
+        $queuedJobs = 0;
+        foreach ($activeJobs as $j) {
+            if ($j['status'] === 'running' || $j['status'] === 'sent') $runningJobs++;
+            else $queuedJobs++;
+        }
+
+        // Tile links to /log?level=error&hours=24, so count only what that
+        // page renders. See getDashboardData() for the rationale (#235).
+        $errorCountQuery = "SELECT COUNT(*) as cnt FROM server_log sl LEFT JOIN agents a ON a.id = sl.agent_id WHERE sl.level = 'error' AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
+        if ($agentWhere !== '1=1') {
+            $errorCountQuery .= " AND ({$agentWhere} OR sl.agent_id IS NULL)";
+        }
+        $errorCount = (int) ($this->db->fetchOne($errorCountQuery, $agentParams)['cnt'] ?? 0);
+
+        $this->json([
+            'agentCount'  => $agentCount,
+            'onlineCount' => $onlineCount,
+            'runningJobs' => $runningJobs,
+            'queuedJobs'  => $queuedJobs,
+            'errorCount'  => $errorCount,
+            'activeJobs'  => array_map(static function ($j) {
+                $pct = ((int) ($j['files_total'] ?? 0)) > 0
+                    ? (int) round(((int) $j['files_processed'] / (int) $j['files_total']) * 100)
+                    : null;
+                return [
+                    'id'          => (int) $j['id'],
+                    'agent_name'  => $j['agent_name'],
+                    'task_type'   => $j['task_type'],
+                    'repo_name'   => $j['repo_name'],
+                    'status'      => $j['status'],
+                    'percent'     => $pct,
+                ];
+            }, $activeJobs),
+        ]);
     }
 
     /**
@@ -134,11 +462,40 @@ class DashboardController extends Controller
         $queuedJobs = $this->db->fetchOne(
             "SELECT COUNT(*) as cnt FROM backup_jobs bj JOIN agents a ON a.id = bj.agent_id WHERE bj.status = 'queued' {$jobScope}", $jobParams
         )['cnt'];
+        // The "Errors (24h)" tile links straight to /log?level=error&hours=24,
+        // so the count must match what that page renders — otherwise the tile
+        // says "5 errors" and the linked page is empty (#235). Failed jobs
+        // already write a level=error server_log row from the agent status
+        // endpoint and the scheduler's stale/zombie sweepers, so they're
+        // captured here without a separate count. Operational alerts
+        // (agent_offline, missed_schedule) live in /notifications.
         $errorCountQuery = "SELECT COUNT(*) as cnt FROM server_log sl LEFT JOIN agents a ON a.id = sl.agent_id WHERE sl.level = 'error' AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
         if ($agentWhere !== '1=1') {
             $errorCountQuery .= " AND ({$agentWhere} OR sl.agent_id IS NULL)";
         }
-        $errorCount = $this->db->fetchOne($errorCountQuery, $jobParams)['cnt'];
+        $errorCount = (int) $this->db->fetchOne($errorCountQuery, $jobParams)['cnt'];
+
+        // Optional task-type filter for the Recently Completed list. Accepts
+        // a comma-separated list of category keys (backup, restore, prune,
+        // compact, s3, other) — see self::RECENT_JOB_CATEGORIES for the
+        // task_type mapping. Persisted client-side via localStorage.
+        $recentScope = $jobScope;
+        $recentParams = $jobParams;
+        $typesParam = $_GET['types'] ?? '';
+        if ($typesParam !== '') {
+            $wanted = array_filter(array_map('trim', explode(',', $typesParam)));
+            $taskTypes = [];
+            foreach ($wanted as $cat) {
+                foreach (self::RECENT_JOB_CATEGORIES[$cat] ?? [] as $t) {
+                    $taskTypes[$t] = true;
+                }
+            }
+            if (!empty($taskTypes)) {
+                $placeholders = implode(',', array_fill(0, count($taskTypes), '?'));
+                $recentScope .= " AND bj.task_type IN ({$placeholders})";
+                $recentParams = array_merge($recentParams, array_keys($taskTypes));
+            }
+        }
 
         $recentJobs = $this->db->fetchAll("
             SELECT bj.*, SUBSTRING(bj.error_log, 1, 255) as error_log, a.name as agent_name,
@@ -147,10 +504,10 @@ class DashboardController extends Controller
             JOIN agents a ON a.id = bj.agent_id
             LEFT JOIN repositories r ON r.id = bj.repository_id
             LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
-            WHERE bj.status IN ('completed', 'failed', 'cancelled') {$jobScope}
+            WHERE bj.status IN ('completed', 'failed', 'cancelled') {$recentScope}
             ORDER BY bj.completed_at DESC
             LIMIT 10
-        ", $jobParams);
+        ", $recentParams);
 
         $activeJobs = $this->db->fetchAll("
             SELECT bj.*, SUBSTRING(bj.error_log, 1, 255) as error_log, a.name as agent_name,
@@ -191,6 +548,21 @@ class DashboardController extends Controller
             ORDER BY hour
         ", $jobParams);
 
+        // Hourly error bars must come from the same source as the "Errors (24h)"
+        // tile and the linked /log page (#240) — counting failed_jobs and
+        // unresolved alerts here meant the chart showed red bars at hours that
+        // had no corresponding entries on the Log page.
+        $logErrorsChartQuery = "SELECT DATE_FORMAT(sl.created_at, '%Y-%m-%d %H:00') as hour, COUNT(*) as count
+                                  FROM server_log sl
+                                  LEFT JOIN agents a ON a.id = sl.agent_id
+                                 WHERE sl.level = 'error'
+                                   AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
+        if ($agentWhere !== '1=1') {
+            $logErrorsChartQuery .= " AND ({$agentWhere} OR sl.agent_id IS NULL)";
+        }
+        $logErrorsChartQuery .= " GROUP BY hour ORDER BY hour";
+        $logErrorsChart = $this->db->fetchAll($logErrorsChartQuery, $jobParams);
+
         // Group task types into 3 categories
         $categoryMap = [
             'backup' => 'backups',
@@ -203,6 +575,9 @@ class DashboardController extends Controller
             $cat = $categoryMap[$row['task_type']] ?? null;
             if ($cat === null) continue;
             $hourCounts[$row['hour']][$cat] = ($hourCounts[$row['hour']][$cat] ?? 0) + (int) $row['count'];
+        }
+        foreach ($logErrorsChart as $row) {
+            $hourCounts[$row['hour']]['errors'] = ($hourCounts[$row['hour']]['errors'] ?? 0) + (int) $row['count'];
         }
 
         // Fill in missing hours
@@ -223,6 +598,7 @@ class DashboardController extends Controller
                 'backups' => $counts['backups'] ?? 0,
                 'restores' => $counts['restores'] ?? 0,
                 's3_sync' => $counts['s3_sync'] ?? 0,
+                'errors' => $counts['errors'] ?? 0,
             ];
         }
 
@@ -255,6 +631,9 @@ class DashboardController extends Controller
         return [
             'cpuLoad' => $cache->remember('server_cpu', 60, fn() => ServerStats::getCpuLoad()),
             'memory' => $cache->remember('server_mem', 60, fn() => ServerStats::getMemory()),
+            // Not remember()-cached: the method keeps its own counter
+            // snapshot and must run every call to measure a delta.
+            'netThroughput' => ServerStats::getNetworkThroughput(),
             'partitions' => $cache->remember('server_parts', 60, fn() => ServerStats::getPartitions()),
             'mysqlStats' => $cache->remember('mysql_stats', 60, fn() => ServerStats::getMysqlStats()),
             'clickhouseStats' => $cache->remember('ch_stats', 60, fn() => ServerStats::getClickHouseStats()),
@@ -289,6 +668,10 @@ class DashboardController extends Controller
             ];
             if ($info['total_original'] > 0) {
                 $info['dedup_savings'] = round((1 - $info['total_dedup'] / $info['total_original']) * 100, 1);
+                // Clamp at 99.9% — rounding can produce 100 even when dedup > 0 (#191).
+                if ($info['dedup_savings'] >= 100 && $info['total_dedup'] > 0) {
+                    $info['dedup_savings'] = 99.9;
+                }
             }
             if (!empty($path)) {
                 $diskUsage = \BBS\Services\ServerStats::getDiskUsage($path);

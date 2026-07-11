@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import socket
@@ -45,7 +46,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.25.0"
+AGENT_VERSION = "2.61.0"
 BORG_PATH = None  # Resolved in get_system_info()
 IS_WINDOWS = sys.platform == "win32"
 
@@ -111,20 +112,85 @@ if IS_WINDOWS:
         pass
 
 
+def _detect_dropbear():
+    """Detect Dropbear's dbclient (common on Enigma2 boxes, BusyBox, embedded
+    Linux). Dropbear ignores OpenSSH-only options like UserKnownHostsFile and
+    LogLevel and prints "Ignoring unknown configuration option" warnings to
+    stderr — harmless but noisy in the agent log (#247). When detected, we
+    swap to Dropbear-equivalent flags (-y -y for hostkey, -q for quiet)."""
+    if IS_WINDOWS:
+        return False
+    try:
+        result = subprocess.run([SSH_CMD, "-V"], capture_output=True, timeout=3)
+        text = (result.stdout + result.stderr).decode("utf-8", errors="ignore").lower()
+        return "dropbear" in text
+    except Exception:
+        return False
+
+
+IS_DROPBEAR = _detect_dropbear()
+
+
+def _ssh_common_opts(connect_timeout=None):
+    """Argv fragment for non-interactive ssh: skip hostkey check, run in
+    batch mode, optionally cap connect time. Dropbear has none of the
+    OpenSSH `-o` options and complains about them — emit `-y -y` instead
+    (skips hostkey check + accepts new keys silently). BatchMode and
+    ConnectTimeout don't exist on Dropbear but its defaults are equivalent
+    when key-auth is set up, so we just omit them."""
+    if IS_DROPBEAR:
+        return ["-y", "-y"]
+    # Always "/dev/null" — even on Windows. The bundled ssh is MinGit /
+    # Git-for-Windows (MSYS2-based), which maps "/dev/null" to the real null
+    # device but treats "NUL" as a relative filename. With
+    # StrictHostKeyChecking=no, ssh appends newly-seen host keys to the
+    # UserKnownHostsFile, so "NUL" creates a literal, reserved-name file named
+    # NUL in the working directory that Explorer/PowerShell cannot delete (#300).
+    null = "/dev/null"
+    opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile={}".format(null),
+        "-o", "BatchMode=yes",
+        "-o", "LogLevel=ERROR",
+    ]
+    if connect_timeout:
+        opts.extend(["-o", "ConnectTimeout={}".format(int(connect_timeout))])
+    return opts
+
+
+def _rewrite_borg_rsh_for_dropbear(rsh):
+    """Server-built BORG_RSH strings include OpenSSH-only `-o` options that
+    Dropbear logs warnings for (#247). Strip them and add Dropbear's `-y -y`
+    so the connection still skips hostkey verification."""
+    # Drop `-o key=value` and `-o key=val` whether quoted or not
+    rsh = re.sub(r'\s+-o\s+\S+', '', rsh)
+    # Insert -y -y right after the ssh command (handles quoted ssh paths too)
+    if rsh.startswith('"'):
+        # quoted ssh path: "C:/path/ssh.exe" rest...
+        end = rsh.find('"', 1)
+        if end > 0:
+            return rsh[:end + 1] + ' -y -y' + rsh[end + 1:]
+    return rsh.replace('ssh ', 'ssh -y -y ', 1)
+
+
 def _lockdown_key_windows(path):
-    """Set SSH key permissions so only SYSTEM and Administrators can read it.
+    """Set SSH key permissions so only SYSTEM and Administrators can access it.
+
+    SYSTEM gets FullControl (the agent service runs as SYSTEM and must be able
+    to overwrite/delete this file on retry and cleanup). Administrators get
+    Read. OpenSSH on Windows only refuses keys when *other* users can read —
+    granting the owner Write/Delete is fine.
 
     Uses PowerShell to create a clean ACL from scratch — no leftover ACEs.
     SIDs are used instead of group names for locale independence.
     Falls back to icacls if PowerShell is unavailable.
     """
-    # PowerShell: build a fresh ACL with only SYSTEM + Administrators read access
     ps_cmd = (
         "$acl = New-Object System.Security.AccessControl.FileSecurity; "
         "$acl.SetAccessRuleProtection($true, $false); "
         "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("
         "(New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'), "
-        "[System.Security.AccessControl.FileSystemRights]::Read, "
+        "[System.Security.AccessControl.FileSystemRights]::FullControl, "
         "[System.Security.AccessControl.AccessControlType]::Allow))); "
         "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("
         "(New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'), "
@@ -154,9 +220,27 @@ def _lockdown_key_windows(path):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     subprocess.run(
-        ["icacls", path, "/grant:r", "*S-1-5-18:(R)", "*S-1-5-32-544:(R)"],
+        ["icacls", path, "/grant:r", "*S-1-5-18:(F)", "*S-1-5-32-544:(R)"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+
+
+def _clear_stale_key_windows(path):
+    """Delete a previously-locked-down key file before rewriting.
+
+    Older agents granted SYSTEM only Read, so the leftover file blocks
+    open("w"). Grant ourselves perms via icacls, then delete.
+    """
+    if not os.path.exists(path):
+        return
+    subprocess.run(
+        ["icacls", path, "/grant", "*S-1-5-18:(F)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    try:
+        os.unlink(path)
+    except Exception as e:
+        logger.warning("Could not remove stale remote SSH key at {}: {}".format(path, e))
 
 
 def _verify_key_readable(path):
@@ -233,9 +317,14 @@ def load_config():
 def api_request(config, endpoint, method="GET", data=None, timeout=60):
     """Make an authenticated request to the BBS server."""
     url = "{}{}".format(config['server_url'], endpoint)
+    # Cloudflare blocks Python's default "Python-urllib/3.x" User-Agent with
+    # a 1010 challenge, so a BBS server fronted by Cloudflare returns 403 to
+    # every agent request and the registration loop gives up (#237). A
+    # named UA also makes our traffic identifiable in server access logs.
     headers = {
         "Authorization": "Bearer {}".format(config['api_key']),
         "Content-Type": "application/json",
+        "User-Agent": "BBS-Agent/{}".format(AGENT_VERSION),
     }
 
     body = None
@@ -486,12 +575,63 @@ def download_ssh_key(config):
             _lockdown_key_windows(SSH_KEY_PATH)
         else:
             os.chmod(SSH_KEY_PATH, 0o600)
+            _maybe_convert_dropbear_key(SSH_KEY_PATH)
         logger.info("SSH key saved to {}".format(SSH_KEY_PATH))
         _save_ssh_info(result)
         return True
     except Exception as e:
         logger.error("Failed to save SSH key: {}".format(e))
         return False
+
+
+def _maybe_convert_dropbear_key(key_path):
+    """If the local SSH client is Dropbear (common on embedded systems
+    like OpenATV/Enigma2 receivers), convert the OpenSSH-format key the
+    server hands us into Dropbear's binary format. install.sh does this
+    once on first install, but the agent re-downloads on auth failure
+    after a server-side key rotation — without a runtime conversion the
+    rewritten OpenSSH key would be unreadable by dbclient and the agent
+    would loop. Mirrors the install.sh fallback: warn and leave the key
+    in OpenSSH format if dropbearconvert isn't available."""
+    try:
+        ver = subprocess.run(["ssh", "-V"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, timeout=5)
+        banner = (ver.stdout or b"").decode("utf-8", errors="replace")
+        if "Dropbear" not in banner:
+            return
+    except Exception:
+        return
+
+    try:
+        which = subprocess.run(["dropbearconvert", "-h"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        if which.returncode not in (0, 1):  # -h often exits 1 but proves the binary exists
+            raise FileNotFoundError
+    except FileNotFoundError:
+        logger.warning("Dropbear SSH detected but dropbearconvert not found; "
+                       "key left in OpenSSH format (may not authenticate)")
+        return
+    except Exception:
+        return
+
+    tmp_path = key_path + ".dropbear"
+    try:
+        conv = subprocess.run(
+            ["dropbearconvert", "openssh", "dropbear", key_path, tmp_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        if conv.returncode == 0 and os.path.exists(tmp_path):
+            os.replace(tmp_path, key_path)
+            os.chmod(key_path, 0o600)
+            logger.info("Converted SSH key to Dropbear format")
+        else:
+            err = conv.stderr.decode("utf-8", errors="replace").strip()
+            logger.warning("dropbearconvert failed: {}".format(err[:200]))
+            try: os.unlink(tmp_path)
+            except OSError: pass
+    except Exception as e:
+        logger.warning("Dropbear key conversion error: {}".format(e))
+        try: os.unlink(tmp_path)
+        except OSError: pass
 
 
 def _save_ssh_info(result):
@@ -531,19 +671,10 @@ def test_ssh_connection(config):
         'Permission denied' means auth actually failed (key mismatch).
         """
         try:
-            known_hosts_null = "NUL" if IS_WINDOWS else "/dev/null"
             proc = subprocess.Popen(
-                [
-                    SSH_CMD,
-                    "-i", SSH_KEY_PATH,
-                    "-p", ssh_port,
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile={}".format(known_hosts_null),
-                    "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=10",
-                    "{}@{}".format(ssh_user, server_host),
-                    "ping",
-                ],
+                [SSH_CMD, "-i", SSH_KEY_PATH, "-p", ssh_port]
+                + _ssh_common_opts(connect_timeout=10)
+                + ["{}@{}".format(ssh_user, server_host), "ping"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -815,7 +946,24 @@ def _install_borg_windows():
     import tempfile
 
     borg_dir = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "BorgBackup")
-    borg_exe = os.path.join(borg_dir, "borg", "borg.exe")
+
+    def _locate_borg_exe():
+        # The borg-windows zip layout has shifted between releases: newer zips
+        # put borg.exe at the root, older ones nested it under borg\. Runtime
+        # detection (get_system_info) uses the root path, so prefer it; skip the
+        # bundled ssh\ tree so an unrelated borg.exe isn't picked up (#324).
+        for cand in (os.path.join(borg_dir, "borg.exe"),
+                     os.path.join(borg_dir, "borg", "borg.exe")):
+            if os.path.isfile(cand):
+                return cand
+        for root, _dirs, files in os.walk(borg_dir):
+            if (os.sep + "ssh" + os.sep) in (root + os.sep).lower():
+                continue
+            if "borg.exe" in files:
+                return os.path.join(root, "borg.exe")
+        return None
+
+    borg_exe = _locate_borg_exe() or os.path.join(borg_dir, "borg.exe")
     api_url = "https://api.github.com/repos/marcpope/borg-windows/releases/latest"
 
     # Get current version for comparison
@@ -872,9 +1020,11 @@ def _install_borg_windows():
     except Exception as e:
         return "failed", "", "Failed to extract borg-windows.zip: {}".format(e)
 
-    # Verify new binary works
-    if not os.path.isfile(borg_exe):
-        return "failed", "", "borg.exe not found after extraction at {}".format(borg_exe)
+    # Re-locate borg.exe after extraction — the new zip's layout may differ
+    # from what was previously installed (root vs borg\ subdir) (#324).
+    borg_exe = _locate_borg_exe()
+    if not borg_exe:
+        return "failed", "", "borg.exe not found after extracting borg-windows.zip under {}".format(borg_dir)
 
     try:
         r = subprocess.run([borg_exe, "--version"], capture_output=True, timeout=10)
@@ -1081,6 +1231,7 @@ def execute_update_agent(config, task):
         url = "{}/api/agent/download?file=bbs-agent.py".format(config['server_url'])
         headers = {
             "Authorization": "Bearer {}".format(config['api_key']),
+            "User-Agent": "BBS-Agent/{}".format(AGENT_VERSION),
         }
         req = urllib.request.Request(url, headers=headers, method="GET")
 
@@ -1209,8 +1360,13 @@ PLUGIN_DISPLAY_NAMES = {
 }
 
 
-def execute_plugins(plugins, config=None, job_id=None):
-    """Execute pre-backup plugins. Returns dict of results keyed by slug."""
+def execute_plugins(plugins, config=None, job_id=None, task=None):
+    """Execute pre-backup plugins. Returns dict of results keyed by slug.
+
+    `task` is the full task dict from the server; passed through to plugins
+    that consume backup-context env vars (currently shell_hook only — see
+    #250). Other plugins ignore it.
+    """
     results = {}
     for plugin in plugins:
         slug = plugin.get("slug", "")
@@ -1227,7 +1383,13 @@ def execute_plugins(plugins, config=None, job_id=None):
         if not func:
             logger.warning("Plugin {} not implemented, skipping".format(slug))
             continue
-        result = func(cfg)
+        # shell_hook needs the task context to inject BBS_* env vars and
+        # (opt-in) BORG_PASSCOMMAND. Other plugins keep the simpler
+        # single-arg signature.
+        if slug == "shell_hook":
+            result = func(cfg, task)
+        else:
+            result = func(cfg)
         results[slug] = result
         logger.info("Plugin {} completed".format(slug))
 
@@ -1309,7 +1471,7 @@ def _format_size(bytes_val):
     return "{:.1f} PB".format(bytes_val)
 
 
-def cleanup_plugins(plugins, plugin_results, config=None, job_id=None, backup_result="completed"):
+def cleanup_plugins(plugins, plugin_results, config=None, job_id=None, backup_result="completed", task=None):
     """Run post-backup cleanup for plugins.
     Shell hook post-scripts always run (to restart services stopped by pre-scripts).
     File cleanup (dump deletion) only runs on successful backups.
@@ -1323,7 +1485,7 @@ def cleanup_plugins(plugins, plugin_results, config=None, job_id=None, backup_re
             func = globals().get("cleanup_plugin_shell_hook")
             if func:
                 try:
-                    cleanup_result = func(cfg, plugin_results.get(slug, {}))
+                    cleanup_result = func(cfg, plugin_results.get(slug, {}), task=task, backup_result=backup_result)
                     if config and job_id and cleanup_result:
                         log_to_server(config, job_id, "Shell hook post-script: {}".format(cleanup_result))
                 except Exception as e:
@@ -1996,7 +2158,194 @@ def _parse_script_command(value):
     return argv, argv[0]
 
 
-def execute_plugin_shell_hook(config):
+def _diagnose_script_path(exe_path):
+    """Return a human-readable diagnosis of why a script path isn't runnable.
+    Returns None when the file exists, is readable, and is executable for the
+    current process. Otherwise returns a multi-line string explaining the
+    exact failure (missing, parent dir blocked, wrong perms, owned by another
+    user, etc.) plus the agent's effective uid/user so the reporter can
+    compare with `ls -la` output."""
+    try:
+        running_as = "uid={}".format(os.geteuid()) if hasattr(os, "geteuid") else "user={}".format(os.environ.get("USERNAME") or os.environ.get("USER") or "?")
+        try:
+            import pwd  # type: ignore
+            running_as = "uid={} ({})".format(os.geteuid(), pwd.getpwuid(os.geteuid()).pw_name)
+        except Exception:
+            pass
+    except Exception:
+        running_as = "unknown user"
+
+    if not exe_path:
+        return "Script path is empty."
+
+    parent = os.path.dirname(exe_path) or "."
+
+    if not os.path.exists(parent):
+        return "Parent directory does not exist: {} (agent running as {})".format(parent, running_as)
+
+    if not os.access(parent, os.R_OK | os.X_OK):
+        try:
+            st = os.stat(parent)
+            perms = oct(st.st_mode & 0o777)
+        except Exception:
+            perms = "?"
+        return ("Cannot access parent directory: {} (perms {}, agent running as {}).\n"
+                "The agent user needs 'x' on every directory in the path. "
+                "If the script lives in /root or another restricted dir, move it "
+                "somewhere readable like /usr/local/bin or /opt/bbs-hooks.").format(parent, perms, running_as)
+
+    if not os.path.exists(exe_path):
+        try:
+            siblings = ", ".join(sorted(os.listdir(parent))[:8])
+        except Exception:
+            siblings = "(cannot list)"
+        return ("File does not exist: {} (agent running as {}).\n"
+                "Parent dir is readable. First files in {}: {}").format(exe_path, running_as, parent, siblings)
+
+    if not os.path.isfile(exe_path):
+        return "Path exists but is not a regular file: {}".format(exe_path)
+
+    if not os.access(exe_path, os.R_OK):
+        try:
+            st = os.stat(exe_path)
+            perms = oct(st.st_mode & 0o777)
+            owner = "{}:{}".format(st.st_uid, st.st_gid)
+        except Exception:
+            perms, owner = "?", "?"
+        return ("File exists but is not readable: {} (perms {}, owner {}, agent running as {}).\n"
+                "Run `chmod 755 {}` (or chown to the agent user).").format(exe_path, perms, owner, running_as, exe_path)
+
+    if not os.access(exe_path, os.X_OK):
+        try:
+            st = os.stat(exe_path)
+            perms = oct(st.st_mode & 0o777)
+            owner = "{}:{}".format(st.st_uid, st.st_gid)
+        except Exception:
+            perms, owner = "?", "?"
+        return ("File exists but is not executable for the agent: {} "
+                "(perms {}, owner {}, agent running as {}).\n"
+                "Run `chmod +x {}`. If the +x bit is already set, the agent user "
+                "may not be in the file's owner/group — try `chmod 755 {}` or "
+                "`chown <agent-user> {}`.").format(exe_path, perms, owner, running_as, exe_path, exe_path, exe_path)
+
+    return None
+
+
+def _diagnose_exec_failure(exe_path, error):
+    """Explain a FileNotFoundError/OSError raised when actually exec'ing a
+    script that already passed the exists/readable/executable checks. The
+    classic cause is the shebang interpreter not being found: Windows CRLF
+    line endings turn `#!/bin/bash` into the interpreter `/bin/bash\\r` (which
+    doesn't exist), so execve returns ENOENT and Python surfaces a bare
+    '[Errno 2] No such file or directory' on a file that plainly exists (#297).
+
+    Reads the shebang line and builds a targeted hint. Always returns a
+    multi-line string ending with the raw OS error for reference."""
+    shebang = ""
+    crlf = False
+    interp = ""
+    try:
+        with open(exe_path, "rb") as fh:
+            first = fh.readline(512)
+        crlf = first.endswith(b"\r\n") or first.rstrip(b"\n").endswith(b"\r")
+        text = first.decode("utf-8", errors="replace").rstrip("\r\n")
+        if text.startswith("#!"):
+            shebang = text
+            # Interpreter is the first token after #! (CRLF leaves a trailing \r)
+            interp = text[2:].strip().split()[0] if text[2:].strip() else ""
+            interp = interp.rstrip("\r")
+    except Exception:
+        pass
+
+    lines = ["Script exists and is executable, but failed to start (exec error)."]
+    if crlf:
+        lines.append(
+            "The file has Windows (CRLF) line endings — the shebang interpreter "
+            "is being read as '{}\\r', which doesn't exist. Convert it to Unix "
+            "(LF) endings: `sed -i 's/\\r$//' {}` (or `dos2unix {}`).".format(
+                interp or "/bin/sh", exe_path, exe_path))
+    elif shebang and interp and not os.path.exists(interp):
+        lines.append(
+            "The shebang line `{}` points to an interpreter that does not exist: "
+            "{}. Install it or fix the path on the first line.".format(shebang, interp))
+    elif shebang:
+        lines.append(
+            "Check that the shebang line `{}` points to an installed interpreter "
+            "and that the file uses Unix (LF) line endings, not Windows (CRLF).".format(shebang))
+    else:
+        lines.append(
+            "The file has no usable `#!` shebang line, or its interpreter is "
+            "missing. Add a shebang like `#!/bin/bash` (with Unix LF line endings) "
+            "or run it through an explicit interpreter.")
+    lines.append("Underlying error: {}".format(error))
+    return "\n".join(lines)
+
+
+def _build_shell_hook_env(config, task, backup_status):
+    """Build the env dict for a shell_hook script. Returns (env, cleanup_fn).
+    cleanup_fn() must be called once the subprocess exits to remove the temp
+    passphrase file (when expose_passphrase is enabled). Cleanup is a no-op
+    when no temp file was written.
+
+    Wiki documents BBS_ARCHIVE_NAME, BBS_REPO_PATH, BBS_BACKUP_PLAN,
+    BBS_CLIENT_NAME, BBS_BACKUP_STATUS — all sourced from the task payload
+    the server now sends (#250). BBS_DIRECTORIES is bonus context.
+
+    For credentials, we use BORG_PASSCOMMAND pointing at a mode-0600 temp
+    file rather than putting BORG_PASSPHRASE in the env directly. Reason:
+    BORG_PASSCOMMAND is read by borg when it needs the passphrase, while
+    env vars are inherited by every subprocess the hook script spawns —
+    so BORG_PASSPHRASE in the env would leak the passphrase to every
+    binary the hook calls (curl, aws, ssh, etc.). The temp file only
+    exposes credentials to processes that actually shell out to `cat
+    <file>`, which is borg itself by design.
+    """
+    env = os.environ.copy()
+    if task is None:
+        task = {}
+
+    env["BBS_ARCHIVE_NAME"] = str(task.get("archive_name", ""))
+    env["BBS_REPO_PATH"] = str(task.get("repo_path", ""))
+    env["BBS_BACKUP_PLAN"] = str(task.get("plan_name", ""))
+    env["BBS_CLIENT_NAME"] = str(task.get("client_name", ""))
+    env["BBS_BACKUP_STATUS"] = str(backup_status or "")
+    env["BBS_DIRECTORIES"] = str(task.get("directories", ""))
+    env["BBS_JOB_ID"] = str(task.get("job_id", ""))
+
+    cleanup_fn = lambda: None
+
+    if config.get("expose_passphrase"):
+        passphrase = (task.get("env") or {}).get("BORG_PASSPHRASE", "")
+        if passphrase:
+            import tempfile
+            fd, pp_path = tempfile.mkstemp(prefix="bbs-pp-", suffix="")
+            try:
+                os.write(fd, (passphrase + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+            try:
+                os.chmod(pp_path, 0o600)
+            except OSError:
+                pass
+            # Quote the path for the shell `cat` invocation. Tempfile
+            # paths from mkstemp don't normally contain special chars
+            # (just /tmp/bbs-pp-XXXXXX), but quoting costs nothing.
+            env["BORG_PASSCOMMAND"] = "cat {}".format(shlex.quote(pp_path))
+            env["BORG_REPO"] = env["BBS_REPO_PATH"]
+
+            def _cleanup():
+                try:
+                    os.unlink(pp_path)
+                except OSError:
+                    pass
+            cleanup_fn = _cleanup
+        else:
+            logger.warning("Shell hook expose_passphrase=true but no BORG_PASSPHRASE in task env; skipping credential exposure")
+
+    return env, cleanup_fn
+
+
+def execute_plugin_shell_hook(config, task=None):
     """Run pre-backup shell script hook."""
     pre_script = config.get("pre_script", "").strip()
     post_script = config.get("post_script", "").strip()
@@ -2016,50 +2365,56 @@ def execute_plugin_shell_hook(config):
 
     pre_argv, pre_exe = _parse_script_command(pre_script)
 
-    if not os.path.isfile(pre_exe):
-        msg = "Pre-script not found: {}".format(pre_exe)
+    problem = _diagnose_script_path(pre_exe)
+    if problem:
+        msg = "Pre-script cannot run: {}\n{}".format(pre_exe, problem)
         if abort_on_failure:
             raise Exception(msg)
         logger.warning(msg)
         return result
 
-    if not os.access(pre_exe, os.X_OK):
-        msg = "Pre-script not executable: {}".format(pre_exe)
-        if abort_on_failure:
-            raise Exception(msg)
-        logger.warning(msg)
-        return result
+    env, cleanup_fn = _build_shell_hook_env(config, task, "pending")
 
     logger.info("Shell hook: running pre-script {}".format(pre_script))
     try:
-        proc = subprocess.run(
-            pre_argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            universal_newlines=True,
-        )
-        output = proc.stdout[:10240] if proc.stdout else ""
-        result["pre_output"] = output
-        result["pre_exit_code"] = proc.returncode
+        try:
+            proc = subprocess.run(
+                pre_argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                universal_newlines=True,
+                env=env,
+            )
+            output = proc.stdout[:10240] if proc.stdout else ""
+            result["pre_output"] = output
+            result["pre_exit_code"] = proc.returncode
 
-        if proc.returncode != 0:
-            msg = "Pre-script exited with code {}: {}".format(proc.returncode, output)
+            if proc.returncode != 0:
+                msg = "Pre-script exited with code {}: {}".format(proc.returncode, output)
+                if abort_on_failure:
+                    raise Exception(msg)
+                logger.warning(msg)
+            else:
+                logger.info("Pre-script completed successfully (exit 0)")
+        except subprocess.TimeoutExpired:
+            msg = "Pre-script timed out after {}s: {}".format(timeout, pre_script)
             if abort_on_failure:
                 raise Exception(msg)
             logger.warning(msg)
-        else:
-            logger.info("Pre-script completed successfully (exit 0)")
-    except subprocess.TimeoutExpired:
-        msg = "Pre-script timed out after {}s: {}".format(timeout, pre_script)
-        if abort_on_failure:
-            raise Exception(msg)
-        logger.warning(msg)
+        except OSError as e:
+            msg = "Pre-script could not be executed: {}\n{}".format(
+                pre_exe, _diagnose_exec_failure(pre_exe, e))
+            if abort_on_failure:
+                raise Exception(msg)
+            logger.warning(msg)
+    finally:
+        cleanup_fn()
 
     return result
 
 
-def cleanup_plugin_shell_hook(config, plugin_result):
+def cleanup_plugin_shell_hook(config, plugin_result, task=None, backup_result=None):
     """Run post-backup shell script hook."""
     post_script = config.get("post_script", "").strip()
     timeout = int(config.get("timeout", 300))
@@ -2069,33 +2424,41 @@ def cleanup_plugin_shell_hook(config, plugin_result):
 
     post_argv, post_exe = _parse_script_command(post_script)
 
-    if not os.path.isfile(post_exe):
-        logger.warning("Post-script not found: {}".format(post_exe))
-        return "{} not found".format(post_exe)
+    problem = _diagnose_script_path(post_exe)
+    if problem:
+        logger.warning("Post-script cannot run: {}\n{}".format(post_exe, problem))
+        return "Post-script cannot run: {} — {}".format(post_exe, problem.replace("\n", " "))
 
-    if not os.access(post_exe, os.X_OK):
-        logger.warning("Post-script not executable: {}".format(post_exe))
-        return "{} not executable".format(post_exe)
+    env, cleanup_fn = _build_shell_hook_env(config, task, backup_result or "completed")
 
     logger.info("Shell hook: running post-script {}".format(post_script))
     try:
-        proc = subprocess.run(
-            post_argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            universal_newlines=True,
-        )
-        output = proc.stdout[:10240] if proc.stdout else ""
-        if proc.returncode != 0:
-            logger.warning("Post-script exited with code {}: {}".format(proc.returncode, output))
-            return "{} exited {}: {}".format(post_script, proc.returncode, output[:500])
-        else:
-            logger.info("Post-script completed successfully (exit 0)")
-            return "{} completed (exit 0)".format(post_script) + (": {}".format(output[:500]) if output.strip() else "")
-    except subprocess.TimeoutExpired:
-        logger.warning("Post-script timed out after {}s: {}".format(timeout, post_script))
-        return "{} timed out after {}s".format(post_script, timeout)
+        try:
+            proc = subprocess.run(
+                post_argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                universal_newlines=True,
+                env=env,
+            )
+            output = proc.stdout[:10240] if proc.stdout else ""
+            if proc.returncode != 0:
+                logger.warning("Post-script exited with code {}: {}".format(proc.returncode, output))
+                return "{} exited {}: {}".format(post_script, proc.returncode, output[:500])
+            else:
+                logger.info("Post-script completed successfully (exit 0)")
+                return "{} completed (exit 0)".format(post_script) + (": {}".format(output[:500]) if output.strip() else "")
+        except subprocess.TimeoutExpired:
+            logger.warning("Post-script timed out after {}s: {}".format(timeout, post_script))
+            return "{} timed out after {}s".format(post_script, timeout)
+        except OSError as e:
+            diag = _diagnose_exec_failure(post_exe, e)
+            logger.warning("Post-script could not be executed: {}\n{}".format(post_exe, diag))
+            return "Post-script could not be executed: {} — {}".format(
+                post_exe, diag.replace("\n", " "))
+    finally:
+        cleanup_fn()
 
 
 def test_plugin_shell_hook(config):
@@ -2132,6 +2495,9 @@ def test_plugin_shell_hook(config):
             results.append("{}: {} exit 0{}".format(label, value, " — {}".format(output) if output else ""))
         except subprocess.TimeoutExpired:
             raise Exception("{} timed out after {}s: {}".format(label, timeout, value))
+        except OSError as e:
+            raise Exception("{} could not be executed: {}\n{}".format(
+                label, exe, _diagnose_exec_failure(exe, e)))
 
     return " | ".join(results)
 
@@ -2167,6 +2533,8 @@ def execute_restore_pg(config, task):
     if remote_ssh_key:
         try:
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+            if IS_WINDOWS:
+                _clear_stale_key_windows(remote_key_path)
             with open(remote_key_path, "w") as kf:
                 kf.write(normalized_key)
             if IS_WINDOWS:
@@ -2382,6 +2750,8 @@ def execute_restore_mysql(config, task):
     if remote_ssh_key:
         try:
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+            if IS_WINDOWS:
+                _clear_stale_key_windows(remote_key_path)
             with open(remote_key_path, "w") as kf:
                 kf.write(normalized_key)
             if IS_WINDOWS:
@@ -2610,6 +2980,8 @@ def execute_restore_mongo(config, task):
     if remote_ssh_key:
         try:
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+            if IS_WINDOWS:
+                _clear_stale_key_windows(remote_key_path)
             with open(remote_key_path, "w") as kf:
                 kf.write(normalized_key)
             if IS_WINDOWS:
@@ -2832,9 +3204,185 @@ def execute_task(config, task):
         _allow_sleep(sleep_state)
 
 
+# Pseudo-filesystems we hide from the BBS file browser by default. Borg
+# can't / shouldn't back these up anyway and listing them just buries
+# the real filesystem under noise. Users can override via show_all=true.
+_BROWSE_SKIP_ROOTS = frozenset([
+    "/proc", "/sys", "/dev", "/run", "/snap", "/tmp", "/var/run", "/var/lock",
+])
+
+
+def _build_list_dir_tree(task):
+    """Walk the filesystem starting at task['path'] up to task['depth']
+    levels deep. Returns a tree dict the BBS UI can render directly.
+    Bounded by max_entries (default 5000) — when the cap is hit, the
+    current node is marked truncated and remaining siblings/children
+    aren't visited.
+    """
+    path = task.get("path", "/") or "/"
+    if not isinstance(path, str) or not path.startswith("/"):
+        # Windows: accept any absolute-looking path; normalize separators
+        if os.name == "nt" and len(path) >= 2 and path[1] == ":":
+            pass
+        else:
+            raise ValueError("path must be absolute")
+    depth = max(0, min(int(task.get("depth", 2)), 5))
+    max_entries = max(50, min(int(task.get("max_entries", 5000)), 20000))
+    show_hidden = bool(task.get("show_hidden", False))
+    show_all_fs = bool(task.get("show_all", False))
+    follow_symlinks = bool(task.get("follow_symlinks", False))
+
+    counter = {"n": 0, "stop": False}
+
+    def _entry_kind(de):
+        try:
+            if de.is_symlink():
+                return "symlink"
+            if de.is_dir(follow_symlinks=follow_symlinks):
+                return "directory"
+            return "file"
+        except OSError:
+            return "other"
+
+    def _walk(node_path, remaining_depth):
+        if counter["stop"]:
+            return None
+        node = {
+            "name": os.path.basename(node_path.rstrip("/")) or node_path,
+            "path": node_path,
+            "type": "directory",
+            "size": None,
+            "entry_count": 0,
+            "children": [],
+            "truncated": False,
+        }
+        # Note: os.scandir() context-manager + PEP 448 dict-spread require
+        # Python 3.6/3.5 respectively. Some agents run older interpreters
+        # (CentOS 7, embedded Linux); using the older non-context-manager
+        # form and explicit dict copies keeps this portable to 3.4+.
+        try:
+            entries = []
+            it = os.scandir(node_path)
+            try:
+                for de in it:
+                    if counter["stop"]:
+                        node["truncated"] = True
+                        break
+                    if not show_hidden and de.name.startswith("."):
+                        continue
+                    full = os.path.join(node_path, de.name)
+                    if not show_all_fs and full in _BROWSE_SKIP_ROOTS:
+                        continue
+                    counter["n"] += 1
+                    if counter["n"] > max_entries:
+                        node["truncated"] = True
+                        counter["stop"] = True
+                        break
+                    kind = _entry_kind(de)
+                    try:
+                        st = de.stat(follow_symlinks=False)
+                        size = int(st.st_size) if kind == "file" else None
+                        mtime = int(st.st_mtime)
+                    except OSError:
+                        size, mtime = None, None
+                    entries.append({
+                        "name": de.name,
+                        "path": full,
+                        "type": kind,
+                        "size": size,
+                        "mtime": mtime,
+                    })
+            finally:
+                # os.scandir() became a context manager in 3.6; close() in 3.6
+                # too. Use getattr() so older interpreters skip the close
+                # rather than AttributeErroring.
+                close = getattr(it, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            entries.sort(key=lambda e: (0 if e["type"] == "directory" else 1, e["name"].lower()))
+            node["entry_count"] = len(entries)
+            if remaining_depth <= 0:
+                # Surface children but don't recurse; UI shows them as
+                # expandable but unloaded.
+                node["children"] = entries
+            else:
+                for child in entries:
+                    if child["type"] == "directory":
+                        sub = _walk(child["path"], remaining_depth - 1)
+                        if sub is None:
+                            sub = dict(child)
+                            sub["children"] = []
+                            sub["truncated"] = True
+                        else:
+                            sub["size"] = None  # directories: no size
+                        node["children"].append(sub)
+                    else:
+                        node["children"].append(child)
+        except PermissionError:
+            node["error"] = "permission denied"
+        except OSError as e:
+            node["error"] = str(e)
+        return node
+
+    # Windows has no unified "/" root — os.scandir("/") only ever sees the
+    # current drive (typically C:), so the file browser couldn't reach D:, E:,
+    # etc. (#318). When the root is requested, enumerate the drive letters and
+    # return each as an expandable node; the UI lazy-loads a drive's contents
+    # when it's clicked, which then scans that drive normally.
+    if os.name == "nt" and path.strip().rstrip("/\\") == "":
+        import string
+        drives = []
+        for letter in string.ascii_uppercase:
+            drive_path = "{}:\\".format(letter)
+            if os.path.exists(drive_path):
+                drives.append({
+                    "name": "{}:".format(letter),
+                    "path": drive_path,
+                    "type": "directory",
+                    "size": None,
+                    "mtime": None,
+                    "entry_count": None,  # unknown until expanded
+                    "children": [],       # lazy-loaded on click
+                    "truncated": False,
+                })
+        return {
+            "name": "Computer",
+            "path": "/",
+            "type": "directory",
+            "size": None,
+            "entry_count": len(drives),
+            "children": drives,
+            "truncated": False,
+        }
+
+    return _walk(path.rstrip("/") or "/", depth)
+
+
 def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                         archive_name, directories, plugins, cwd):
     """Inner task execution logic, wrapped by execute_task for sleep inhibition."""
+    # Handle filesystem browse — returns a JSON tree under output_log so
+    # the BBS UI's "Browse..." modal can populate a directory picker
+    # when building backup plans. Bounded by max_entries to keep the
+    # response size sane on busy filesystems.
+    if task_type == "list_dir":
+        try:
+            result_tree = _build_list_dir_tree(task)
+            report_status(config, {
+                "job_id": job_id,
+                "result": "completed",
+                "output_log": json.dumps(result_tree),
+            })
+        except Exception as e:
+            report_status(config, {
+                "job_id": job_id, "result": "failed",
+                "error_log": "list_dir error: {}".format(e),
+            })
+        return
+
     # Handle plugin test
     if task_type == "plugin_test":
         plugin_data = task.get("plugin", {})
@@ -2884,7 +3432,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     if task_type == "backup" and plugins:
         try:
             logger.info("Running {} pre-backup plugin(s)".format(len(plugins)))
-            plugin_results = execute_plugins(plugins, config, job_id)
+            plugin_results = execute_plugins(plugins, config, job_id, task=task)
         except Exception as e:
             logger.error("Pre-backup plugin failed: {}".format(e))
             report_status(config, {
@@ -2921,17 +3469,26 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     # Use forward slashes - Windows SSH accepts them and backslashes get
     # stripped as escape characters when passed through subprocess/shell
     if IS_WINDOWS and "BORG_RSH" in env:
+        # Note: "/dev/null" in UserKnownHostsFile is intentionally NOT rewritten
+        # to "NUL". The bundled MinGit/MSYS2 ssh maps "/dev/null" to the real
+        # null device but would create a literal, undeletable reserved-name file
+        # named NUL for "NUL" (#300).
         env["BORG_RSH"] = env["BORG_RSH"].replace(
             "/etc/bbs-agent/ssh_key", SSH_KEY_PATH.replace("\\", "/")
         ).replace(
             "/tmp/bbs-remote-ssh-key", REMOTE_KEY_PATH.replace("\\", "/")
-        ).replace(
-            "/dev/null", "NUL"
         )
         # Replace bare "ssh" command with our bundled ssh.exe to avoid the
         # Windows built-in OpenSSH stdin forwarding bug that hangs borg.
         if SSH_CMD != "ssh" and env["BORG_RSH"].startswith("ssh "):
             env["BORG_RSH"] = '"' + SSH_CMD + '"' + env["BORG_RSH"][3:]
+
+    # Server-built BORG_RSH carries OpenSSH-only `-o` options. Dropbear logs
+    # "Ignoring unknown configuration option" warnings for each one (#247).
+    # Strip them and switch to Dropbear's `-y -y` so the connection still
+    # skips hostkey verification.
+    if IS_DROPBEAR and "BORG_RSH" in env:
+        env["BORG_RSH"] = _rewrite_borg_rsh_for_dropbear(env["BORG_RSH"])
 
     # Always allow relocated repos - common after S3 restore or copying repositories
     # This prevents "repository was previously located at X" interactive prompts
@@ -2975,7 +3532,14 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     files_processed = 0
     original_size = 0
     deduplicated_size = 0
+    # Restore-only counters. borg extract's progress_percent carries byte
+    # offsets (not file counts), and its --list output carries file entries
+    # (one per extracted item) — track both so we can report accurate
+    # Files Total/Processed + Bytes Total/Processed to the server.
+    bytes_processed = 0
+    bytes_total = 0
     error_output = ""
+    had_warnings = False
     last_progress_time = time.time()
     catalog_count = 0
     catalog_ssh = None  # SSH subprocess for streaming catalog to server
@@ -2985,15 +3549,10 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         ssh_info = load_ssh_info()
         if ssh_info and ssh_info.get("ssh_unix_user") and ssh_info.get("server_host"):
             try:
-                known_hosts_null = "NUL" if IS_WINDOWS else "/dev/null"
                 catalog_ssh = subprocess.Popen(
-                    [
-                        SSH_CMD,
-                        "-i", SSH_KEY_PATH,
-                        "-p", str(ssh_info.get("ssh_port", 22)),
-                        "-o", "StrictHostKeyChecking=no",
-                        "-o", "UserKnownHostsFile={}".format(known_hosts_null),
-                        "-o", "BatchMode=yes",
+                    [SSH_CMD, "-i", SSH_KEY_PATH, "-p", str(ssh_info.get("ssh_port", 22))]
+                    + _ssh_common_opts()
+                    + [
                         "{}@{}".format(ssh_info['ssh_unix_user'], ssh_info['server_host']),
                         "catalog-write {}".format(job_id),
                     ],
@@ -3019,6 +3578,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         try:
             # Normalize line endings (Windows \r\n -> Unix \n) and ensure trailing newline
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+            if IS_WINDOWS:
+                _clear_stale_key_windows(remote_key_path)
             with open(remote_key_path, "w") as kf:
                 kf.write(normalized_key)
             if IS_WINDOWS:
@@ -3103,6 +3664,35 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                                 catalog_ssh = None
                             break
 
+                elif msg_type == "progress_percent" and task_type != "backup":
+                    # Borg emits progress_percent during extract/restore where
+                    # the backup-centric archive_progress handler never fires.
+                    # Forward "current / total" as bytes so the restore UI
+                    # shows a live bar instead of staying pinned at
+                    # "Starting task..." (#168).
+                    #
+                    # During BACKUP borg 1.4+ also fires progress_percent for
+                    # internal phases like chunk-index rebuild where current/
+                    # total are item counts, not bytes. Sending those as
+                    # bytes_total stomps the real archive size with a tiny
+                    # number ("83 GB of 17 B processed", #234), so the whole
+                    # branch is skipped on backup — archive_progress drives
+                    # the UI for backups.
+                    cur = entry.get("current")
+                    tot = entry.get("total")
+                    if cur is not None and tot not in (None, 0):
+                        bytes_processed = int(cur)
+                        bytes_total = int(tot)
+                        now = time.time()
+                        if now - last_progress_time >= 3:
+                            api_request(config, "/api/agent/progress", method="POST", data={
+                                "job_id": job_id,
+                                "bytes_total": int(tot),
+                                "bytes_processed": int(cur),
+                                "files_processed": files_processed,
+                            })
+                            last_progress_time = now
+
                 elif msg_type in ("file_status", "file_item") and task_type == "backup" and catalog_ssh:
                     # Stream file entry to server via SSH pipe
                     fpath = entry.get("path", "")
@@ -3145,10 +3735,28 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                     if log_level in ("WARNING", "ERROR", "CRITICAL"):
                         error_output += message + "\n"
                         logger.warning("borg: {}".format(message))
+                    elif (entry.get("name") == "borg.output.list"
+                          and task_type != "backup"):
+                        # borg extract --list writes one INFO log_message
+                        # per extracted item on the "borg.output.list"
+                        # logger (confirmed in borg 1.4). That's the only
+                        # reliable per-file signal during restore — count
+                        # them so the server's Files Processed field is
+                        # accurate.
+                        files_processed += 1
 
             except ValueError:
                 # Non-JSON output, might be regular progress text
-                if "Error" in line or "error" in line:
+                if ("Error" in line
+                        or "error" in line
+                        or "NotLocked" in line
+                        or "Failed to release the lock" in line):
+                    # Cache-lock cleanup failures arrive as a plain Python
+                    # traceback (no JSON wrapper), so capture those lines
+                    # explicitly — they don't contain "Error". We need
+                    # them in error_output so the exit-code handler can
+                    # spot a NotLocked at end-of-run and downgrade it to
+                    # a warning (#214).
                     error_output += line + "\n"
                 logger.debug("borg: {}".format(line))
 
@@ -3199,24 +3807,118 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                 pass
 
         if proc.returncode == 0:
-            result = "completed"
-            logger.info(
-                "Job #{} completed: {} files, "
-                "{} bytes original, {} bytes dedup".format(job_id, files_processed, original_size, deduplicated_size)
-            )
+            # borg returned success, but for restore that doesn't guarantee
+            # anything was actually written — if the path filter matched
+            # zero archive entries, borg extract still exits 0. Catch that
+            # so the server doesn't show a green check on a no-op restore.
+            if task_type != "backup" and files_processed == 0:
+                # borg extract --list emits one file_status per item, so
+                # files_processed stays 0 only when the path filter
+                # matched nothing at all (directories count too, which
+                # is why we use file count rather than bytes).
+                result = "failed"
+                error_output = "Restore extracted nothing — the requested path may not exist in this archive"
+                logger.error("Job #{} failed: nothing extracted".format(job_id))
+            else:
+                result = "completed"
+                if task_type == "backup":
+                    logger.info(
+                        "Job #{} completed: {} files, "
+                        "{} bytes original, {} bytes dedup".format(job_id, files_processed, original_size, deduplicated_size)
+                    )
+                else:
+                    logger.info(
+                        "Job #{} completed: {} files, {} bytes restored".format(
+                            job_id, files_processed, bytes_processed)
+                    )
         elif job_cancelled:
             pass  # Already set result='failed', error_output='Cancelled by user'
         elif proc.returncode == 1:
-            # borg returns 1 for warnings (still successful)
-            result = "completed"
-            logger.warning("Job #{} completed with warnings".format(job_id))
+            # borg returns 1 for warnings. For backup the archive is
+            # usually still useful (a file vanished mid-read, or — more
+            # importantly — a configured source path didn't exist and was
+            # silently skipped, #203). For restore (and any other op)
+            # exit 1 means at least one file failed to extract — fail
+            # the job outright.
+            if task_type == "backup":
+                result = "completed"
+                # Routine borg/SSH warnings that fire on every backup of
+                # an active system aren't actionable and shouldn't trip
+                # had_warnings (which surfaces a notification). Only flag
+                # had_warnings when there's something the user would want
+                # to know about (#225).
+                routine_patterns = (
+                    "Permanently added",                  # SSH known_hosts notice
+                    "file changed while we backed it up", # active mysql / mailspool / log
+                    "file vanished while we backed it up",# transient files
+                    "stat: [Errno 2]",                    # file deleted between scan and read
+                    # OS-level "you can't read this" errors on files we don't
+                    # control — registry hives on Windows, system caches on
+                    # macOS, iCloud-synced folders. The user can't grant the
+                    # backup process access, so flagging every backup with
+                    # had_warnings just adds noise (#236). Error codes in
+                    # brackets are locale-independent.
+                    "[WinError 5]",                       # Windows: Access denied (NTUSER.DAT, special folders)
+                    "[Errno 13]",                         # POSIX: Permission denied
+                    "[Errno 1]",                          # POSIX: Operation not permitted (macOS SIP)
+                    "[Errno 11]",                         # POSIX: Resource (deadlock) — common in macOS iCloud
+                )
+                warning_lines = [
+                    ln for ln in error_output.splitlines() if ln.strip()
+                ]
+                actionable = [
+                    ln for ln in warning_lines
+                    if not any(p in ln for p in routine_patterns)
+                ]
+                if actionable:
+                    had_warnings = True
+                    logger.warning("Job #{} completed with warnings".format(job_id))
+                else:
+                    # All warnings were routine — log at info level, don't
+                    # forward as had_warnings. Job appears as a clean
+                    # completion in the dashboard.
+                    error_output = ""
+                    logger.info(
+                        "Job #{} completed (borg exit 1 — only routine warnings)".format(job_id)
+                    )
+            else:
+                result = "failed"
+                if not error_output:
+                    error_output = "borg exited with warnings (code 1) — see job log for details"
+                logger.error("Job #{} failed with warnings (borg code 1)".format(job_id))
         else:
-            result = "failed"
-            logger.error(
-                "Job #{} failed with return code {}".format(job_id, proc.returncode)
+            # Special-case borg's cache-lock cleanup failure for backup
+            # jobs (#214): borg writes the archive successfully, then
+            # raises borg.locking.NotLocked when releasing the local
+            # cache lock — usually because something cleared the lock
+            # mid-run. The data is intact, so flagging the job as
+            # FAILED forces the user to retry an already-complete
+            # backup. Downgrade to completed-with-warnings instead.
+            cache_lock_cleanup_failed = (
+                task_type == "backup"
+                and "NotLocked" in error_output
+                and "Failed to release the lock" in error_output
             )
-            if not error_output:
-                error_output = "borg exited with code {}".format(proc.returncode)
+            if cache_lock_cleanup_failed:
+                result = "completed"
+                had_warnings = True
+                error_output = (
+                    "Backup archive was written successfully, but borg's local "
+                    "cache lock was already gone when it tried to release it "
+                    "(borg.locking.NotLocked). The archive is intact and "
+                    "restoreable; this is a cleanup-side error, not a backup "
+                    "failure.\n\n" + error_output
+                )
+                logger.warning(
+                    "Job #{} completed with warnings (cache-lock cleanup)".format(job_id)
+                )
+            else:
+                result = "failed"
+                logger.error(
+                    "Job #{} failed with return code {}".format(job_id, proc.returncode)
+                )
+                if not error_output:
+                    error_output = "borg exited with code {}".format(proc.returncode)
 
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -3269,21 +3971,35 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             error_output = warning
         logger.warning("Job #{}: {}".format(job_id, warning))
 
-    # Build status data
-    status_data = {
-        "job_id": job_id,
-        "files_total": files_total if files_total else files_processed,
-        "files_processed": files_processed,
-        "original_size": original_size,
-        "deduplicated_size": deduplicated_size,
-        "bytes_total": original_size,
-        "bytes_processed": original_size,
-    }
+    # Build status data. For restore (and other non-backup tasks) the
+    # byte counts come from progress_percent and the file counts come
+    # from file_status events; original_size/deduplicated_size aren't
+    # meaningful since borg extract doesn't emit archive stats.
+    if task_type == "backup":
+        status_data = {
+            "job_id": job_id,
+            "files_total": files_total if files_total else files_processed,
+            "files_processed": files_processed,
+            "original_size": original_size,
+            "deduplicated_size": deduplicated_size,
+            "bytes_total": original_size,
+            "bytes_processed": original_size,
+        }
+    else:
+        status_data = {
+            "job_id": job_id,
+            "files_total": files_processed,
+            "files_processed": files_processed,
+            "bytes_total": bytes_total if bytes_total else bytes_processed,
+            "bytes_processed": bytes_processed,
+        }
 
     if archive_name:
         status_data["archive_name"] = archive_name
     if error_output:
         status_data["error_log"] = error_output[:10000]  # Limit size
+    if had_warnings:
+        status_data["had_warnings"] = True
 
     # Report backed-up databases from mysql_dump plugin
     if result == "completed" and task_type == "backup" and plugin_results.get("mysql_dump"):
@@ -3320,7 +4036,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     # Run post-backup plugin cleanup (always run shell_hook post-scripts to
     # restart services even if backup failed; other cleanup only on success)
     if task_type == "backup" and plugins:
-        cleanup_plugins(plugins, plugin_results, config, job_id, backup_result=result)
+        cleanup_plugins(plugins, plugin_results, config, job_id, backup_result=result, task=task)
 
     # Clean up temporary SSH key for remote repos
     if remote_ssh_key and os.path.exists(remote_key_path):
@@ -3332,25 +4048,43 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
 
 
 def clear_stale_cache_locks():
-    """Remove stale borg cache locks that can block operations after a crash."""
-    if IS_WINDOWS:
-        cache_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "borg", "Cache")
-    else:
-        cache_dir = os.path.expanduser("~/.cache/borg")
-    if not os.path.isdir(cache_dir):
-        return
+    """Remove stale borg cache locks that can block operations after a crash.
+
+    Borg 1.2+ stores its cache at ~/.cache/borg/<repo_id>/ on all platforms
+    (including Windows, where ~ resolves to the user profile — for a service
+    running as SYSTEM that's C:\\WINDOWS\\system32\\config\\systemprofile).
+    Older borg used %LOCALAPPDATA%\\borg\\Cache on Windows. Forceful kills
+    (cancel, service stop, crash) leave lock.exclusive behind; borg's own
+    stale-PID detection is unreliable on Windows, so the next run hits a
+    lock timeout. We check both paths plus BORG_CACHE_DIR if set.
+    """
     import shutil
-    for entry in os.listdir(cache_dir):
-        lock_path = os.path.join(cache_dir, entry, "lock.exclusive")
-        if os.path.exists(lock_path):
-            try:
-                if os.path.isdir(lock_path):
-                    shutil.rmtree(lock_path)
-                else:
-                    os.remove(lock_path)
-                logger.info("Cleared stale cache lock: {}".format(lock_path))
-            except Exception as e:
-                logger.warning("Could not clear cache lock {}: {}".format(lock_path, e))
+    candidates = []
+    env_cache = os.environ.get("BORG_CACHE_DIR")
+    if env_cache:
+        candidates.append(env_cache)
+    candidates.append(os.path.expanduser("~/.cache/borg"))
+    if IS_WINDOWS:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            candidates.append(os.path.join(local_appdata, "borg", "Cache"))
+
+    seen = set()
+    for cache_dir in candidates:
+        if not cache_dir or cache_dir in seen or not os.path.isdir(cache_dir):
+            continue
+        seen.add(cache_dir)
+        for entry in os.listdir(cache_dir):
+            lock_path = os.path.join(cache_dir, entry, "lock.exclusive")
+            if os.path.exists(lock_path):
+                try:
+                    if os.path.isdir(lock_path):
+                        shutil.rmtree(lock_path)
+                    else:
+                        os.remove(lock_path)
+                    logger.info("Cleared stale cache lock: {}".format(lock_path))
+                except Exception as e:
+                    logger.warning("Could not clear cache lock {}: {}".format(lock_path, e))
 
 
 def signal_handler(signum, frame):
@@ -3421,6 +4155,8 @@ def main():
     logger.info("BBS Agent v{} starting".format(AGENT_VERSION))
     if IS_WINDOWS and SSH_CMD != "ssh":
         logger.info("Using bundled SSH: {}".format(SSH_CMD))
+    if IS_DROPBEAR:
+        logger.info("Detected Dropbear SSH client; using Dropbear-compatible options")
 
     signal.signal(signal.SIGINT, signal_handler)
     if IS_WINDOWS:
@@ -3449,10 +4185,33 @@ def main():
     hb_thread = threading.Thread(target=heartbeat_thread, args=(config,), daemon=True)
     hb_thread.start()
 
+    # Re-report system info hourly so manual borg updates on clients that
+    # can't use auto-update (armv7l etc.) are picked up by the server (#198).
+    last_info_report = time.time()
+    info_report_interval = 3600
+
+    # Burst-poll window. When the UI's file-browser modal queues list_dir
+    # tasks, we want the agent to feel near-real-time — but at 30s default
+    # polling, every click is a 15s average wait. Once we see a list_dir
+    # task come through, drop to a 2s poll interval for the next 60s so
+    # follow-up clicks during the same browse session are snappy. Window
+    # resets each time a new list_dir arrives, so an active user keeps
+    # the agent warm; an idle modal lets it drop back to normal polling.
+    BURST_INTERVAL = 2
+    BURST_WINDOW = 60
+    burst_until = 0
+
     while running:
         try:
             # Poll for tasks
             result = api_request(config, "/api/agent/tasks")
+
+            if time.time() - last_info_report >= info_report_interval:
+                try:
+                    api_request(config, "/api/agent/info", method="POST", data=get_system_info())
+                except Exception as e:
+                    logger.debug("Periodic info report failed: {}".format(e))
+                last_info_report = time.time()
 
             # Update poll interval if server sends one
             if result and "poll_interval" in result:
@@ -3483,6 +4242,10 @@ def main():
                             execute_update_agent(config, task)
                         else:
                             execute_task(config, task)
+                        # Refresh burst-poll window when we see a list_dir
+                        # task — the user is interactively browsing.
+                        if task.get("task") == "list_dir":
+                            burst_until = time.time() + BURST_WINDOW
                     finally:
                         task_running = False
                         current_job_id = None
@@ -3493,8 +4256,11 @@ def main():
         except Exception as e:
             logger.error("Poll loop error: {}".format(e))
 
-        # Wait for next poll
-        for _ in range(config["poll_interval"]):
+        # Wait for next poll. If a list_dir came through recently we're
+        # in burst mode — short interval so subsequent browse clicks feel
+        # near-instant. Otherwise the standard server-configured interval.
+        sleep_seconds = BURST_INTERVAL if time.time() < burst_until else config["poll_interval"]
+        for _ in range(sleep_seconds):
             if not running:
                 break
             time.sleep(1)

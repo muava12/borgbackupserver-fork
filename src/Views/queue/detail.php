@@ -1,15 +1,16 @@
 <?php
 $statusClass = match($job['status']) {
-    'completed' => 'success',
+    'completed' => !empty($job['had_warnings']) ? 'warning' : 'success',
     'failed', 'cancelled' => 'danger',
-    'running' => 'info',
+    'running' => 'primary',
     'sent' => 'primary',
     default => 'warning',
 };
+$statusLabel = ($job['status'] === 'completed' && !empty($job['had_warnings']))
+    ? 'Completed with warnings'
+    : ucfirst($job['status']);
 
-$d = $job['duration_seconds'] ?? 0;
-$durLabel = $d >= 3600 ? floor($d / 3600) . 'h ' . floor(($d % 3600) / 60) . 'm'
-    : ($d >= 60 ? floor($d / 60) . 'm ' . ($d % 60) . 's' : ($d > 0 ? $d . 's' : '--'));
+$durLabel = \BBS\Core\TimeHelper::duration((int) ($job['duration_seconds'] ?? 0));
 
 $pct = 0;
 if (($job['files_total'] ?? 0) > 0 && $job['files_processed'] > 0) {
@@ -22,10 +23,7 @@ if (($job['bytes_total'] ?? 0) > 0 && $job['bytes_processed'] > 0) {
 
 function formatBytes($bytes) {
     if (!$bytes || $bytes == 0) return '--';
-    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    $i = 0;
-    while ($bytes >= 1024 && $i < count($units) - 1) { $bytes /= 1024; $i++; }
-    return round($bytes, $i > 0 ? 1 : 0) . ' ' . $units[$i];
+    return \BBS\Services\ServerStats::formatBytes((int) $bytes);
 }
 
 $isActive = in_array($job['status'], ['queued', 'sent', 'running']);
@@ -34,13 +32,88 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 ?>
 
 <style>
+    :root {
+        --queue-laser: #0d6efd;
+        --queue-laser-hot: #36a2eb;
+        --queue-flow-trail: rgba(13, 110, 253, 0.12);
+        --queue-block-bg: #2f73c9;
+        --queue-block-bg-2: #224f93;
+    }
+    [data-bs-theme="dark"] {
+        --queue-laser: #36a2ff;
+        --queue-laser-hot: #79e7ff;
+        --queue-flow-trail: rgba(54, 162, 255, 0.12);
+        --queue-block-bg: #1e63ad;
+        --queue-block-bg-2: #17395f;
+    }
+    .queue-shell { color-scheme: light dark; }
+    .queue-detail-hero {
+        position: relative;
+        overflow: hidden;
+        border-left: 4px solid var(--queue-laser-hot);
+        background:
+            linear-gradient(90deg, var(--queue-flow-trail), transparent 46%),
+            var(--bs-body-bg);
+    }
+    .queue-detail-hero::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(circle at 0 50%, rgba(255, 255, 255, 0.18), transparent 84px);
+    }
+    .queue-detail-hero > * {
+        position: relative;
+        z-index: 1;
+    }
+    .queue-meta-strip {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+    }
+    .queue-meta-pill {
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--bs-border-color);
+        background: var(--bs-body-bg);
+        color: var(--bs-secondary-color);
+        font-size: 0.78rem;
+        font-weight: 600;
+    }
+    .queue-panel .card-header {
+        min-height: 46px;
+    }
+    .queue-progress-panel {
+        background:
+            radial-gradient(circle at 0 50%, rgba(255, 255, 255, 0.16), transparent 84px),
+            linear-gradient(135deg, var(--queue-block-bg), var(--queue-block-bg-2));
+    }
+    .queue-detail-table td {
+        padding-top: 0.68rem;
+        padding-bottom: 0.68rem;
+    }
     /* Force long paths and command lines to wrap inside table cells / log entries */
     .job-detail-wrap {
+        font-size: 1em;
         word-break: break-all;
         overflow-wrap: anywhere;
         white-space: normal;
         display: inline-block;
         max-width: 100%;
+    }
+    /* Whole progress card: status_message can carry a full file path from
+       borg. Without overflow protection a long path stretches the card
+       past the viewport and the page scrolls horizontally (#209,
+       regression of #108). overflow-wrap:anywhere only breaks when needed,
+       so normal sentences stay unbroken. Excluding .text-truncate so the
+       single-line ellipsis on currentFile still works. */
+    #progress-section .card-body {
+        min-width: 0;
+    }
+    #progress-section .card-body :not(.text-truncate):not(.progress):not(.progress-bar) {
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        min-width: 0;
     }
     #log-section .list-group-item .small {
         word-break: break-all;
@@ -53,18 +126,37 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
     }
 </style>
 
-<div class="d-flex align-items-center mb-4">
-    <a href="/queue" class="btn btn-sm btn-outline-secondary me-3"><i class="bi bi-arrow-left"></i> Queue</a>
-    <h4 class="mb-0">
-        Job #<?= $job['id'] ?>
-        <span class="badge bg-<?= $statusClass ?> fs-6 ms-2"><?= ucfirst($job['status']) ?></span>
-    </h4>
+<div class="queue-shell container-fluid px-0">
+<div class="card border-0 shadow-sm queue-detail-hero mb-4">
+    <div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-3">
+        <div class="d-flex align-items-center gap-3">
+            <a href="/queue" class="btn btn-sm btn-outline-secondary" title="Back to Queue"><i class="bi bi-arrow-left"></i></a>
+            <div>
+                <h4 class="mb-1">
+                    Job #<?= $job['id'] ?>
+                    <span class="badge text-bg-<?= $statusClass ?> fs-6 ms-2"><?= htmlspecialchars($statusLabel) ?></span>
+                </h4>
+                <div class="queue-meta-strip">
+                    <span class="queue-meta-pill"><i class="bi bi-cpu me-1"></i><?= htmlspecialchars($taskLabel) ?></span>
+                    <span class="queue-meta-pill"><i class="bi bi-pc-display me-1"></i><?= htmlspecialchars($job['agent_name']) ?></span>
+                    <span class="queue-meta-pill"><i class="bi bi-archive me-1"></i><?= htmlspecialchars($job['repo_name'] ?? '--') ?></span>
+                    <?php if ($queuePosition): ?>
+                    <span class="queue-meta-pill"><i class="bi bi-list-ol me-1"></i>Position #<?= $queuePosition ?></span>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+        <div class="text-end small text-muted">
+            <div>Queued <?= $job['queued_at'] ? \BBS\Core\TimeHelper::ago($job['queued_at']) : '--' ?></div>
+            <div><?= $activeCount ?>/<?= $maxQueue ?> queue slots used</div>
+        </div>
+    </div>
 </div>
 
 <div id="progress-section">
 <!-- Progress Bar (for active jobs) -->
 <?php if ($isActive): ?>
-<div class="card border-0 shadow-sm mb-4" style="background-color: #2c3e50;">
+<div class="card border-0 shadow-sm mb-4 queue-progress-panel">
     <div class="card-body py-3">
         <?php if ($isServerSide && $job['status'] === 'running'): ?>
             <div class="text-white fw-semibold mb-1"><i class="bi bi-hdd me-1"></i> <?= ucfirst($job['task_type']) ?> running on server...</div>
@@ -189,6 +281,18 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
         <div class="text-muted small">Duration: <?= $durLabel ?> &middot; See activity log below for details</div>
     </div>
 </div>
+<?php elseif ($job['status'] === 'completed' && !empty($job['had_warnings'])): ?>
+<div class="card border-0 shadow-sm mb-4 bg-warning-subtle">
+    <div class="card-body py-3">
+        <div class="fw-semibold text-warning-emphasis mb-1"><i class="bi bi-exclamation-triangle me-1"></i> Completed with warnings</div>
+        <div class="progress mb-1" style="height: 22px;">
+            <div class="progress-bar bg-warning" role="progressbar" style="width: 100%;">
+                <?= number_format($job['files_total'] ?? 0) ?> files processed
+            </div>
+        </div>
+        <div class="text-warning-emphasis small mt-1"><i class="bi bi-info-circle me-1"></i>borg created the archive but reported one or more warnings — see Warning Log below</div>
+    </div>
+</div>
 <?php elseif ($job['status'] === 'completed' && ($job['files_total'] ?? 0) > 0): ?>
 <div class="card border-0 shadow-sm mb-4 bg-success-subtle">
     <div class="card-body py-3">
@@ -221,12 +325,12 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 <!-- Job Details -->
 <div class="row g-4 mb-4">
     <div class="col-lg-7">
-        <div class="card border-0 shadow-sm h-100">
-            <div class="card-header bg-body fw-semibold">
+        <div class="card border-0 shadow-sm queue-panel">
+            <div class="card-header card-head-gradient fw-semibold">
                 <i class="bi bi-info-circle me-1"></i> Job Details
             </div>
             <div class="card-body p-0">
-                <table class="table table-borderless mb-0">
+                <table class="table table-borderless mb-0 queue-detail-table">
                     <tbody>
                         <tr>
                             <td class="text-muted fw-semibold ps-3" style="width: 160px;">Client</td>
@@ -240,7 +344,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                                     default => 'warning',
                                 };
                                 ?>
-                                <span class="badge bg-<?= $agentBadge ?> ms-1"><?= ucfirst($job['agent_status']) ?></span>
+                                <span class="badge text-bg-<?= $agentBadge ?> ms-1"><?= ucfirst($job['agent_status']) ?></span>
                             </td>
                         </tr>
                         <tr>
@@ -289,9 +393,9 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
     </div>
 
     <div class="col-lg-5">
-        <div class="card border-0 shadow-sm h-100">
+        <div class="card border-0 shadow-sm queue-panel queue-stats-panel">
             <?php if ($job['task_type'] === 'prune' && !empty($pruneStats)): ?>
-            <div class="card-header bg-body fw-semibold">
+            <div class="card-header card-head-gradient fw-semibold">
                 <i class="bi bi-scissors me-1"></i> Prune Stats
             </div>
             <div class="card-body p-0">
@@ -339,7 +443,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                 </table>
             </div>
             <?php else: ?>
-            <div class="card-header bg-body fw-semibold">
+            <div class="card-header card-head-gradient fw-semibold">
                 <i class="bi bi-bar-chart me-1"></i> Stats
             </div>
             <div class="card-body p-0">
@@ -384,11 +488,24 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 <!-- Error Log (if failed) -->
 <?php if ($job['status'] === 'failed' && $job['error_log']): ?>
 <div id="error-section" class="card border-0 shadow-sm mb-4 border-danger">
-    <div class="card-header bg-body fw-semibold text-danger">
+    <div class="card-header card-head-gradient fw-semibold text-danger">
         <i class="bi bi-exclamation-triangle me-1"></i> Error Log
     </div>
     <div class="card-body">
         <pre class="mb-0 small text-danger" style="white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;"><?= htmlspecialchars($job['error_log']) ?></pre>
+    </div>
+</div>
+<?php elseif ($job['status'] === 'completed' && !empty($job['had_warnings'])): ?>
+<!-- Warning Log (completed with warnings — e.g. a configured source path didn't exist, #203) -->
+<div id="warning-section" class="card border-0 shadow-sm mb-4 border-warning">
+    <div class="card-header card-head-gradient fw-semibold text-warning">
+        <i class="bi bi-exclamation-triangle me-1"></i> Backup Completed with Warnings
+    </div>
+    <div class="card-body">
+        <p class="small text-muted mb-2">borg created the archive but reported one or more warnings — check that every source path actually exists on the client.</p>
+        <?php if (!empty($job['error_log'])): ?>
+        <pre class="mb-0 small text-warning-emphasis" style="white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;"><?= htmlspecialchars($job['error_log']) ?></pre>
+        <?php endif; ?>
     </div>
 </div>
 <?php endif; ?>
@@ -397,7 +514,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 <div id="log-section" <?= empty($logs) ? 'style="display:none"' : '' ?>>
 <?php if (!empty($logs)): ?>
 <div class="card border-0 shadow-sm mb-4">
-    <div class="card-header bg-body fw-semibold">
+    <div class="card-header card-head-gradient fw-semibold">
         <i class="bi bi-journal-text me-1"></i> Activity Log
     </div>
     <div class="card-body p-0">
@@ -447,6 +564,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
     </div>
     <?php endif; ?>
 </div>
+</div>
 
 <script>
 (function() {
@@ -469,19 +587,12 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                dt.toLocaleTimeString('en-US', tOpts);
     }
 
-    function fmtDur(s) {
-        if (!s || s <= 0) return '--';
-        if (s >= 3600) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-        if (s >= 60) return Math.floor(s/60) + 'm ' + (s%60) + 's';
-        return s + 's';
-    }
-
     function fmtBytes(b) {
         if (!b || b == 0) return '--';
         const units = ['B','KB','MB','GB','TB'];
         let i = 0, s = b;
         while (s >= 1024 && i < units.length-1) { s /= 1024; i++; }
-        return (i > 0 ? s.toFixed(1) : s) + ' ' + units[i];
+        return (i > 0 ? s.toFixed(1) : s) + '\u00A0' + units[i];
     }
 
     function updateProgressBar(job, data) {
@@ -497,12 +608,12 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                 container.innerHTML = '<div class="card border-0 shadow-sm mb-4 bg-success-subtle"><div class="card-body py-3">' +
                     '<div class="fw-semibold text-success mb-1"><i class="bi bi-hdd me-1"></i> ' + esc(job.task_type[0].toUpperCase()+job.task_type.slice(1)) + ' Completed</div>' +
                     '<div class="progress mb-1" style="height:22px"><div class="progress-bar bg-success" style="width:100%">Server-side ' + esc(job.task_type) + ' finished</div></div>' +
-                    '<div class="text-muted small">Duration: ' + fmtDur(job.duration_seconds) + ' &middot; See activity log below for details</div></div></div>';
+                    '<div class="text-muted small">Duration: ' + window.BBS.formatDuration(job.duration_seconds) + ' &middot; See activity log below for details</div></div></div>';
             } else {
                 container.innerHTML = '<div class="card border-0 shadow-sm mb-4 bg-success-subtle"><div class="card-body py-3">' +
                     '<div class="fw-semibold text-success mb-1">Completed</div>' +
                     '<div class="progress mb-1" style="height:22px"><div class="progress-bar bg-success" style="width:100%">' + (job.files_total ? Number(job.files_total).toLocaleString() + ' files processed' : 'Done') + '</div></div>' +
-                    '<div class="text-muted small">' + fmtBytes(job.bytes_total) + ' total &middot; ' + fmtDur(job.duration_seconds) + '</div></div></div>';
+                    '<div class="text-muted small">' + fmtBytes(job.bytes_total) + ' total &middot; ' + window.BBS.formatDuration(job.duration_seconds) + '</div></div></div>';
             }
         } else if (job.status === 'failed') {
             container.innerHTML = '<div class="card border-0 shadow-sm mb-4 bg-danger-subtle"><div class="card-body py-3">' +
@@ -529,7 +640,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                 else if (fileEl && !currentFile) { fileEl.textContent = ''; }
             } else {
                 // Full replace (transitioning from pre-progress state)
-                container.innerHTML = '<div class="card border-0 shadow-sm mb-4" style="background-color:#2c3e50"><div class="card-body py-3">' +
+                container.innerHTML = '<div class="card border-0 shadow-sm mb-4 queue-progress-panel"><div class="card-body py-3">' +
                     '<div class="d-flex justify-content-between text-white mb-1"><span class="fw-semibold">' + esc(taskLabel) + '... ' + pct + '%</span><span class="small text-white-50">' + bytesText + '</span></div>' +
                     '<div class="progress mb-1" style="height:22px;background-color:rgba(255,255,255,0.15)"><div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:' + pct + '%;background-color:#5b9bd5">' + Number(job.files_processed).toLocaleString() + ' / ' + Number(job.files_total).toLocaleString() + ' files</div></div>' +
                     fileHtml + '</div></div>';
@@ -539,7 +650,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             var taskLabel2 = (job.task_type || 'backup').replace('_',' ').replace(/^\w/, c => c.toUpperCase());
             var msg = job.status_message ? esc(job.status_message) : taskLabel2 + ' in progress...';
             var sub = job.status_message ? '' : '<div class="text-white-50 small">' + (isServerSide ? 'Running on server...' : 'Waiting for progress data from agent...') + '</div>';
-            container.innerHTML = '<div class="card border-0 shadow-sm mb-4" style="background-color:#2c3e50"><div class="card-body py-3">' +
+            container.innerHTML = '<div class="card border-0 shadow-sm mb-4 queue-progress-panel"><div class="card-body py-3">' +
                 '<div class="text-white fw-semibold mb-1">' + msg + '</div>' +
                 '<div class="progress mb-1" style="height:22px;background-color:rgba(255,255,255,0.15)"><div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:100%;background-color:#5b9bd5">Running</div></div>' +
                 sub + '</div></div>';
@@ -548,9 +659,14 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
         // Update status badge in header
         const badge = document.querySelector('h4 .badge');
         if (badge) {
-            const cls = {completed:'success',failed:'danger',cancelled:'danger',running:'info',sent:'primary',queued:'warning'}[job.status] || 'secondary';
-            badge.className = 'badge bg-' + cls + ' fs-6 ms-2';
-            badge.textContent = job.status[0].toUpperCase() + job.status.slice(1);
+            let cls = {completed:'success',failed:'danger',cancelled:'danger',running:'primary',sent:'primary',queued:'warning'}[job.status] || 'secondary';
+            let label = job.status[0].toUpperCase() + job.status.slice(1);
+            if (job.status === 'completed' && job.had_warnings) {
+                cls = 'warning';
+                label = 'Completed with warnings';
+            }
+            badge.className = 'badge text-bg-' + cls + ' fs-6 ms-2';
+            badge.textContent = label;
         }
     }
 
@@ -569,7 +685,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             }
             if (key === 'Started At' && job.started_at) td.nextElementSibling.textContent = fmtDate(job.started_at);
             if (key === 'Completed At' && job.completed_at) td.nextElementSibling.textContent = fmtDate(job.completed_at);
-            if (key === 'Duration') td.nextElementSibling.textContent = fmtDur(job.duration_seconds);
+            if (key === 'Duration') td.nextElementSibling.textContent = window.BBS.formatDuration(job.duration_seconds);
         });
     }
 
@@ -622,16 +738,28 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                     previousStatus = job.status;
                 }
 
-                // Update error log section
+                // Update error / warning log section
                 if (job.status === 'failed' && job.error_log) {
-                    let errSection = document.getElementById('error-section');
+                    let errSection = document.getElementById('error-section') || document.getElementById('warning-section');
                     if (!errSection) {
                         errSection = document.createElement('div');
-                        errSection.id = 'error-section';
                         const logEl = document.getElementById('log-section');
                         if (logEl) logEl.parentNode.insertBefore(errSection, logEl);
                     }
-                    errSection.innerHTML = '<div class="card border-0 shadow-sm mb-4 border-danger"><div class="card-header bg-body fw-semibold text-danger"><i class="bi bi-exclamation-triangle me-1"></i> Error Log</div><div class="card-body"><pre class="mb-0 small text-danger" style="white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;">' + esc(job.error_log) + '</pre></div></div>';
+                    errSection.id = 'error-section';
+                    errSection.innerHTML = '<div class="card border-0 shadow-sm mb-4 border-danger"><div class="card-header fw-semibold text-danger"><i class="bi bi-exclamation-triangle me-1"></i> Error Log</div><div class="card-body"><pre class="mb-0 small text-danger" style="white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;">' + esc(job.error_log) + '</pre></div></div>';
+                } else if (job.status === 'completed' && job.had_warnings) {
+                    let warnSection = document.getElementById('warning-section') || document.getElementById('error-section');
+                    if (!warnSection) {
+                        warnSection = document.createElement('div');
+                        const logEl = document.getElementById('log-section');
+                        if (logEl) logEl.parentNode.insertBefore(warnSection, logEl);
+                    }
+                    warnSection.id = 'warning-section';
+                    const body = job.error_log
+                        ? '<pre class="mb-0 small text-warning-emphasis" style="white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;">' + esc(job.error_log) + '</pre>'
+                        : '';
+                    warnSection.innerHTML = '<div class="card border-0 shadow-sm mb-4 border-warning"><div class="card-header fw-semibold text-warning"><i class="bi bi-exclamation-triangle me-1"></i> Backup Completed with Warnings</div><div class="card-body"><p class="small text-muted mb-2">borg created the archive but reported one or more warnings — check that every source path actually exists on the client.</p>' + body + '</div></div>';
                 }
 
                 // Decide whether to keep polling

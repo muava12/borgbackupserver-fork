@@ -19,6 +19,18 @@ Config::load();
 
 $db = \BBS\Core\Database::getInstance();
 
+// Heartbeat: record that the cron scheduler actually ran. When this goes
+// stale the dashboard warns — that surfaces a dead or misconfigured cron,
+// which is the usual cause of server-side jobs (prune/compact/catalog)
+// sitting in the queue forever while agent backups keep working via the
+// poll endpoint (#307). Written first so it reflects "cron fired" regardless
+// of what later steps do.
+$db->query(
+    "INSERT INTO settings (`key`, `value`) VALUES ('scheduler_last_run', ?)
+     ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+    [date('Y-m-d H:i:s')]
+);
+
 // Step 1: Mark agents offline if no heartbeat in 3x poll interval
 $pollInterval = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'agent_poll_interval'");
 $threshold = ((int)($pollInterval['value'] ?? 30)) * 3;
@@ -36,55 +48,138 @@ $stale = $db->query(
 
 if ($stale->rowCount() > 0) {
     echo date('Y-m-d H:i:s') . " Marked {$stale->rowCount()} agent(s) offline (no heartbeat in {$threshold}s)\n";
+}
 
-    // Notify for each agent that just went offline
+// Hysteresis on agent_offline notifications: only fire once the agent has
+// been continuously offline for >= agent_offline_notify_minutes (default 5).
+// BBS isn't a real-time monitoring system — sub-minute detection is too
+// noisy on residential ISPs and laptops, where short network blips cause
+// status to flap several times an hour. The agent's *status* still flips
+// to offline at the 90s threshold above (so dashboards and queues react
+// quickly), but the user-visible notification + push/email dispatch waits
+// for the longer threshold. Only fires once per outage by checking for
+// an unresolved agent_offline notification for the agent.
+$notifyMinutes = max(1, (int) ($db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'agent_offline_notify_minutes'")['value'] ?? 5));
+$notifyThresholdSec = $notifyMinutes * 60;
+$notifyCutoff = date('Y-m-d H:i:s', time() - $notifyThresholdSec);
+
+$candidates = $db->fetchAll(
+    "SELECT a.id, a.name
+       FROM agents a
+       LEFT JOIN notifications n
+         ON n.type = 'agent_offline'
+        AND n.agent_id = a.id
+        AND n.resolved_at IS NULL
+      WHERE a.status = 'offline'
+        AND a.last_heartbeat IS NOT NULL
+        AND a.last_heartbeat < ?
+        AND n.id IS NULL",
+    [$notifyCutoff]
+);
+
+if (!empty($candidates)) {
     $notificationService = new NotificationService();
-    $offlineAgents = $db->fetchAll(
-        "SELECT id, name FROM agents WHERE status = 'offline' AND last_heartbeat IS NOT NULL AND last_heartbeat < ?",
-        [$cutoff]
-    );
-    foreach ($offlineAgents as $offAgent) {
-        $notificationService->notify('agent_offline', $offAgent['id'], null, "Client \"{$offAgent['name']}\" is offline (no heartbeat in {$threshold}s)", 'warning');
+    foreach ($candidates as $offAgent) {
+        $notificationService->notify(
+            'agent_offline',
+            $offAgent['id'],
+            null,
+            "Client \"{$offAgent['name']}\" has been offline for at least {$notifyMinutes} minute" . ($notifyMinutes === 1 ? '' : 's'),
+            'warning'
+        );
     }
 }
 
 // Step 2: Fail jobs for agents that are offline (sent or running only)
 // Queued jobs are left alone — the agent may come back online and pick them up.
-// Excludes server-side tasks (prune, compact, catalog, etc.) — those don't need the agent
+// Excludes:
+//   - Server-side tasks (prune, compact, catalog, etc.) — run by the scheduler, don't need the agent.
+//   - Management tasks (update_borg, update_agent) — these should wait for the
+//     agent to come back online and pick them up, not fail at 5am because the
+//     client's laptop was asleep (#144). They get their own grace-period sweep
+//     in Step 2c below.
 $staleJobs = $db->fetchAll("
-    SELECT bj.id, bj.agent_id, bj.task_type, bj.backup_plan_id, bj.status, a.name as agent_name
+    SELECT bj.id, bj.agent_id, bj.task_type, bj.backup_plan_id, bj.repository_id,
+           bj.status, bj.retry_count, a.name as agent_name
     FROM backup_jobs bj
     JOIN agents a ON a.id = bj.agent_id
     WHERE bj.status IN ('sent', 'running')
       AND a.status = 'offline'
-      AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+      AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'update_borg', 'update_agent')
 ");
 
+// Auto-retry settings (#249). Only kicks in for offline-induced backup
+// failures; real errors (borg path missing, encryption failed, etc.) are
+// reported by the agent via /api/agent/status and never enter this sweep.
+$autoRetryEnabled = (($db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'auto_retry_failed_backups'")['value'] ?? '1') === '1');
+$autoRetryMax = max(0, (int) ($db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'auto_retry_max_attempts'")['value'] ?? 3));
+
 foreach ($staleJobs as $sj) {
+    $isBackup = ($sj['task_type'] === 'backup' && !empty($sj['backup_plan_id']));
+    $attempt = ((int) $sj['retry_count']) + 1;
+    $willRetry = $isBackup && $autoRetryEnabled && $attempt <= $autoRetryMax;
+
+    $errorLog = $willRetry
+        ? "Agent offline during backup — rescheduled (attempt {$attempt} of {$autoRetryMax}) for when agent reconnects"
+        : ($isBackup && $autoRetryEnabled
+            ? "Agent went offline — no heartbeat in {$threshold}s; retry limit ({$autoRetryMax}) exhausted"
+            : "Agent went offline — no heartbeat in {$threshold}s");
+
     $db->update('backup_jobs', [
         'status' => 'failed',
         'completed_at' => date('Y-m-d H:i:s'),
-        'error_log' => "Agent went offline — no heartbeat in {$threshold}s",
+        'error_log' => $errorLog,
     ], 'id = ?', [$sj['id']]);
+
+    if ($willRetry) {
+        // Re-queue the same plan; agent picks it up when it reconnects.
+        // parent_job_id chains the retries so the UI can show history.
+        $db->insert('backup_jobs', [
+            'backup_plan_id' => $sj['backup_plan_id'],
+            'agent_id' => $sj['agent_id'],
+            'repository_id' => $sj['repository_id'],
+            'task_type' => 'backup',
+            'status' => 'queued',
+            'retry_count' => $attempt,
+            'parent_job_id' => $sj['id'],
+        ]);
+        $db->insert('server_log', [
+            'agent_id' => $sj['agent_id'],
+            'backup_job_id' => $sj['id'],
+            'level' => 'info',
+            'message' => "Agent \"{$sj['agent_name']}\" went offline during backup — rescheduled (attempt {$attempt} of {$autoRetryMax}) for when agent reconnects",
+        ]);
+        echo date('Y-m-d H:i:s') . " Re-queued: plan {$sj['backup_plan_id']} (attempt {$attempt}/{$autoRetryMax}) — agent \"{$sj['agent_name']}\" offline\n";
+        continue;
+    }
 
     $db->insert('server_log', [
         'agent_id' => $sj['agent_id'],
         'backup_job_id' => $sj['id'],
-        'level' => 'warning',
-        'message' => "Job #{$sj['id']} ({$sj['task_type']}) failed — agent \"{$sj['agent_name']}\" went offline",
+        'level' => 'error',
+        'message' => "Job #{$sj['id']} ({$sj['task_type']}) failed — agent \"{$sj['agent_name']}\" went offline"
+                     . ($isBackup && $autoRetryEnabled ? " (retry limit {$autoRetryMax} exhausted)" : ""),
     ]);
 
-    // Fire backup_failed notification if it was a backup
-    if ($sj['task_type'] === 'backup' && $sj['backup_plan_id']) {
+    // Fire backup_failed notification if it was a backup. When auto-retry
+    // is exhausted (or disabled), force the email so dedup doesn't swallow
+    // the terminal failure.
+    if ($isBackup) {
         $notificationService = $notificationService ?? new NotificationService();
         $planRow = $db->fetchOne("SELECT name FROM backup_plans WHERE id = ?", [$sj['backup_plan_id']]);
         $planName = $planRow['name'] ?? '';
+        $exhausted = $autoRetryEnabled && $autoRetryMax > 0;
+        $msg = $exhausted
+            ? "Backup failed for plan \"{$planName}\" on client \"{$sj['agent_name']}\" — agent went offline; retry limit ({$autoRetryMax}) exhausted"
+            : "Backup failed for plan \"{$planName}\" on client \"{$sj['agent_name']}\" — agent went offline";
         $notificationService->notify(
             'backup_failed',
             $sj['agent_id'],
             (int)$sj['backup_plan_id'],
-            "Backup failed for plan \"{$planName}\" on client \"{$sj['agent_name']}\" — agent went offline",
-            'critical'
+            $msg,
+            'critical',
+            null,
+            $exhausted // forceEmail on retry exhaustion
         );
     }
 
@@ -133,6 +228,35 @@ foreach ($zombieJobs as $zj) {
     }
 
     echo date('Y-m-d H:i:s') . " Auto-failed: job #{$zj['id']} ({$zj['task_type']}) — running >24h on online agent \"{$zj['agent_name']}\"\n";
+}
+
+// Step 2c: Fail stale management tasks (update_borg, update_agent) after 7 days
+// unpicked. These are excluded from Step 2 so they don't fail the moment the
+// client's laptop goes to sleep, but we still need a safety valve — if an agent
+// has been gone for a week and still hasn't polled for its pending update, the
+// job is effectively abandoned and should stop cluttering the queue.
+$staleMgmtCutoffDays = 7;
+$staleMgmt = $db->fetchAll("
+    SELECT bj.id, bj.agent_id, bj.task_type, a.name as agent_name
+    FROM backup_jobs bj
+    JOIN agents a ON a.id = bj.agent_id
+    WHERE bj.status IN ('queued', 'sent')
+      AND bj.task_type IN ('update_borg', 'update_agent')
+      AND bj.queued_at < DATE_SUB(NOW(), INTERVAL {$staleMgmtCutoffDays} DAY)
+");
+foreach ($staleMgmt as $sm) {
+    $db->update('backup_jobs', [
+        'status' => 'failed',
+        'completed_at' => date('Y-m-d H:i:s'),
+        'error_log' => "Agent did not pick up the update within {$staleMgmtCutoffDays} days",
+    ], 'id = ?', [$sm['id']]);
+    $db->insert('server_log', [
+        'agent_id' => $sm['agent_id'],
+        'backup_job_id' => $sm['id'],
+        'level' => 'warning',
+        'message' => "Job #{$sm['id']} ({$sm['task_type']}) expired — agent \"{$sm['agent_name']}\" did not poll for the update in {$staleMgmtCutoffDays} days",
+    ]);
+    echo date('Y-m-d H:i:s') . " Expired: job #{$sm['id']} ({$sm['task_type']}) — agent \"{$sm['agent_name']}\" offline >{$staleMgmtCutoffDays}d\n";
 }
 
 // Step 3: Check schedules and create queued jobs
@@ -238,12 +362,22 @@ foreach ($serverJobs as $sj) {
         'prune_years' => $sj['prune_years'] ?? 0,
     ];
 
-    // Mark as running
+    // Atomically claim the job. Cron runs this scheduler every minute, so
+    // a long-running compact/prune can overlap with the next invocation:
+    // both instances fetch the same 'sent' row via getServerSideJobs() before
+    // either marks it 'running'. Without this guard both would execute the
+    // same job (issue #163). The WHERE status='sent' clause makes the claim
+    // atomic — if another scheduler already transitioned the row, rowCount()
+    // is 0 and we skip this iteration.
     $startedAt = date('Y-m-d H:i:s');
-    $db->update('backup_jobs', [
-        'status' => 'running',
-        'started_at' => $startedAt,
-    ], 'id = ?', [$sj['id']]);
+    $claim = $db->query(
+        "UPDATE backup_jobs SET status='running', started_at=? WHERE id=? AND status='sent'",
+        [$startedAt, $sj['id']]
+    );
+    if ($claim->rowCount() === 0) {
+        echo date('Y-m-d H:i:s') . " Skipped job #{$sj['id']} ({$sj['task_type']}) — already claimed by another scheduler run\n";
+        continue;
+    }
 
     echo date('Y-m-d H:i:s') . " Executing server-side: job #{$sj['id']} ({$sj['task_type']})\n";
 
@@ -310,11 +444,19 @@ foreach ($serverJobs as $sj) {
             'message' => $logMessage,
         ]);
 
-        // Update last_sync_at in repository_s3_configs after successful sync
+        // Update last_sync_at in repository_s3_configs after successful sync —
+        // scoped to this job's destination when it has one (multi-destination
+        // repos track each destination's sync time separately)
         if ($s3Result === 'completed' && !empty($sj['repository_id'])) {
-            $db->update('repository_s3_configs', [
-                'last_sync_at' => $now,
-            ], 'repository_id = ?', [$sj['repository_id']]);
+            if (!empty($sj['plugin_config_id'])) {
+                $db->update('repository_s3_configs', [
+                    'last_sync_at' => $now,
+                ], 'repository_id = ? AND plugin_config_id = ?', [$sj['repository_id'], $sj['plugin_config_id']]);
+            } else {
+                $db->update('repository_s3_configs', [
+                    'last_sync_at' => $now,
+                ], 'repository_id = ?', [$sj['repository_id']]);
+            }
         }
 
         // Send notifications for S3 sync results
@@ -550,13 +692,13 @@ foreach ($serverJobs as $sj) {
         } else {
             $csLocalPath = \BBS\Services\BorgCommandBuilder::getLocalRepoPath($csRepo);
 
-            // Run borg list via bbs-ssh-helper (handles sudo to the repo-owning user)
+            // Run borg list via bbs-ssh-helper (handles sudo to the repo-owning user).
+            // Passphrase is piped on stdin ("-" marker) so it's not visible in `ps`.
             $runAsUser = $sj['ssh_unix_user'] ?? null;
             if ($runAsUser) {
-                // Use ssh-helper which handles sudo properly
                 $csCmd = [
                     'sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-list',
-                    $runAsUser, $passphrase, $csLocalPath
+                    $runAsUser, '-', $csLocalPath
                 ];
                 $csEnv = [];
             } else {
@@ -585,6 +727,9 @@ foreach ($serverJobs as $sj) {
             $csError = '';
             $csExitCode = -1;
             if (is_resource($csProc)) {
+                if ($runAsUser) {
+                    fwrite($csPipes[0], $passphrase . "\n");
+                }
                 fclose($csPipes[0]);
                 $csOutput = stream_get_contents($csPipes[1]);
                 $csError = stream_get_contents($csPipes[2]);
@@ -631,8 +776,22 @@ foreach ($serverJobs as $sj) {
 
             $archives = $csData['archives'] ?? [];
 
-            // Clear existing archives for this repo and rebuild
-            $db->delete('archives', 'repository_id = ?', [$csRepo['id']]);
+            // Snapshot existing archive rows BEFORE we touch anything. The
+            // catalog sync used to DELETE the whole repo's archives and
+            // re-INSERT from the borg listing — that wiped agent-reported
+            // metadata (databases_backed_up, backup_job_id) which can't be
+            // reconstructed from borg alone (#294). The new flow updates
+            // existing rows in place and inserts only genuinely new ones,
+            // leaving the agent-side columns untouched.
+            $existingRows = $db->fetchAll(
+                "SELECT id, archive_name FROM archives WHERE repository_id = ?",
+                [$csRepo['id']]
+            );
+            $existingByName = [];
+            foreach ($existingRows as $existingRow) {
+                $existingByName[$existingRow['archive_name']] = $existingRow;
+            }
+            $borgArchiveNamesSet = array_flip(array_filter(array_column($archives, 'name')));
 
             // Set progress bar for archive processing
             $totalArchiveCount = count($archives);
@@ -667,7 +826,7 @@ foreach ($serverJobs as $sj) {
                     if ($runAsUser) {
                         $infoCmd = [
                             'sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-cmd',
-                            $runAsUser, $passphrase, 'info', '--json', $archivePath
+                            $runAsUser, '-', 'info', '--json', $archivePath
                         ];
                         $infoEnvStrings = null;
                     } else {
@@ -690,6 +849,9 @@ foreach ($serverJobs as $sj) {
                     ], $infoPipes, null, $infoEnvStrings);
 
                     if (is_resource($infoProc)) {
+                        if ($runAsUser) {
+                            fwrite($infoPipes[0], $passphrase . "\n");
+                        }
                         fclose($infoPipes[0]);
                         $infoOutput = stream_get_contents($infoPipes[1]);
                         fclose($infoPipes[1]);
@@ -707,14 +869,25 @@ foreach ($serverJobs as $sj) {
                     }
                 }
 
-                $db->insert('archives', [
-                    'repository_id' => $csRepo['id'],
-                    'archive_name' => $archiveName,
-                    'created_at' => $createdAt,
-                    'file_count' => $fileCount,
-                    'original_size' => $originalSize,
-                    'deduplicated_size' => $deduplicatedSize,
-                ]);
+                // Refresh existing row in place (preserving agent-reported
+                // databases_backed_up + backup_job_id) or insert new.
+                if (isset($existingByName[$archiveName])) {
+                    $db->update('archives', [
+                        'created_at' => $createdAt,
+                        'file_count' => $fileCount,
+                        'original_size' => $originalSize,
+                        'deduplicated_size' => $deduplicatedSize,
+                    ], 'id = ?', [$existingByName[$archiveName]['id']]);
+                } else {
+                    $db->insert('archives', [
+                        'repository_id' => $csRepo['id'],
+                        'archive_name' => $archiveName,
+                        'created_at' => $createdAt,
+                        'file_count' => $fileCount,
+                        'original_size' => $originalSize,
+                        'deduplicated_size' => $deduplicatedSize,
+                    ]);
+                }
                 $archiveCount++;
                 $totalSize += $deduplicatedSize;
 
@@ -727,10 +900,31 @@ foreach ($serverJobs as $sj) {
                 echo date('Y-m-d H:i:s') . "   Catalog sync {$archiveCount}/{$totalArchiveCount}: {$archiveName}\n";
             }
 
-            // Update repo stats
+            // Drop stale rows: archives that existed in our DB but aren't in
+            // the borg listing anymore (pruned upstream). Per-row delete so
+            // the ON DELETE CASCADE on backup_jobs/etc. fires properly.
+            $stalePruned = 0;
+            foreach ($existingByName as $staleName => $staleRow) {
+                if (!isset($borgArchiveNamesSet[$staleName])) {
+                    $db->delete('archives', 'id = ?', [$staleRow['id']]);
+                    $stalePruned++;
+                }
+            }
+            if ($stalePruned > 0) {
+                echo date('Y-m-d H:i:s') . " Catalog sync job #{$sj['id']}: dropped {$stalePruned} archive(s) no longer in borg\n";
+            }
+
+            // Repo size: prefer borg's own dedup-aware unique_csize over the
+            // sum of per-archive deduplicated_size, which is the *incremental*
+            // contribution at archive-creation time and goes wrong as soon as
+            // anything is pruned/compacted (#258).
+            $sshUnixUser = $sj['ssh_unix_user'] ?? null;
+            $repoUniqueSize = \BBS\Services\RepositorySizeService::fetchRepoUniqueCsize($csRepo, $sshUnixUser);
+            $sizeForRepo = $repoUniqueSize ?? $totalSize;
+
             $db->update('repositories', [
                 'archive_count' => $archiveCount,
-                'size_bytes' => $totalSize,
+                'size_bytes' => $sizeForRepo,
             ], 'id = ?', [$csRepo['id']]);
 
             $db->update('backup_jobs', [
@@ -833,7 +1027,7 @@ foreach ($serverJobs as $sj) {
         } else {
             $runAsUserSync = $sj['ssh_unix_user'] ?? null;
             if ($runAsUserSync) {
-                $syncCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-list', $runAsUserSync, $passphrase, $crLocalPath];
+                $syncCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-list', $runAsUserSync, '-', $crLocalPath];
                 $syncEnvStrings = null;
             } else {
                 $syncCmd = ['borg', 'list', '--json', $crLocalPath];
@@ -847,6 +1041,9 @@ foreach ($serverJobs as $sj) {
             }
             $syncProc = proc_open($syncCmd, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $syncPipes, null, $syncEnvStrings);
             if (is_resource($syncProc)) {
+                if ($runAsUserSync) {
+                    fwrite($syncPipes[0], $passphrase . "\n");
+                }
                 fclose($syncPipes[0]);
                 $syncOutput = stream_get_contents($syncPipes[1]);
                 fclose($syncPipes[1]);
@@ -1047,7 +1244,7 @@ foreach ($serverJobs as $sj) {
                 if ($runAsUser) {
                     $crCmd = [
                         'sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-list-archive',
-                        $runAsUser, $passphrase, $archivePath
+                        $runAsUser, '-', $archivePath
                     ];
                     $crEnv = null;
                 } else {
@@ -1074,6 +1271,9 @@ foreach ($serverJobs as $sj) {
                     continue;
                 }
 
+                if ($runAsUser) {
+                    fwrite($crPipes[0], $passphrase . "\n");
+                }
                 fclose($crPipes[0]);
 
                 // Stream borg stdout line-by-line to TSV — constant memory usage
@@ -1206,6 +1406,125 @@ foreach ($serverJobs as $sj) {
             // Update cached catalog total for dashboard
             \BBS\Services\CatalogImporter::updateCachedTotal($db);
 
+            // Heal: any archive row whose databases_backed_up is NULL gets
+            // its database list reconstructed from the freshly-populated
+            // file_catalog. Recovers archives whose agent-reported metadata
+            // was wiped by a pre-fix catalog_sync (#294). Covers all three
+            // DB plugins: mysql_dump / pg_dump (one .sql{,.gz} per database
+            // at the top level of dump_dir) and mongo_dump (one subdir per
+            // database under dump_dir).
+            $healCount = 0;
+            $needHeal = $db->fetchAll(
+                "SELECT id FROM archives WHERE repository_id = ? AND databases_backed_up IS NULL",
+                [$crRepo['id']]
+            );
+            if (!empty($needHeal)) {
+                $dbPluginConfigs = $db->fetchAll(
+                    "SELECT pc.config, p.slug FROM plugin_configs pc
+                     JOIN plugins p ON p.id = pc.plugin_id
+                     WHERE pc.agent_id = ? AND p.slug IN ('mysql_dump', 'pg_dump', 'mongo_dump')",
+                    [$agentId]
+                );
+                $configsBySlug = [];
+                $defaultDumpDirs = [
+                    'mysql_dump' => '/home/bbs/mysql',
+                    'pg_dump'    => '/home/bbs/pgdump',
+                    'mongo_dump' => '/home/bbs/mongodump',
+                ];
+                foreach ($dbPluginConfigs as $pcRow) {
+                    if (isset($configsBySlug[$pcRow['slug']])) continue; // first one wins
+                    $cfg = json_decode($pcRow['config'], true) ?: [];
+                    $dumpDir = rtrim($cfg['dump_dir'] ?? '', '/');
+                    if ($dumpDir === '') {
+                        $dumpDir = $defaultDumpDirs[$pcRow['slug']] ?? '';
+                    }
+                    if ($dumpDir !== '') {
+                        $configsBySlug[$pcRow['slug']] = $dumpDir;
+                    }
+                }
+
+                if (!empty($configsBySlug)) {
+                    foreach ($needHeal as $ahRow) {
+                        $archiveIdInt = (int) $ahRow['id'];
+                        $reconstructed = null;
+
+                        foreach ($configsBySlug as $slug => $dumpDir) {
+                            if ($slug === 'mongo_dump') {
+                                $rows = $ch->fetchAll(
+                                    "SELECT DISTINCT parent_dir FROM file_catalog
+                                     WHERE agent_id = ? AND archive_id = ?
+                                       AND startsWith(parent_dir, ?)",
+                                    [$agentId, $archiveIdInt, $dumpDir . '/']
+                                );
+                                $dbs = [];
+                                foreach ($rows as $r) {
+                                    $rel = ltrim(substr($r['parent_dir'], strlen($dumpDir)), '/');
+                                    $first = explode('/', $rel)[0] ?? '';
+                                    if ($first !== '' && !in_array($first, $dbs, true)) {
+                                        $dbs[] = $first;
+                                    }
+                                }
+                                if ($dbs) {
+                                    $reconstructed = [
+                                        'databases'    => $dbs,
+                                        'per_database' => count($dbs) > 1,
+                                        'compress'     => false,
+                                    ];
+                                    break;
+                                }
+                            } else {
+                                // mysql_dump / pg_dump
+                                $rows = $ch->fetchAll(
+                                    "SELECT file_name FROM file_catalog
+                                     WHERE agent_id = ? AND archive_id = ?
+                                       AND parent_dir = ?
+                                       AND (endsWith(file_name, '.sql') OR endsWith(file_name, '.sql.gz'))",
+                                    [$agentId, $archiveIdInt, $dumpDir]
+                                );
+                                $dbs = [];
+                                $anyCompressed = false;
+                                foreach ($rows as $r) {
+                                    $fn = $r['file_name'];
+                                    if (str_ends_with($fn, '.sql.gz')) {
+                                        $anyCompressed = true;
+                                        $dbName = substr($fn, 0, -7);
+                                    } else {
+                                        $dbName = substr($fn, 0, -4);
+                                    }
+                                    if ($dbName !== '' && !in_array($dbName, $dbs, true)) {
+                                        $dbs[] = $dbName;
+                                    }
+                                }
+                                if ($dbs) {
+                                    $reconstructed = [
+                                        'databases'    => $dbs,
+                                        'per_database' => count($dbs) > 1,
+                                        'compress'     => $anyCompressed,
+                                    ];
+                                    break;
+                                }
+                            }
+                        }
+
+                        if ($reconstructed !== null) {
+                            $db->update('archives', [
+                                'databases_backed_up' => json_encode($reconstructed),
+                            ], 'id = ?', [$ahRow['id']]);
+                            $healCount++;
+                        }
+                    }
+                }
+            }
+            if ($healCount > 0) {
+                $db->insert('server_log', [
+                    'agent_id' => $agentId,
+                    'backup_job_id' => $sj['id'],
+                    'level' => 'info',
+                    'message' => "Reconstructed database list for {$healCount} archive(s) from dump files in the catalog",
+                ]);
+                echo date('Y-m-d H:i:s') . "   Healed databases_backed_up for {$healCount} archive(s)\n";
+            }
+
             $db->update('backup_jobs', [
                 'status' => 'completed',
                 'completed_at' => $crNow,
@@ -1260,7 +1579,10 @@ foreach ($serverJobs as $sj) {
             $borgArgs[$lastIdx] = $repo['path'];
         }
     } elseif ($sj['task_type'] === 'compact') {
-        $borgArgs = ['compact', $repoPath];
+        // --verbose so borg emits the "compaction freed about X GB" summary
+        // line, which the generic stdout logger downstream captures into
+        // server_log (issue #162).
+        $borgArgs = ['compact', '--verbose', $repoPath];
     } elseif ($sj['task_type'] === 'repo_check') {
         $borgArgs = ['check', '--verbose', $repoPath];
     } elseif ($sj['task_type'] === 'repo_repair') {
@@ -1324,9 +1646,10 @@ foreach ($serverJobs as $sj) {
         // Local repos: run as the repo's unix user via bbs-ssh-helper
         $runAsUser = $sj['ssh_unix_user'] ?? null;
         if ($runAsUser) {
-            // Use ssh-helper which handles sudo properly
+            // Use ssh-helper which handles sudo properly. Passphrase is piped
+            // via stdin ("-" marker) so it's not visible in `ps`.
             $cmd = array_merge(
-                ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-cmd', $runAsUser, $passphrase],
+                ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-cmd', $runAsUser, '-'],
                 $borgArgs
             );
             $envStrings = [];
@@ -1341,9 +1664,9 @@ foreach ($serverJobs as $sj) {
             $envStrings['HOME'] = '/tmp/bbs-borg-www-data';
         }
 
-        // Log the borg command (without passphrase)
+        // Log the borg command (passphrase passed on stdin, never in argv)
         $logCmd = $runAsUser
-            ? array_merge(['sudo', 'bbs-ssh-helper', 'borg-cmd', $runAsUser, '***'], $borgArgs)
+            ? array_merge(['sudo', 'bbs-ssh-helper', 'borg-cmd', $runAsUser, '-'], $borgArgs)
             : $cmd;
         $cmdStr = implode(' ', array_map('escapeshellarg', array_values($logCmd)));
         $db->insert('server_log', [
@@ -1362,6 +1685,9 @@ foreach ($serverJobs as $sj) {
         $stdout = '';
 
         if (is_resource($proc)) {
+            if ($runAsUser) {
+                fwrite($pipes[0], $passphrase . "\n");
+            }
             fclose($pipes[0]);
             $stdout = stream_get_contents($pipes[1]);
             $stderr = stream_get_contents($pipes[2]);
@@ -1381,12 +1707,31 @@ foreach ($serverJobs as $sj) {
     }
 
     $now = date('Y-m-d H:i:s');
-    $db->update('backup_jobs', [
-        'status' => $result,
-        'completed_at' => $now,
-        'duration_seconds' => max(0, strtotime($now) - strtotime($startedAt)),
-        'error_log' => $errorOutput ?: null,
-    ], 'id = ?', [$sj['id']]);
+    // Only finalize jobs we still own (status='running'). If an external
+    // flow flipped the row to failed/cancelled while borg was running,
+    // don't clobber that with a 'completed' here (#227 — stall-detect
+    // marked the job abandoned 9s after we started, and the long delete
+    // run then overwrote 'failed' with 'completed').
+    $finalize = $db->query(
+        "UPDATE backup_jobs SET status = ?, completed_at = ?, duration_seconds = ?, error_log = ?
+         WHERE id = ? AND status = 'running'",
+        [$result, $now, max(0, strtotime($now) - strtotime($startedAt)), $errorOutput ?: null, $sj['id']]
+    );
+    if ($finalize->rowCount() === 0) {
+        // Surface the race in the activity log too, not just stdout, so an
+        // admin can see why a long-running server-side job ended without a
+        // matching "Server-side X completed" entry (PR #228, credit @SAY-5).
+        $current = $db->fetchOne("SELECT status FROM backup_jobs WHERE id = ?", [$sj['id']]);
+        $existingStatus = $current['status'] ?? 'unknown';
+        $db->insert('server_log', [
+            'agent_id' => $sj['agent_id'],
+            'backup_job_id' => $sj['id'],
+            'level' => 'warning',
+            'message' => "Server-side {$sj['task_type']} job #{$sj['id']} finished, but its status was already '{$existingStatus}' (likely an abandoned/cancelled report came in mid-flight); not overwriting.",
+        ]);
+        echo date('Y-m-d H:i:s') . " Job #{$sj['id']} ({$sj['task_type']}) finished but row was already '{$existingStatus}' — leaving as-is\n";
+        continue;
+    }
 
     $level = $result === 'completed' ? 'info' : 'error';
     $db->insert('server_log', [
@@ -1514,22 +1859,22 @@ foreach ($serverJobs as $sj) {
                     'message' => "Prune completed — all " . count($borgArchives) . " recovery point(s) retained, none removed",
                 ]);
             }
-            // Refresh cached repo stats. size_bytes only updated from SUM for
-            // remote SSH repos (no du possible) or when currently 0 — for
-            // local repos the 5-min du scan is the source of truth.
-            $db->query("
-                UPDATE repositories SET
-                    archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
-                    size_bytes = CASE
-                        WHEN storage_type = 'remote_ssh' OR size_bytes = 0
-                        THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
-                        ELSE size_bytes
-                    END
-                WHERE id = ?
-            ", [$repoId, $repoId, $repoId]);
+            // Refresh archive count + size. Prune just shrank the repo,
+            // so measure actual disk usage now — see RepositorySizeService
+            // for the local/remote chain.
+            $db->query(
+                "UPDATE repositories SET archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?) WHERE id = ?",
+                [$repoId, $repoId]
+            );
+            \BBS\Services\RepositorySizeService::refresh((int) $repoId);
 
             } // end JSON validation else
         }
+    }
+
+    // After successful compact, repo shrank — refresh size.
+    if ($result === 'completed' && $sj['task_type'] === 'compact') {
+        \BBS\Services\RepositorySizeService::refresh((int) $sj['repository_id']);
     }
 
     // After successful archive_delete, remove the archive from the database
@@ -1551,82 +1896,78 @@ foreach ($serverJobs as $sj) {
 
             $db->delete('archives', 'id = ?', [$deletedArchive['id']]);
 
-            // Refresh cached repo stats (see note above on size_bytes rules)
-            $db->query("
-                UPDATE repositories SET
-                    archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
-                    size_bytes = CASE
-                        WHEN storage_type = 'remote_ssh' OR size_bytes = 0
-                        THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
-                        ELSE size_bytes
-                    END
-                WHERE id = ?
-            ", [$sj['repository_id'], $sj['repository_id'], $sj['repository_id']]);
+            $db->query(
+                "UPDATE repositories SET archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?) WHERE id = ?",
+                [$sj['repository_id'], $sj['repository_id']]
+            );
+            \BBS\Services\RepositorySizeService::refresh((int) $sj['repository_id']);
 
             echo date('Y-m-d H:i:s') . " Removed archive \"{$archiveName}\" from DB for repo #{$sj['repository_id']}\n";
         }
     }
 
-    // Auto-queue S3 sync after successful prune (skip for remote SSH — already offsite)
+    // Auto-queue S3 sync after successful prune (skip for remote SSH — already offsite).
+    // A repo can replicate to several S3 destinations (#263): queue one sync
+    // job per enabled destination config.
     if ($result === 'completed' && $sj['task_type'] === 'prune' && !empty($sj['repository_id']) && !$isRemoteSsh) {
-        // Check repository_s3_configs for S3 sync configuration
-        $repoS3Config = $db->fetchOne(
-            "SELECT rsc.plugin_config_id
+        $repoS3Configs = $db->fetchAll(
+            "SELECT rsc.plugin_config_id, pc.name AS config_name
              FROM repository_s3_configs rsc
+             JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
              WHERE rsc.repository_id = ? AND rsc.enabled = 1",
             [$sj['repository_id']]
         );
 
-        if ($repoS3Config) {
-            // Check if s3_sync is already queued or running for this repo
+        foreach ($repoS3Configs as $repoS3Config) {
+            // Dedupe per destination — another destination's pending sync
+            // must not block this one
             $existingS3 = $db->fetchOne(
                 "SELECT id FROM backup_jobs
-                 WHERE repository_id = ? AND task_type = 's3_sync' AND status IN ('queued', 'sent', 'running')
+                 WHERE repository_id = ? AND task_type = 's3_sync' AND plugin_config_id = ?
+                   AND status IN ('queued', 'sent', 'running')
                  LIMIT 1",
-                [$sj['repository_id']]
+                [$sj['repository_id'], $repoS3Config['plugin_config_id']]
             );
             if ($existingS3) {
-                echo date('Y-m-d H:i:s') . " Skipped: S3 sync already queued/running (job #{$existingS3['id']}) for repo #{$sj['repository_id']}\n";
-            } else {
-                $s3JobId = $db->insert('backup_jobs', [
-                    'agent_id' => $sj['agent_id'],
-                    'repository_id' => $sj['repository_id'],
-                    'task_type' => 's3_sync',
-                    'plugin_config_id' => $repoS3Config['plugin_config_id'],
-                    'status' => 'queued',
-                ]);
-
-                $db->insert('server_log', [
-                    'agent_id' => $sj['agent_id'],
-                    'backup_job_id' => $s3JobId,
-                    'level' => 'info',
-                    'message' => "S3 sync queued (job #{$s3JobId}) after prune job #{$sj['id']}",
-                ]);
-
-                // Update last_sync_at will happen when the job completes
-                echo date('Y-m-d H:i:s') . " Queued: S3 sync job #{$s3JobId} after prune #{$sj['id']}\n";
+                echo date('Y-m-d H:i:s') . " Skipped: S3 sync to \"{$repoS3Config['config_name']}\" already queued/running (job #{$existingS3['id']}) for repo #{$sj['repository_id']}\n";
+                continue;
             }
+
+            $s3JobId = $db->insert('backup_jobs', [
+                'agent_id' => $sj['agent_id'],
+                'repository_id' => $sj['repository_id'],
+                'task_type' => 's3_sync',
+                'plugin_config_id' => $repoS3Config['plugin_config_id'],
+                'status' => 'queued',
+            ]);
+
+            $db->insert('server_log', [
+                'agent_id' => $sj['agent_id'],
+                'backup_job_id' => $s3JobId,
+                'level' => 'info',
+                'message' => "S3 sync to \"{$repoS3Config['config_name']}\" queued (job #{$s3JobId}) after prune job #{$sj['id']}",
+            ]);
+
+            // Update last_sync_at will happen when the job completes
+            echo date('Y-m-d H:i:s') . " Queued: S3 sync job #{$s3JobId} (\"{$repoS3Config['config_name']}\") after prune #{$sj['id']}\n";
         }
     }
 }
 
-// Step 5: Update repository sizes from actual disk usage (every 5 minutes)
-// Skips remote SSH repos — no local disk to measure; size comes from agent backup reports
-if ((int) date('i') % 5 === 0) {
-    $repos = $db->fetchAll("SELECT id, path, agent_id, name, storage_type, storage_location_id FROM repositories");
-    foreach ($repos as $repo) {
-        if (($repo['storage_type'] ?? 'local') === 'remote_ssh') continue;
-        $localPath = \BBS\Services\BorgCommandBuilder::getLocalRepoPath($repo);
-        if (!empty($localPath)) {
-            // Use SSH helper to get size (runs as root, can read all repos)
-            $output = [];
-            exec('sudo /usr/local/bin/bbs-ssh-helper get-size ' . escapeshellarg($localPath) . ' 2>/dev/null', $output);
-            if (!empty($output[0]) && is_numeric($output[0])) {
-                $sizeBytes = (int) $output[0];
-                $db->update('repositories', ['size_bytes' => $sizeBytes], 'id = ?', [$repo['id']]);
-            }
-        }
-    }
+// Step 5: Bootstrap size for any local repo whose size_bytes is still 0
+// (fresh install, newly added repo, or legacy migration). Runs every minute
+// but only touches disks once per repo, since the UPDATE makes size_bytes > 0.
+// After the bootstrap, size is maintained by event-driven refreshes in
+// RepositorySizeService — triggered after backup, prune, compact, and
+// archive_delete. No periodic rescan on idle disks.
+$zeroRepos = $db->fetchAll(
+    "SELECT id FROM repositories
+      WHERE size_bytes = 0
+        AND (storage_type = 'local' OR storage_type IS NULL)
+        AND id IN (SELECT DISTINCT repository_id FROM archives)"
+);
+foreach ($zeroRepos as $zr) {
+    \BBS\Services\RepositorySizeService::refresh((int) $zr['id']);
 }
 
 // Step 5b: Poll remote SSH host disk usage (every 15 minutes)
@@ -1636,24 +1977,29 @@ if ((int) date('i') % 15 === 0) {
     foreach ($remoteConfigs as $rc) {
         $rcFull = $remoteSshService->getDecrypted((int) $rc['id']);
         if ($rcFull) {
-            $diskData = $remoteSshService->getDiskUsage($rcFull);
-            $remoteSshService->updateDiskUsage((int) $rc['id'], $diskData);
+            if (($rcFull['provider'] ?? '') === 'borgbase' || str_contains((string)($rcFull['remote_host'] ?? ''), '.repo.borgbase.com')) {
+                $diskData = $remoteSshService->refreshBorgBaseDiskUsage($rcFull);
+            } else {
+                $diskData = $remoteSshService->getDiskUsage($rcFull);
+                $remoteSshService->updateDiskUsage((int) $rc['id'], $diskData, 'df');
+            }
             if ($diskData) {
                 echo date('Y-m-d H:i:s') . " Remote SSH \"{$rc['name']}\": {$diskData['percent']}% used\n";
             } else {
-                echo date('Y-m-d H:i:s') . " Remote SSH \"{$rc['name']}\": df unavailable\n";
+                echo date('Y-m-d H:i:s') . " Remote SSH \"{$rc['name']}\": usage unavailable\n";
             }
         }
     }
 }
 
-// Step 6: Check storage for low disk space (all storage locations)
+// Step 6: Check storage for low disk space — per-user thresholds (#156).
+// Each user picks their own trigger: percent-used, free-gb, or disabled.
+// We collect every storage endpoint's stats once, then evaluate each user's
+// threshold against them so the disk_total_space / df syscalls only run once
+// regardless of how many users are on the server.
 $notificationService = $notificationService ?? new NotificationService();
-$thresholdSetting = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_alert_threshold'");
-$storageThreshold = (int) ($thresholdSetting['value'] ?? 90);
 
 $storageLocations = $db->fetchAll("SELECT * FROM storage_locations ORDER BY id");
-// Fallback if no storage_locations table yet (pre-migration)
 if (empty($storageLocations)) {
     $storagePathSetting = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
     if (!empty($storagePathSetting['value'])) {
@@ -1661,40 +2007,69 @@ if (empty($storageLocations)) {
     }
 }
 
-$anyLow = false;
+// Collect usage for every storage endpoint once.
+$storageStats = []; // [{label, detail, total_bytes, free_bytes, used_percent}]
 foreach ($storageLocations as $sl) {
     $slPath = $sl['path'] ?? '';
     if (empty($slPath) || !is_dir($slPath)) continue;
     $total = @disk_total_space($slPath);
-    $free = @disk_free_space($slPath);
-    if ($total !== false && $free !== false && $total > 0) {
-        $usagePercent = round((($total - $free) / $total) * 100, 1);
-        if ($usagePercent >= $storageThreshold) {
-            $label = $sl['label'] ?? $slPath;
-            $notificationService->notify('storage_low', null, null, "Storage \"{$label}\" is at {$usagePercent}% capacity ({$slPath})", 'warning');
-            $anyLow = true;
-        }
-    }
+    $free  = @disk_free_space($slPath);
+    if ($total === false || $free === false || $total <= 0) continue;
+    $storageStats[] = [
+        'label'        => $sl['label'] ?? $slPath,
+        'detail'       => $slPath,
+        'total_bytes'  => (int) $total,
+        'free_bytes'   => (int) $free,
+        'used_percent' => round((($total - $free) / $total) * 100, 1),
+    ];
 }
-
-// Also check remote SSH storage
 $remoteConfigs = $db->fetchAll("SELECT * FROM remote_ssh_configs WHERE disk_total_bytes IS NOT NULL AND disk_total_bytes > 0");
 foreach ($remoteConfigs as $rc) {
     $total = (int) $rc['disk_total_bytes'];
-    $free = (int) $rc['disk_free_bytes'];
-    if ($total > 0) {
-        $usagePercent = round((($total - $free) / $total) * 100, 1);
-        if ($usagePercent >= $storageThreshold) {
-            $notificationService->notify('storage_low', null, null,
-                "Remote storage \"{$rc['name']}\" is at {$usagePercent}% capacity ({$rc['remote_user']}@{$rc['remote_host']})",
-                'warning');
-            $anyLow = true;
-        }
-    }
+    $free  = (int) $rc['disk_free_bytes'];
+    if ($total <= 0) continue;
+    $storageStats[] = [
+        'label'        => "Remote storage \"{$rc['name']}\"",
+        'detail'       => "{$rc['remote_user']}@{$rc['remote_host']}",
+        'total_bytes'  => $total,
+        'free_bytes'   => $free,
+        'used_percent' => round((($total - $free) / $total) * 100, 1),
+    ];
 }
 
-if (!$anyLow) {
-    $notificationService->resolve('storage_low', null, null);
+// Evaluate each active user's threshold against the collected stats.
+$users = $db->fetchAll("SELECT id, storage_alert_mode, storage_alert_value FROM users WHERE storage_alert_mode != 'disabled'");
+foreach ($users as $u) {
+    $mode  = $u['storage_alert_mode'];
+    $value = (int) $u['storage_alert_value'];
+    $userId = (int) $u['id'];
+    $anyLow = false;
+
+    foreach ($storageStats as $st) {
+        $triggered = false;
+        $suffix    = '';
+        if ($mode === 'percent') {
+            if ($st['used_percent'] >= $value) {
+                $triggered = true;
+                $suffix = "{$st['used_percent']}% used";
+            }
+        } elseif ($mode === 'gb_free') {
+            $freeGb = round($st['free_bytes'] / 1073741824, 1);
+            if ($freeGb <= $value) {
+                $triggered = true;
+                $suffix = "{$freeGb} GB free";
+            }
+        }
+        if (!$triggered) continue;
+
+        $msg = "{$st['label']} is low on space ({$suffix}) — {$st['detail']}";
+        $notificationService->notify('storage_low', null, null, $msg, 'warning', $userId);
+        $anyLow = true;
+    }
+
+    if (!$anyLow) {
+        $notificationService->resolve('storage_low', null, null, $userId);
+    }
 }
 
 // Step 7: Cleanup old resolved notifications and server logs
@@ -1727,6 +2102,65 @@ if (!$lastBorgCheckTime || strtotime($lastBorgCheckTime) < time() - 86400) {
         echo date('Y-m-d H:i:s') . " Borg version sync: {$syncResult['added']} new versions added\n";
     } elseif (isset($syncResult['error'])) {
         echo date('Y-m-d H:i:s') . " Borg version sync failed: {$syncResult['error']}\n";
+    }
+}
+
+// Step 8b: Auto-update agents after a BBS update (#306).
+// When the bundled agent version changes (i.e. BBS was just updated), queue
+// an agent update for every outdated, online agent — once per new version,
+// tracked via 'auto_update_agents_last_version' so it doesn't re-queue every
+// minute. Enabled by default; turn off with the 'auto_update_agents' setting.
+// Updates the agent .py through the normal mechanism (the safe path — the
+// Windows launcher exe is never touched).
+$autoUpdAgents = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'auto_update_agents'");
+if (($autoUpdAgents['value'] ?? '1') === '1') {
+    $bundledAgentVersion = null;
+    $agentFile = __DIR__ . '/agent/bbs-agent.py';
+    if (is_readable($agentFile) && ($fh = fopen($agentFile, 'r'))) {
+        for ($i = 0; $i < 50 && ($line = fgets($fh)) !== false; $i++) {
+            if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/', $line, $m)) {
+                $bundledAgentVersion = $m[1];
+                break;
+            }
+        }
+        fclose($fh);
+    }
+    $lastAutoVer = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'auto_update_agents_last_version'");
+    if ($bundledAgentVersion && ($lastAutoVer['value'] ?? '') !== $bundledAgentVersion) {
+        $outdated = $db->fetchAll(
+            "SELECT id, name FROM agents
+             WHERE agent_version IS NOT NULL AND agent_version != ? AND status = 'online'",
+            [$bundledAgentVersion]
+        );
+        $pending = array_column($db->fetchAll(
+            "SELECT agent_id FROM backup_jobs WHERE task_type = 'update_agent' AND status IN ('queued','sent','running')"
+        ), 'agent_id');
+        $queuedUpd = 0;
+        foreach ($outdated as $ag) {
+            if (in_array($ag['id'], $pending)) {
+                continue;
+            }
+            $jid = $db->insert('backup_jobs', [
+                'agent_id' => $ag['id'],
+                'task_type' => 'update_agent',
+                'status' => 'queued',
+            ]);
+            $db->insert('server_log', [
+                'agent_id' => $ag['id'],
+                'backup_job_id' => $jid,
+                'level' => 'info',
+                'message' => "Agent update queued automatically (BBS updated to agent v{$bundledAgentVersion})",
+            ]);
+            $queuedUpd++;
+        }
+        if ($queuedUpd > 0) {
+            echo date('Y-m-d H:i:s') . " Auto agent-update: queued {$queuedUpd} update(s) to v{$bundledAgentVersion}\n";
+        }
+        $db->query(
+            "INSERT INTO settings (`key`, `value`) VALUES ('auto_update_agents_last_version', ?)
+             ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+            [$bundledAgentVersion]
+        );
     }
 }
 
@@ -1897,13 +2331,23 @@ if (($selfBackupEnabled['value'] ?? '1') === '1') {
     }
 }
 
-// Step 11: Weekly auto-compact of all repositories (Saturday night at 2 AM)
-// Jobs are queued sequentially and processed one at a time by the scheduler
+// Step 11: Weekly auto-compact of all repositories.
+// Day/hour are configurable (#272) — the default Saturday-2 AM window never
+// fires on storage that isn't powered on then. We trigger on the configured
+// day at OR AFTER the configured hour (not an exact hour match) so a machine
+// that only comes online later that day still catches the once-per-week run.
+// Jobs are queued sequentially and processed one at a time by the scheduler.
 $dayOfWeek = (int) date('w'); // 0=Sunday, 6=Saturday
 $hourOfDay = (int) date('G'); // 0-23
 
-// Check if it's Saturday (6) and within the 2 AM hour
-if ($dayOfWeek === 6 && $hourOfDay === 2) {
+$compactDaySetting  = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'auto_compact_day'");
+$compactHourSetting = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'auto_compact_hour'");
+$compactDay  = isset($compactDaySetting['value'])  && $compactDaySetting['value']  !== '' ? (int) $compactDaySetting['value']  : 6;
+$compactHour = isset($compactHourSetting['value']) && $compactHourSetting['value'] !== '' ? (int) $compactHourSetting['value'] : 2;
+$compactDay  = max(0, min(6, $compactDay));
+$compactHour = max(0, min(23, $compactHour));
+
+if ($dayOfWeek === $compactDay && $hourOfDay >= $compactHour) {
     $lastAutoCompact = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'last_auto_compact'");
     $lastAutoCompactTime = $lastAutoCompact['value'] ?? null;
 
@@ -2006,6 +2450,7 @@ if ($hourOfDay === 3) {
             );
             $pendingIds = array_column($pending, 'agent_id');
 
+            $alreadyCurrent = 0;
             foreach ($agents as $agent) {
                 if (in_array($agent['id'], $pendingIds)) {
                     continue;
@@ -2018,6 +2463,34 @@ if ($hourOfDay === 3) {
                         $skipped++;
                         continue;
                     }
+                }
+
+                // Skip agents already on the target version (#174). The old
+                // behavior queued every day for every client regardless of
+                // whether an update was actually available, which re-installed
+                // the same binary and spammed the log.
+                $target = $borgService->getBestVersionForAgent($agent);
+                $targetVersion = $target['version'] ?? null;
+                $currentVersion = $agent['borg_version'] ?? null;
+
+                // No versioned binary for this arch — only pip 'latest' is
+                // available, and we can't tell whether an update is actually
+                // needed. Arches without a working pip (armv7l, some BSDs)
+                // would otherwise fail daily forever. Skip auto-queue; the
+                // user can still trigger "Update Borg" manually. #187
+                if (($target['source'] ?? '') === 'pip' && $targetVersion === 'latest') {
+                    $alreadyCurrent++;
+                    continue;
+                }
+
+                if (
+                    $targetVersion
+                    && $targetVersion !== 'latest'
+                    && $currentVersion
+                    && version_compare($currentVersion, $targetVersion, '>=')
+                ) {
+                    $alreadyCurrent++;
+                    continue;
                 }
 
                 $jobId = $db->insert('backup_jobs', [
@@ -2034,8 +2507,8 @@ if ($hourOfDay === 3) {
                 $queued++;
             }
 
-            if ($queued > 0 || $skipped > 0) {
-                echo date('Y-m-d H:i:s') . " Auto-update: queued {$queued} borg update(s), skipped {$skipped} incompatible\n";
+            if ($queued > 0 || $skipped > 0 || $alreadyCurrent > 0) {
+                echo date('Y-m-d H:i:s') . " Auto-update: queued {$queued} borg update(s), skipped {$skipped} incompatible, {$alreadyCurrent} already current\n";
             }
 
             $db->query(
@@ -2078,9 +2551,26 @@ if ($hourOfDay === 3) {
             );
             $pendingIds = array_column($pending, 'agent_id');
 
+            // 24h backoff (#264): if a previous update_agent failed within
+            // the last day, don't keep retrying every minute. Without this,
+            // a transient network issue during the update produces one
+            // email per minute per agent indefinitely. Once the cooldown
+            // passes, we'll try once more — if it fails again, one fresh
+            // email, then another 24h of silence.
+            $recentlyFailed = $db->fetchAll(
+                "SELECT agent_id FROM backup_jobs
+                 WHERE task_type = 'update_agent'
+                   AND status = 'failed'
+                   AND completed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+            );
+            $recentlyFailedIds = array_column($recentlyFailed, 'agent_id');
+
             $queued = 0;
             foreach ($outdatedAgents as $agent) {
                 if (in_array($agent['id'], $pendingIds)) {
+                    continue;
+                }
+                if (in_array($agent['id'], $recentlyFailedIds)) {
                     continue;
                 }
 

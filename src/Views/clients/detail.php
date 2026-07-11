@@ -28,16 +28,13 @@ $statusClass = match($agent['status']) {
     'error' => 'danger',
     default => 'warning',
 };
-$sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' GB'
-    : ($totalSize >= 1048576 ? round($totalSize / 1048576, 1) . ' MB'
-    : ($totalSize >= 1024 ? round($totalSize / 1024, 1) . ' KB'
-    : ($totalSize > 0 ? $totalSize . ' B' : '0')));
+$sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $totalSize) : '0';
 ?>
 <div class="mb-4">
         <div class="d-flex justify-content-between align-items-start mb-3">
             <div class="flex-fill">
                 <div class="d-flex flex-wrap align-items-center gap-2">
-                    <h3 class="mb-0">
+                    <h3 class="mb-0" style="font-size:18px;">
                         <i class="bi bi-display me-2 text-primary"></i><?= htmlspecialchars($agent['name']) ?>
                     </h3>
                     <span class="badge bg-<?= $statusClass ?>" id="agent-status-badge"><?= ucfirst($agent['status']) ?></span>
@@ -47,7 +44,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                 </div>
                 <div class="text-muted d-flex flex-wrap gap-3 align-items-center" style="font-size:.8rem;">
                     <?php if ($agent['hostname']): ?>
-                        <span><i class="bi bi-hdd-network me-1"></i><?= htmlspecialchars($agent['hostname']) ?></span>
+                        <span><i class="bi bi-signpost me-1"></i><?= htmlspecialchars($agent['hostname']) ?></span>
                         <?php if ($agent['ip_address'] ?? null): ?>
                             <span class="d-none d-sm-inline"><i class="bi bi-globe me-1"></i><?= htmlspecialchars($agent['ip_address']) ?></span>
                         <?php endif; ?>
@@ -242,7 +239,12 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
             <i class="bi bi-arrow-counterclockwise me-1"></i><span class="tab-label">Restore</span>
         </a>
     </li>
-    <?php if ($this->isAdmin()): ?>
+    <?php
+    // Install and Delete: admins, or the client's owner — owners manage
+    // the full lifecycle of their own clients (#337)
+    $isOwnerOrAdmin = $this->isAdmin() || (int) ($agent['user_id'] ?? 0) === (int) ($_SESSION['user_id'] ?? 0);
+    ?>
+    <?php if ($isOwnerOrAdmin): ?>
     <li class="nav-item">
         <a class="nav-link <?= $tab === 'install' ? 'active' : '' ?>" href="?tab=install">
             <i class="bi bi-download me-1"></i><span class="tab-label">Install</span>
@@ -260,8 +262,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
 <?php if ($tab === 'status'): ?>
     <?php
     // Compute status metrics
-    $avgDuration = (int) ($jobStats['avg_duration'] ?? 0);
-    $avgDurLabel = $avgDuration >= 60 ? floor($avgDuration / 60) . 'm ' . ($avgDuration % 60) . 's' : $avgDuration . 's';
+    $avgDurLabel = \BBS\Core\TimeHelper::duration((int) ($jobStats['avg_duration'] ?? 0));
     $successRate = ($jobStats['total'] ?? 0) > 0
         ? round(($jobStats['completed'] / $jobStats['total']) * 100)
         : 0;
@@ -386,7 +387,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         <!-- Backup Duration Chart -->
         <div class="col-lg-7">
             <div class="card border-0 shadow-sm h-100">
-                <div class="card-header bg-body fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-bar-chart me-1"></i> Backup Duration (Last 30)
                 </div>
                 <div class="card-body">
@@ -403,7 +404,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         <!-- Storage by Repository -->
         <div class="col-lg-5">
             <div class="card border-0 shadow-sm h-100">
-                <div class="card-header bg-body fw-semibold">
+                <div class="card-header fw-semibold">
                     <i class="bi bi-pie-chart me-1"></i> Storage by Repository
                 </div>
                 <div class="card-body">
@@ -420,7 +421,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                 <span class="fw-semibold">
                                     <?php
                                     $s = $repo['size_bytes'];
-                                    echo $s >= 1073741824 ? round($s / 1073741824, 1) . ' GB' : ($s >= 1048576 ? round($s / 1048576, 1) . ' MB' : ($s >= 1024 ? round($s / 1024, 1) . ' KB' : ($s > 0 ? $s . ' B' : '0')));
+                                    echo $s > 0 ? \BBS\Services\ServerStats::formatBytes((int) $s) : '0';
                                     ?>
                                     <span class="text-muted">(<?= $repo['archive_count'] ?> archives)</span>
                                 </span>
@@ -433,61 +434,63 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         </div>
     </div>
 
-    <!-- Row 3: Recent Activity Timeline -->
+    <!-- Row 3: Recent Activity (table) -->
     <div class="card border-0 shadow-sm">
-        <div class="card-header bg-body fw-semibold">
+        <div class="card-header fw-semibold">
             <i class="bi bi-clock-history me-1"></i> Recent Activity
         </div>
         <div class="card-body p-0">
             <?php if (empty($recentJobs)): ?>
             <div class="p-4 text-muted text-center">No activity yet.</div>
             <?php else: ?>
-            <div class="list-group list-group-flush">
-                <?php foreach (array_slice($recentJobs, 0, 10) as $job): ?>
-                <?php
-                $jIcon = match($job['status']) {
-                    'completed' => 'check-circle-fill text-success',
-                    'failed' => 'x-circle-fill text-danger',
-                    'running' => 'arrow-repeat text-info',
-                    'queued','sent' => 'hourglass-split text-warning',
-                    default => 'dash-circle text-secondary',
-                };
-                $d = $job['duration_seconds'] ?? 0;
-                $durStr = $d >= 60 ? floor($d / 60) . 'm ' . ($d % 60) . 's' : ($d > 0 ? $d . 's' : '--');
-                ?>
-                <div class="list-group-item d-flex align-items-center py-2 px-3">
-                    <i class="bi bi-<?= $jIcon ?> fs-5 me-3"></i>
-                    <div class="flex-grow-1">
-                        <div class="d-flex justify-content-between">
-                            <span class="fw-semibold"><?= ucfirst($job['task_type']) ?></span>
-                            <small class="text-muted"><?= \BBS\Core\TimeHelper::format($job['completed_at'] ?? $job['started_at'] ?? $job['queued_at'], 'M j g:ia') ?></small>
-                        </div>
-                        <div class="small text-muted">
-                            <?= htmlspecialchars($job['repo_name'] ?? '') ?>
-                            <?php if ($job['files_total']): ?>
-                                &middot; <?= number_format($job['files_total']) ?> files
-                            <?php endif; ?>
-                            &middot; <?= $durStr ?>
-                            <?php if ($job['status'] === 'failed' && $job['error_log']): ?>
-                                <?php
-                                $errFull = $job['error_log'];
-                                $errShort = mb_strlen($errFull) > 80 ? mb_substr($errFull, 0, 80) . '…' : $errFull;
-                                ?>
-                                <span class="text-danger ms-1" title="<?= htmlspecialchars(mb_substr($errFull, 0, 500)) ?>">
-                                    &middot; <i class="bi bi-exclamation-triangle"></i> <?= htmlspecialchars($errShort) ?>
-                                </span>
-                            <?php endif; ?>
-                        </div>
-                    </div>
-                </div>
-                <?php endforeach; ?>
+            <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle mb-0" style="font-size: 0.875rem;">
+                    <thead>
+                        <tr>
+                            <th style="width:36px;"></th>
+                            <th>Task</th>
+                            <th>Repo</th>
+                            <th class="text-nowrap">Time</th>
+                            <th class="text-nowrap">Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach (array_slice($recentJobs, 0, 20) as $job):
+                        $jIcon = match($job['status']) {
+                            'completed' => 'check-circle-fill text-success',
+                            'failed' => 'x-circle-fill text-danger',
+                            'running' => 'arrow-repeat text-info',
+                            'queued','sent' => 'hourglass-split text-warning',
+                            default => 'dash-circle text-secondary',
+                        };
+                        $durStr = \BBS\Core\TimeHelper::duration((int) ($job['duration_seconds'] ?? 0));
+                        $when = $job['completed_at'] ?? $job['started_at'] ?? $job['queued_at'];
+                        $iconTitle = '';
+                        if ($job['status'] === 'failed' && !empty($job['error_log'])) {
+                            $iconTitle = mb_substr($job['error_log'], 0, 500);
+                        }
+                    ?>
+                        <tr style="cursor: pointer;" onclick="window.location='/queue/<?= (int) $job['id'] ?>'">
+                            <td class="text-center"<?= $iconTitle ? ' title="' . htmlspecialchars($iconTitle) . '"' : '' ?>>
+                                <i class="bi bi-<?= $jIcon ?>"></i>
+                            </td>
+                            <td><?= ucfirst($job['task_type']) ?></td>
+                            <td class="text-truncate" style="max-width:240px;" title="<?= htmlspecialchars($job['repo_name'] ?? '') ?>">
+                                <?= htmlspecialchars($job['repo_name'] ?? '—') ?>
+                            </td>
+                            <td class="text-nowrap text-muted"><?= $durStr ?></td>
+                            <td class="text-nowrap text-muted"><?= $when ? \BBS\Core\TimeHelper::format($when, 'M j g:ia') : '—' ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
             </div>
             <?php endif; ?>
         </div>
     </div>
 
     <?php if (!empty($durationChart)): ?>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <script src="/assets/chartjs/chart.umd.min.js"></script>
     <script>
     const _dk = document.documentElement.getAttribute('data-bs-theme') === 'dark';
     const _tc = _dk ? '#8b929a' : '#6c757d';
@@ -562,11 +565,11 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                 tooltip: {
                     callbacks: {
                         label: function(ctx) {
-                            const bytes = ctx.parsed;
-                            if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
-                            if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
-                            if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
-                            return bytes + ' B';
+                            const bytes = ctx.parsed, s = '\u00A0';
+                            if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + s + 'GB';
+                            if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + s + 'MB';
+                            if (bytes >= 1024) return (bytes / 1024).toFixed(1) + s + 'KB';
+                            return bytes + s + 'B';
                         }
                     }
                 }
@@ -629,6 +632,270 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         if (grid) grid.style.display = '';
         if (solo) solo.style.display = '';
         if (imp) imp.style.display = 'none';
+        cancelAdopt();
+    }
+
+    // --- Scan & adopt: find borg repos on storage and move them into place ---
+    var scanCandidates = [];
+
+    function scanForRepos() {
+        var btn = document.getElementById('scanReposBtn');
+        var results = document.getElementById('scan-results');
+        var errDiv = document.getElementById('scan-error');
+        errDiv.classList.add('d-none');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Scanning...';
+
+        fetch('/repositories/scan', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: '',
+            credentials: 'same-origin'
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-search me-1"></i> Scan Storage for Repositories';
+            if (data.status !== 'ok') {
+                errDiv.textContent = data.error || 'Scan failed.';
+                errDiv.classList.remove('d-none');
+                return;
+            }
+            scanCandidates = data.candidates || [];
+            renderScanResults();
+        })
+        .catch(function() {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-search me-1"></i> Scan Storage for Repositories';
+            errDiv.textContent = 'Scan request failed.';
+            errDiv.classList.remove('d-none');
+        });
+    }
+
+    function renderScanResults() {
+        var results = document.getElementById('scan-results');
+        results.innerHTML = '';
+        results.style.display = '';
+
+        if (!scanCandidates.length) {
+            var p = document.createElement('div');
+            p.className = 'alert alert-secondary small mb-0';
+            p.textContent = 'No unregistered borg repositories were found in the configured storage locations.';
+            results.appendChild(p);
+            return;
+        }
+
+        var table = document.createElement('table');
+        table.className = 'table table-sm table-hover align-middle';
+        table.innerHTML = '<thead><tr>' +
+            '<th>Found Repository</th><th>Size</th><th>Modified</th><th>Encryption Key</th><th></th>' +
+            '</tr></thead>';
+        var tbody = document.createElement('tbody');
+
+        scanCandidates.forEach(function(c, idx) {
+            var tr = document.createElement('tr');
+
+            var tdPath = document.createElement('td');
+            tdPath.className = 'font-monospace small';
+            tdPath.style.wordBreak = 'break-all';
+            tdPath.textContent = c.path;
+            tr.appendChild(tdPath);
+
+            var tdSize = document.createElement('td');
+            tdSize.className = 'text-nowrap';
+            tdSize.textContent = c.size_label;
+            tr.appendChild(tdSize);
+
+            var tdMod = document.createElement('td');
+            tdMod.className = 'text-nowrap small';
+            tdMod.textContent = c.modified;
+            tr.appendChild(tdMod);
+
+            var tdKey = document.createElement('td');
+            var badge = document.createElement('span');
+            if (c.key_in_repo) {
+                badge.className = 'badge text-bg-success';
+                badge.textContent = 'Key in repo';
+            } else {
+                badge.className = 'badge text-bg-secondary';
+                badge.textContent = 'None / keyfile';
+                badge.title = 'Either unencrypted, or keyfile encryption (key stored outside the repo). Verification will confirm which.';
+            }
+            tdKey.appendChild(badge);
+            tr.appendChild(tdKey);
+
+            var tdBtn = document.createElement('td');
+            tdBtn.className = 'text-end';
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn btn-sm btn-primary';
+            btn.innerHTML = '<i class="bi bi-box-arrow-in-down me-1"></i>Import';
+            btn.onclick = function() { startAdopt(idx); };
+            tdBtn.appendChild(btn);
+            tr.appendChild(tdBtn);
+
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+
+        var wrap = document.createElement('div');
+        wrap.className = 'table-responsive';
+        wrap.appendChild(table);
+        results.appendChild(wrap);
+    }
+
+    function startAdopt(idx) {
+        var c = scanCandidates[idx];
+        if (!c) return;
+        document.getElementById('adopt-scan-block').style.display = 'none';
+        document.getElementById('import-verify-form').style.display = 'none';
+        document.getElementById('import-confirm-section').style.display = 'none';
+        document.getElementById('adopt-confirm-section').style.display = 'none';
+        var sec = document.getElementById('adopt-verify-section');
+        sec.style.display = '';
+        sec.dataset.locationId = c.storage_location_id || '';
+        document.getElementById('adoptSourcePath').value = c.path;
+        // Prefill with the directory name, trimmed to BBS's naming rules
+        document.getElementById('adoptName').value = (c.name || '').replace(/[^a-zA-Z0-9_-]/g, '').substring(0, 20);
+        document.getElementById('adoptPassphrase').value = '';
+        document.getElementById('adopt-verify-error').classList.add('d-none');
+    }
+
+    function cancelAdopt() {
+        var sec = document.getElementById('adopt-verify-section');
+        var confirmSec = document.getElementById('adopt-confirm-section');
+        var scanBlock = document.getElementById('adopt-scan-block');
+        var verifyForm = document.getElementById('import-verify-form');
+        if (sec) sec.style.display = 'none';
+        if (confirmSec) confirmSec.style.display = 'none';
+        if (scanBlock) scanBlock.style.display = '';
+        if (verifyForm) verifyForm.style.display = '';
+    }
+
+    function verifyAdoptRepo() {
+        var btn = document.getElementById('adoptVerifyBtn');
+        var errDiv = document.getElementById('adopt-verify-error');
+        errDiv.classList.add('d-none');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Verifying...';
+
+        var sec = document.getElementById('adopt-verify-section');
+        var formData = new URLSearchParams();
+        formData.append('agent_id', '<?= $agent['id'] ?>');
+        formData.append('name', document.getElementById('adoptName').value);
+        formData.append('passphrase', document.getElementById('adoptPassphrase').value);
+        formData.append('source_path', document.getElementById('adoptSourcePath').value);
+        formData.append('storage_location_id', sec.dataset.locationId || '');
+
+        fetch('/repositories/adopt/verify', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: formData.toString(),
+            credentials: 'same-origin'
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-search me-1"></i> Verify & Preview Move';
+            if (data.status !== 'ok') {
+                errDiv.textContent = data.error || 'Verification failed.';
+                errDiv.classList.remove('d-none');
+                return;
+            }
+            showAdoptConfirm(data);
+        })
+        .catch(function() {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-search me-1"></i> Verify & Preview Move';
+            errDiv.textContent = 'Verification request failed.';
+            errDiv.classList.remove('d-none');
+        });
+    }
+
+    function showAdoptConfirm(data) {
+        var sec = document.getElementById('adopt-verify-section');
+        var name = document.getElementById('adoptName').value;
+
+        document.getElementById('adopt-confirm-name').textContent = name;
+        document.getElementById('adopt-confirm-encryption').textContent = data.encryption;
+        document.getElementById('adopt-confirm-archives').textContent = data.archive_count;
+        document.getElementById('adoptConfirmName').value = name;
+        document.getElementById('adoptConfirmSourcePath').value = data.move.from;
+        document.getElementById('adoptConfirmLocationId').value = sec.dataset.locationId || '';
+        document.getElementById('adoptConfirmPassphrase').value = document.getElementById('adoptPassphrase').value;
+        document.getElementById('adoptConfirmEncryption').value = data.encryption;
+
+        // Plain statement of exactly what will happen on disk
+        var stmt = document.getElementById('adopt-move-statement');
+        stmt.innerHTML = '';
+        var submitBtn = document.getElementById('adoptSubmitBtn');
+        var submitLabel = document.getElementById('adopt-submit-label');
+        var m = data.move;
+
+        function addLine(html, mono) {
+            var div = document.createElement('div');
+            if (mono) div.className = 'font-monospace small';
+            div.style.wordBreak = 'break-all';
+            if (typeof html === 'string') div.textContent = html; else div.appendChild(html);
+            stmt.appendChild(div);
+        }
+        function addPathLine(label, path) {
+            var div = document.createElement('div');
+            div.className = 'font-monospace small';
+            div.style.wordBreak = 'break-all';
+            var b = document.createElement('strong');
+            b.textContent = label + ' ';
+            div.appendChild(b);
+            div.appendChild(document.createTextNode(path));
+            stmt.appendChild(div);
+        }
+
+        if (!m.required) {
+            stmt.className = 'alert alert-primary mb-3';
+            addLine('The repository is already at its correct location — no files will be moved.');
+            addPathLine('Path:', m.to);
+            submitBtn.disabled = false;
+            submitLabel.textContent = 'Import Repository';
+        } else if (m.same_fs) {
+            stmt.className = 'alert alert-primary mb-3';
+            addLine('This will move the repository on the server:');
+            addPathLine('From:', m.from);
+            addPathLine('To:', m.to);
+            var note = document.createElement('div');
+            note.className = 'small mt-1';
+            note.textContent = 'Both paths are on the same filesystem, so this is an instant rename — no data is copied.';
+            stmt.appendChild(note);
+            submitBtn.disabled = false;
+            submitLabel.textContent = 'Move & Import Repository';
+        } else if (m.fits) {
+            stmt.className = 'alert alert-warning mb-3';
+            addLine('This will move the repository to a different filesystem:');
+            addPathLine('From:', m.from);
+            addPathLine('To:', m.to);
+            var note2 = document.createElement('div');
+            note2.className = 'small mt-1';
+            note2.textContent = m.size_label + ' of data will be copied (the destination has ' + m.free_label +
+                ' free). Large repositories can take a long time — keep this page open. ' +
+                'The original is deleted only after the copy completes successfully.';
+            stmt.appendChild(note2);
+            submitBtn.disabled = false;
+            submitLabel.textContent = 'Move & Import Repository';
+        } else {
+            stmt.className = 'alert alert-danger mb-3';
+            addLine('There is not enough free space to move this repository.');
+            addPathLine('From:', m.from);
+            addPathLine('To:', m.to);
+            var note3 = document.createElement('div');
+            note3.className = 'small mt-1';
+            note3.textContent = 'The repository is ' + m.size_label + ', but the destination filesystem only has ' +
+                m.free_label + ' free. Free up space, then verify again.';
+            stmt.appendChild(note3);
+            submitBtn.disabled = true;
+            submitLabel.textContent = 'Move & Import Repository';
+        }
+
+        sec.style.display = 'none';
+        document.getElementById('adopt-confirm-section').style.display = '';
     }
     function toggleImportRemoteSshConfig() {
         var sel = document.getElementById('importStorageType');
@@ -701,7 +968,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     <div id="repo-cards-grid" class="row g-3 mb-4 pb-5" style="overflow:visible;">
         <?php foreach ($repositories as $repo):
             $s = $repo['size_bytes'];
-            $sizeLabel = $s >= 1073741824 ? round($s / 1073741824, 1) . ' GB' : ($s >= 1048576 ? round($s / 1048576, 1) . ' MB' : ($s > 0 ? round($s / 1024, 1) . ' KB' : '--'));
+            $sizeLabel = $s > 0 ? \BBS\Services\ServerStats::formatBytes((int) $s) : '--';
             $repoPlanCount = 0;
             foreach ($plans as $p) { if (($p['repository_id'] ?? 0) == $repo['id']) $repoPlanCount++; }
             $repoActiveJobs = 0;
@@ -781,7 +1048,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     </div>
                 </div>
                 <div class="repo-status-bar">
-                    <?= $sizeLabel ?> &middot; <?= $repo['archive_count'] ?> archives<?php if (isset($s3SyncByRepo[$repo['id']])): ?> &middot; <i class="bi bi-cloud text-info" title="Replicated to S3<?= !empty($s3SyncByRepo[$repo['id']]['last_sync']) ? ' (last: ' . \BBS\Core\TimeHelper::ago($s3SyncByRepo[$repo['id']]['last_sync']) . ')' : '' ?>"></i> S3 Sync<?php endif; ?>
+                    <?= $sizeLabel ?> &middot; <?= $repo['archive_count'] ?> archives<?php if (isset($s3SyncByRepo[$repo['id']])): ?> &middot; <i class="bi bi-cloud text-info" title="Replicated to S3<?= !empty($s3SyncByRepo[$repo['id']]['last_sync']) ? ' (last: ' . \BBS\Core\TimeHelper::ago($s3SyncByRepo[$repo['id']]['last_sync']) . ')' : '' ?>"></i> S3 Sync<?= ($s3SyncByRepo[$repo['id']]['destinations'] ?? 1) > 1 ? ' &times;' . $s3SyncByRepo[$repo['id']]['destinations'] : '' ?><?php endif; ?>
                 </div>
             </div>
         </div>
@@ -821,9 +1088,8 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                         <p class="text-danger fw-bold">This action is NOT reversible.</p>
                         <div class="form-check mt-3 p-3 bg-body-secondary rounded">
                             <input class="form-check-input" type="checkbox" name="delete_from_s3" id="deleteFromS3_<?= $repo['id'] ?>" value="1">
-                            <input type="hidden" name="plugin_config_id" value="<?= $s3SyncByRepo[$repo['id']]['plugin_config_id'] ?>">
                             <label class="form-check-label" for="deleteFromS3_<?= $repo['id'] ?>">
-                                <i class="bi bi-cloud text-info me-1"></i>Also delete from S3 offsite storage
+                                <i class="bi bi-cloud text-info me-1"></i>Also delete from S3 offsite storage<?= ($s3SyncByRepo[$repo['id']]['destinations'] ?? 1) > 1 ? ' (all ' . $s3SyncByRepo[$repo['id']]['destinations'] . ' destinations)' : '' ?>
                             </label>
                             <div class="form-text">If unchecked, the S3 copy will remain and can be restored later.</div>
                         </div>
@@ -859,7 +1125,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     <!-- Create new repo -->
     <div id="create-repo-section" style="display:none;">
     <div class="card border-0 shadow-sm">
-        <div class="card-header bg-body fw-semibold d-flex justify-content-between align-items-center">
+        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
             <span><i class="bi bi-plus-circle me-1"></i> Create New Repository</span>
             <button type="button" class="btn btn-sm btn-outline-secondary" onclick="hideCreateRepo()"><i class="bi bi-arrow-left me-1"></i>Back</button>
         </div>
@@ -876,20 +1142,50 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     <div class="col-md-3 form-text pt-2">Descriptive name for the repo. (Max 20 characters)</div>
                 </div>
 
+                <?php
+                    $isHostedMode = \BBS\Core\Config::isHosted();
+                    $defaultLocation = null;
+                    if ($isHostedMode) {
+                        foreach (($storageLocations ?? []) as $sl) {
+                            if (!empty($sl['is_default'])) { $defaultLocation = $sl; break; }
+                        }
+                    }
+                ?>
+
                 <div class="row mb-3">
                     <label class="col-md-3 col-form-label fw-semibold">Storage</label>
                     <div class="col-md-6">
+                        <?php if ($isHostedMode): ?>
+                        <select class="form-select" name="storage_type" id="storageTypeSelect" disabled>
+                            <option value="local" selected>Local (this server)</option>
+                        </select>
+                        <input type="hidden" name="storage_type" value="local">
+                        <?php else: ?>
                         <select class="form-select" name="storage_type" id="storageTypeSelect" onchange="toggleRemoteSshConfig()">
                             <option value="local">Local (this server)</option>
                             <?php if (!empty($remoteSshConfigs)): ?>
                             <option value="remote_ssh">Remote SSH</option>
                             <?php endif; ?>
                         </select>
+                        <?php endif; ?>
                     </div>
                     <div class="col-md-3 form-text pt-2">Where to store backup data.</div>
                 </div>
 
-                <?php if (!empty($storageLocations) && count($storageLocations) > 1): ?>
+                <?php if ($isHostedMode && $defaultLocation): ?>
+                <div class="row mb-3" id="storageLocationRow">
+                    <label class="col-md-3 col-form-label fw-semibold">Location</label>
+                    <div class="col-md-6">
+                        <select class="form-select" name="storage_location_id" id="storageLocationSelect" disabled>
+                            <option value="<?= $defaultLocation['id'] ?>" selected>
+                                <?= htmlspecialchars($defaultLocation['label']) ?>
+                            </option>
+                        </select>
+                        <input type="hidden" name="storage_location_id" value="<?= $defaultLocation['id'] ?>">
+                    </div>
+                    <div class="col-md-3 form-text pt-2">Platform-managed storage.</div>
+                </div>
+                <?php elseif (!empty($storageLocations) && count($storageLocations) > 1): ?>
                 <div class="row mb-3" id="storageLocationRow">
                     <label class="col-md-3 col-form-label fw-semibold">Location</label>
                     <div class="col-md-6">
@@ -907,6 +1203,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                 </div>
                 <?php endif; ?>
 
+                <?php if (!$isHostedMode): ?>
                 <div class="row mb-3" id="remoteSshConfigRow" style="display:none;">
                     <label class="col-md-3 col-form-label fw-semibold">Remote Host</label>
                     <div class="col-md-6">
@@ -925,6 +1222,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                         <?php endif; ?>
                     </div>
                 </div>
+                <?php endif; ?>
 
                 <div class="row mb-3">
                     <label class="col-md-3 col-form-label fw-semibold">Encryption</label>
@@ -970,11 +1268,31 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     <!-- Import existing repo -->
     <div id="import-repo-section" style="display:none;">
     <div class="card border-0 shadow-sm">
-        <div class="card-header bg-body fw-semibold d-flex justify-content-between align-items-center">
+        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
             <span><i class="bi bi-box-arrow-in-down me-1"></i> Import Existing Repository</span>
             <button type="button" class="btn btn-sm btn-outline-secondary" onclick="hideImportRepo()"><i class="bi bi-arrow-left me-1"></i>Back</button>
         </div>
         <div class="card-body">
+            <?php if ($this->isAdmin()): ?>
+            <!-- Scan for unregistered repositories (admin only) -->
+            <div id="adopt-scan-block" class="mb-4">
+                <div class="d-flex align-items-start gap-2 flex-wrap">
+                    <button type="button" class="btn btn-outline-primary" id="scanReposBtn" onclick="scanForRepos()">
+                        <i class="bi bi-search me-1"></i> Scan Storage for Repositories
+                    </button>
+                    <span class="form-text mb-0" style="flex-basis: 300px; flex-grow: 1;">
+                        Finds borg repositories on this server's storage that BBS doesn't know about —
+                        e.g. copied over from an old server. Found repos can be imported here; they are
+                        moved into this client's storage folder as part of the import.
+                    </span>
+                </div>
+                <div id="scan-results" class="mt-3" style="display:none;"></div>
+                <div id="scan-error" class="alert alert-danger d-none mt-3"></div>
+                <hr class="mt-4">
+                <p class="text-muted small mb-3">Or, if the repository is already in the expected folder, import it directly:</p>
+            </div>
+            <?php endif; ?>
+
             <!-- Step 1: Verify form -->
             <div id="import-verify-form">
                 <div class="row mb-3">
@@ -1089,6 +1407,73 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     </div>
                 </form>
             </div>
+
+            <?php if ($this->isAdmin()): ?>
+            <!-- Adopt step 1: found repo — name + passphrase, then preview the move -->
+            <div id="adopt-verify-section" style="display:none;">
+                <h6 class="fw-semibold mb-3"><i class="bi bi-box-arrow-in-down me-1"></i>Import Found Repository</h6>
+                <div class="row mb-3">
+                    <label class="col-md-3 col-form-label fw-semibold">Found at</label>
+                    <div class="col-md-9">
+                        <input type="text" class="form-control font-monospace" id="adoptSourcePath" readonly>
+                    </div>
+                </div>
+                <div class="row mb-3">
+                    <label class="col-md-3 col-form-label fw-semibold">Name</label>
+                    <div class="col-md-6">
+                        <input type="text" class="form-control" id="adoptName" maxlength="20">
+                    </div>
+                    <div class="col-md-3 form-text pt-2">The repository's name in BBS — also its folder name after the move.</div>
+                </div>
+                <div class="row mb-3">
+                    <label class="col-md-3 col-form-label fw-semibold">Passphrase</label>
+                    <div class="col-md-6">
+                        <input type="password" class="form-control" id="adoptPassphrase" placeholder="Enter repository passphrase (blank if unencrypted)">
+                    </div>
+                    <div class="col-md-3 form-text pt-2">The passphrase used when the repo was created.</div>
+                </div>
+                <div id="adopt-verify-error" class="alert alert-danger d-none"></div>
+                <div class="d-flex gap-2">
+                    <button type="button" class="btn btn-primary" id="adoptVerifyBtn" onclick="verifyAdoptRepo()">
+                        <i class="bi bi-search me-1"></i> Verify &amp; Preview Move
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="cancelAdopt()">Cancel</button>
+                </div>
+            </div>
+
+            <!-- Adopt step 2: confirmation with an explicit move statement -->
+            <div id="adopt-confirm-section" style="display:none;">
+                <h6 class="fw-semibold mb-3">Repository Verified</h6>
+                <table class="table table-sm mb-3" style="max-width:500px;">
+                    <tr><th style="width:150px;">Repository</th><td id="adopt-confirm-name"></td></tr>
+                    <tr><th>Encryption</th><td id="adopt-confirm-encryption"></td></tr>
+                    <tr><th>Recovery Points</th><td id="adopt-confirm-archives"></td></tr>
+                </table>
+                <div class="alert alert-primary mb-3" id="adopt-move-statement"></div>
+                <div class="alert alert-warning small mb-3">
+                    <i class="bi bi-exclamation-triangle me-1"></i>
+                    After the move, file permissions will be changed to what BBS requires for backup
+                    operations and a catalog rebuild task will be queued.
+                </div>
+                <form method="POST" action="/repositories/adopt" onsubmit="var b=this.querySelector('button[type=submit]'); b.disabled=true; b.innerHTML='<span class=\'spinner-border spinner-border-sm me-1\'></span> Moving...';">
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                    <input type="hidden" name="agent_id" value="<?= $agent['id'] ?>">
+                    <input type="hidden" name="name" id="adoptConfirmName">
+                    <input type="hidden" name="source_path" id="adoptConfirmSourcePath">
+                    <input type="hidden" name="storage_location_id" id="adoptConfirmLocationId">
+                    <input type="hidden" name="passphrase" id="adoptConfirmPassphrase">
+                    <input type="hidden" name="encryption" id="adoptConfirmEncryption">
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-success" id="adoptSubmitBtn">
+                            <i class="bi bi-check-circle me-1"></i> <span id="adopt-submit-label">Move &amp; Import Repository</span>
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary" onclick="document.getElementById('adopt-confirm-section').style.display='none'; document.getElementById('adopt-verify-section').style.display='';">
+                            Back
+                        </button>
+                    </div>
+                </form>
+            </div>
+            <?php endif; ?>
         </div>
     </div>
     </div>
@@ -1096,9 +1481,9 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     <?php if (!empty($s3Orphans)): ?>
     <!-- S3 Offsite Backups (Orphaned) -->
     <div class="card border-0 shadow-sm mt-4">
-        <div class="card-header bg-body fw-semibold d-flex justify-content-between align-items-center">
+        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
             <span><i class="bi bi-cloud text-info me-1"></i> Offsite Backups</span>
-            <span class="badge bg-info"><?= count($s3Orphans) ?> available to restore</span>
+            <span class="badge text-bg-info"><?= count($s3Orphans) ?> available to restore</span>
         </div>
         <div class="card-body">
             <p class="text-muted small mb-3">
@@ -1106,7 +1491,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                 You can restore them to recover data or re-enable backups.
             </p>
             <div class="row g-3">
-                <?php foreach ($s3Orphans as $orphanName): ?>
+                <?php foreach ($s3Orphans as $orphanName => $orphanConfigId): ?>
                 <div class="col-md-6 col-lg-4">
                     <div class="card border h-100" style="border-style: dashed !important;">
                         <div class="card-body p-3">
@@ -1124,7 +1509,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             <form method="POST" action="/clients/<?= $agent['id'] ?>/restore-orphan" class="mt-2" data-confirm="Restore repository &quot;<?= htmlspecialchars($orphanName) ?>&quot; from S3?&#10;&#10;This will create the repository and download data from S3.">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <input type="hidden" name="repo_name" value="<?= htmlspecialchars($orphanName) ?>">
-                                <input type="hidden" name="plugin_config_id" value="<?= $s3PluginConfigId ?>">
+                                <input type="hidden" name="plugin_config_id" value="<?= $orphanConfigId ?>">
                                 <button type="submit" class="btn btn-sm btn-outline-info w-100">
                                     <i class="bi bi-cloud-download me-1"></i>Restore from S3
                                 </button>
@@ -1161,9 +1546,16 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         if (grid) grid.style.display = 'none';
         if (solo) solo.style.display = 'none';
         if (create) create.style.display = '';
-        // Collapse any open edit panels
+        // Collapse any open edit panels. Bootstrap.js loads via <script defer>
+        // in the layout, so on a fast click immediately after page-render the
+        // global may not yet exist — fall back to a CSS class swap, which is
+        // what bootstrap's Collapse does internally anyway.
         document.querySelectorAll('.edit-plan-panel.show').forEach(function(p) {
-            bootstrap.Collapse.getOrCreateInstance(p).hide();
+            if (window.bootstrap && bootstrap.Collapse) {
+                bootstrap.Collapse.getOrCreateInstance(p).hide();
+            } else {
+                p.classList.remove('show');
+            }
         });
     }
     function hideCreatePlan() {
@@ -1306,7 +1698,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     ?>
     <div class="collapse edit-plan-panel" id="edit-plan-<?= $plan['id'] ?>">
         <div class="card border-0 shadow-sm mb-4 border-primary">
-            <div class="card-header bg-body fw-semibold d-flex justify-content-between">
+            <div class="card-header fw-semibold d-flex justify-content-between">
                 <span><i class="bi bi-pencil me-1"></i> Edit: <?= htmlspecialchars($plan['name']) ?></span>
                 <button type="button" class="btn-close" data-bs-toggle="collapse" data-bs-target="#edit-plan-<?= $plan['id'] ?>"></button>
             </div>
@@ -1366,18 +1758,27 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     <div class="row mb-3 schedule-daily-row <?= $editFreq !== 'daily' ? 'd-none' : '' ?>">
                         <label class="col-md-3 col-form-label fw-semibold"><i class="bi bi-grid-3x3 me-1"></i> Run Hours</label>
                         <div class="col-md-9">
+                            <?php $is24h = \BBS\Core\TimeHelper::is24h(); ?>
                             <div class="mb-2 d-flex align-items-center hour-picker-row">
-                                <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;">AM</span>
+                                <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;"><?= $is24h ? '' : 'AM' ?></span>
                                 <div class="btn-group btn-group-sm">
-                                    <?php for ($h = 0; $h < 12; $h++): $label = $h === 0 ? '12' : str_pad($h, 2, '0', STR_PAD_LEFT); ?>
+                                    <?php for ($h = 0; $h < 12; $h++):
+                                        $label = $is24h
+                                            ? str_pad((string)$h, 2, '0', STR_PAD_LEFT)
+                                            : ($h === 0 ? '12' : str_pad((string)$h, 2, '0', STR_PAD_LEFT));
+                                    ?>
                                     <button type="button" class="btn <?= in_array($h, $editSelectedHours) ? 'btn-success active' : 'btn-outline-success' ?> hour-btn" data-hour="<?= $h ?>"><?= $label ?></button>
                                     <?php endfor; ?>
                                 </div>
                             </div>
                             <div class="mb-2 d-flex align-items-center hour-picker-row">
-                                <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;">PM</span>
+                                <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;"><?= $is24h ? '' : 'PM' ?></span>
                                 <div class="btn-group btn-group-sm">
-                                    <?php for ($h = 12; $h < 24; $h++): $label = $h === 12 ? '12' : str_pad($h - 12, 2, '0', STR_PAD_LEFT); ?>
+                                    <?php for ($h = 12; $h < 24; $h++):
+                                        $label = $is24h
+                                            ? str_pad((string)$h, 2, '0', STR_PAD_LEFT)
+                                            : ($h === 12 ? '12' : str_pad((string)($h - 12), 2, '0', STR_PAD_LEFT));
+                                    ?>
                                     <button type="button" class="btn <?= in_array($h, $editSelectedHours) ? 'btn-success active' : 'btn-outline-success' ?> hour-btn" data-hour="<?= $h ?>"><?= $label ?></button>
                                     <?php endfor; ?>
                                 </div>
@@ -1403,7 +1804,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             <input type="hidden" name="day_of_week" class="schedule-dow-hidden" value="<?= (int)$editDow ?>">
                             <div class="input-group" style="max-width:300px">
                                 <span class="input-group-text">@ time of day</span>
-                                <input type="time" class="form-control schedule-time-input" value="<?= htmlspecialchars($editTimes ?: '00:00') ?>">
+                                <input type="time" class="form-control schedule-time-input" value="<?= htmlspecialchars(trim(explode(',', $editTimes ?: '00:00')[0])) ?>">
                             </div>
                             <input type="hidden" name="times" class="schedule-weekly-times-hidden" value="<?= htmlspecialchars($editTimes) ?>">
                         </div>
@@ -1424,7 +1825,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                 </select>
                                 <div class="input-group" style="max-width:300px">
                                     <span class="input-group-text">@ time of day</span>
-                                    <input type="time" class="form-control schedule-time-input" value="<?= htmlspecialchars($editTimes ?: '00:00') ?>">
+                                    <input type="time" class="form-control schedule-time-input" value="<?= htmlspecialchars(trim(explode(',', $editTimes ?: '00:00')[0])) ?>">
                                 </div>
                             </div>
                             <input type="hidden" name="times" class="schedule-monthly-times-hidden" value="<?= htmlspecialchars($editTimes) ?>">
@@ -1460,7 +1861,19 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     <div class="row mb-3">
                         <label class="col-md-3 col-form-label fw-semibold">Backup Directories</label>
                         <div class="col-md-6">
-                            <textarea class="form-control edit-directories" name="directories" rows="3" required><?= htmlspecialchars($plan['directories']) ?></textarea>
+                            <textarea id="editDirectories-<?= $plan['id'] ?>" class="form-control edit-directories" name="directories" rows="3" required><?= htmlspecialchars($plan['directories']) ?></textarea>
+                            <div class="mt-2">
+                                <?php $editAgentOnline = ($agent['status'] ?? '') === 'online'; ?>
+                                <?php if ($editAgentOnline): ?>
+                                <button type="button" class="btn btn-sm btn-outline-primary dir-browse-btn" data-agent-id="<?= (int) $agent['id'] ?>" data-is-windows="<?= stripos($agent['os_info'] ?? '', 'Windows') !== false ? '1' : '0' ?>" data-target-textarea="#editDirectories-<?= $plan['id'] ?>" data-bs-toggle="modal" data-bs-target="#dirBrowseModal">
+                                    <i class="bi bi-folder2-open me-1"></i>Browse…
+                                </button>
+                                <?php else: ?>
+                                <button type="button" class="btn btn-sm btn-outline-secondary" disabled title="Client is offline">
+                                    <i class="bi bi-folder2-open me-1"></i>Browse (client offline)
+                                </button>
+                                <?php endif; ?>
+                            </div>
                         </div>
                         <div class="col-md-3 form-text pt-2">One directory per line<?php if (stripos($agent['os_info'] ?? '', 'Windows') !== false): ?><br><small class="text-muted">e.g. C:\Users, C:\Projects</small><?php endif; ?></div>
                     </div>
@@ -1470,7 +1883,12 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                         <div class="col-md-6">
                             <textarea class="form-control edit-excludes" name="excludes" rows="3"><?= htmlspecialchars($plan['excludes'] ?? '') ?></textarea>
                         </div>
-                        <div class="col-md-3 form-text pt-2">One pattern per line</div>
+                        <div class="col-md-3 form-text pt-2">
+                            One pattern per line.<br>
+                            <a href="https://borgbackup.readthedocs.io/en/stable/usage/help.html#borg-patterns" target="_blank" rel="noopener" class="text-decoration-none">
+                                <i class="bi bi-box-arrow-up-right me-1"></i>Borg pattern syntax
+                            </a>
+                        </div>
                     </div>
 
                     <div class="row mb-3">
@@ -1618,7 +2036,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     <div class="alert alert-warning">You need to <a href="?tab=repos">create a repository</a> before adding a backup schedule.</div>
     <?php else: ?>
     <div class="card border-0 shadow-sm">
-        <div class="card-header bg-body fw-semibold d-flex justify-content-between align-items-center">
+        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
             <span><i class="bi bi-plus-circle me-1"></i> Create New Backup Plan</span>
             <button type="button" class="btn btn-sm btn-outline-secondary" onclick="hideCreatePlan()"><i class="bi bi-arrow-left me-1"></i>Back</button>
         </div>
@@ -1664,18 +2082,27 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                 <div class="row mb-3 schedule-daily-row">
                     <label class="col-md-3 col-form-label fw-semibold"><i class="bi bi-grid-3x3 me-1"></i> Run Hours</label>
                     <div class="col-md-9">
+                        <?php $is24h = \BBS\Core\TimeHelper::is24h(); ?>
                         <div class="mb-2 d-flex align-items-center hour-picker-row">
-                            <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;">AM</span>
+                            <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;"><?= $is24h ? '' : 'AM' ?></span>
                             <div class="btn-group btn-group-sm">
-                                <?php for ($h = 0; $h < 12; $h++): $label = $h === 0 ? '12' : str_pad($h, 2, '0', STR_PAD_LEFT); ?>
+                                <?php for ($h = 0; $h < 12; $h++):
+                                    $label = $is24h
+                                        ? str_pad((string)$h, 2, '0', STR_PAD_LEFT)
+                                        : ($h === 0 ? '12' : str_pad((string)$h, 2, '0', STR_PAD_LEFT));
+                                ?>
                                 <button type="button" class="btn <?= $h === 1 ? 'btn-success active' : 'btn-outline-success' ?> hour-btn" data-hour="<?= $h ?>"><?= $label ?></button>
                                 <?php endfor; ?>
                             </div>
                         </div>
                         <div class="mb-2 d-flex align-items-center hour-picker-row">
-                            <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;">PM</span>
+                            <span class="text-muted fw-semibold me-2" style="display:inline-block;width:30px;"><?= $is24h ? '' : 'PM' ?></span>
                             <div class="btn-group btn-group-sm">
-                                <?php for ($h = 12; $h < 24; $h++): $label = $h === 12 ? '12' : str_pad($h - 12, 2, '0', STR_PAD_LEFT); ?>
+                                <?php for ($h = 12; $h < 24; $h++):
+                                    $label = $is24h
+                                        ? str_pad((string)$h, 2, '0', STR_PAD_LEFT)
+                                        : ($h === 12 ? '12' : str_pad((string)($h - 12), 2, '0', STR_PAD_LEFT));
+                                ?>
                                 <button type="button" class="btn btn-outline-success hour-btn" data-hour="<?= $h ?>"><?= $label ?></button>
                                 <?php endfor; ?>
                             </div>
@@ -1765,7 +2192,17 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     <div class="col-md-6">
                         <?php if ($isWindows): ?>
                         <textarea class="form-control" name="directories" id="directoriesInput" rows="3" required placeholder="C:\Users&#10;C:\Projects&#10;C:\inetpub\wwwroot"></textarea>
-                        <div class="mt-2">
+                        <div class="mt-2 d-flex flex-wrap align-items-center gap-1">
+                            <?php $agentOnline = ($agent['status'] ?? '') === 'online'; ?>
+                            <?php if ($agentOnline): ?>
+                            <button type="button" class="btn btn-sm btn-outline-primary dir-browse-btn me-2" data-agent-id="<?= (int) $agent['id'] ?>" data-is-windows="1" data-target-textarea="#directoriesInput" data-bs-toggle="modal" data-bs-target="#dirBrowseModal">
+                                <i class="bi bi-folder2-open me-1"></i>Browse…
+                            </button>
+                            <?php else: ?>
+                            <button type="button" class="btn btn-sm btn-outline-secondary me-2" disabled title="Client is offline">
+                                <i class="bi bi-folder2-open me-1"></i>Browse (client offline)
+                            </button>
+                            <?php endif; ?>
                             <span class="text-muted small me-1">Quick add:</span>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="C:\Users">C:\Users</button>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="C:\Projects">C:\Projects</button>
@@ -1774,13 +2211,21 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                         </div>
                         <?php else: ?>
                         <textarea class="form-control" name="directories" id="directoriesInput" rows="3" required placeholder="/home&#10;/etc&#10;/var/www"></textarea>
-                        <div class="mt-2">
+                        <div class="mt-2 d-flex flex-wrap align-items-center gap-1">
+                            <?php $agentOnline = ($agent['status'] ?? '') === 'online'; ?>
+                            <?php if ($agentOnline): ?>
+                            <button type="button" class="btn btn-sm btn-outline-primary dir-browse-btn me-2" data-agent-id="<?= (int) $agent['id'] ?>" data-is-windows="<?= $isWindows ? '1' : '0' ?>" data-target-textarea="#directoriesInput" data-bs-toggle="modal" data-bs-target="#dirBrowseModal">
+                                <i class="bi bi-folder2-open me-1"></i>Browse…
+                            </button>
+                            <?php else: ?>
+                            <button type="button" class="btn btn-sm btn-outline-secondary me-2" disabled title="Client is offline">
+                                <i class="bi bi-folder2-open me-1"></i>Browse (client offline)
+                            </button>
+                            <?php endif; ?>
                             <span class="text-muted small me-1">Quick add:</span>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/home">/home</button>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/etc">/etc</button>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/var">/var</button>
-                            <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/opt">/opt</button>
-                            <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/srv">/srv</button>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/usr/local">/usr/local</button>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/var/www">/var/www</button>
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="/var/lib/mysql">/var/lib/mysql</button>
@@ -1795,7 +2240,12 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                     <div class="col-md-6">
                         <textarea class="form-control" name="excludes" id="excludesInput" rows="3" placeholder="*.tmp&#10;*.log&#10;*.cache&#10;/home/*/tmp"></textarea>
                     </div>
-                    <div class="col-md-3 form-text pt-2">One pattern per line. Borg glob patterns.</div>
+                    <div class="col-md-3 form-text pt-2">
+                        One pattern per line.<br>
+                        <a href="https://borgbackup.readthedocs.io/en/stable/usage/help.html#borg-patterns" target="_blank" rel="noopener" class="text-decoration-none">
+                            <i class="bi bi-box-arrow-up-right me-1"></i>Borg pattern syntax
+                        </a>
+                    </div>
                 </div>
 
                 <div class="row mb-3">
@@ -2233,18 +2683,35 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
         });
     });
 
-    // Show/hide create section when edit panel is toggled
+    // Hide create-plan-section when an edit panel opens (the two views
+    // are mutually exclusive). We deliberately do NOT mirror this on
+    // 'hidden.bs.collapse' — when the user clicks 'Add Backup Plan'
+    // while an edit panel is open, showCreatePlan() collapses the edit
+    // panel, and a hidden-handler that hid create would race against
+    // the show.
     document.querySelectorAll('.edit-plan-panel').forEach(panel => {
         panel.addEventListener('shown.bs.collapse', function() {
-            document.getElementById('create-plan-section').style.display = 'none';
-        });
-        panel.addEventListener('hidden.bs.collapse', function() {
             document.getElementById('create-plan-section').style.display = 'none';
         });
     });
 
     // Tooltips for help links in schedules tab
     document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootstrap.Tooltip(el));
+
+    // Deep-link: ?edit_plan=<id> auto-expands the edit panel for that plan and
+    // scrolls it into view. Used by the Schedules calendar's "Edit Plan" menu.
+    (function () {
+        const params = new URLSearchParams(window.location.search);
+        const planId = params.get('edit_plan');
+        if (!planId) return;
+        const panel = document.getElementById('edit-plan-' + planId);
+        if (!panel) return;
+        const collapse = bootstrap.Collapse.getOrCreateInstance(panel, { toggle: false });
+        collapse.show();
+        panel.addEventListener('shown.bs.collapse', () => {
+            panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, { once: true });
+    })();
     </script>
     </div><!-- /create-plan-section -->
     <?php endif; ?>
@@ -2264,6 +2731,12 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     ];
     $randomPass = substr(str_shuffle('abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'), 0, 20);
 
+    // In hosted mode the S3 plugin stays visible — the agent-level enable
+    // toggle and the per-config attachment to plans both run through here.
+    // What's locked down is the credentials surface: only "Use Global S3
+    // Settings" is permitted, so customers can't point sync at a third-
+    // party bucket. The form rendering below hides the Custom Credentials
+    // radio + fields; the controller enforces the same constraint on POST.
     foreach ($allPlugins as $plugin):
         $isEnabled = false;
         foreach ($agentPlugins as $ap) { if ($ap['id'] == $plugin['id'] && $ap['agent_enabled']) { $isEnabled = true; break; } }
@@ -2273,7 +2746,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
     ?>
     <div class="card border-0 shadow-sm mb-3">
         <!-- Plugin Header Row -->
-        <div class="card-header bg-body d-flex align-items-center gap-3 py-3">
+        <div class="card-header d-flex align-items-center gap-3 py-3">
             <?php if ($logo): ?>
                 <img src="<?= $logo ?>" alt="" style="width:36px;height:36px;object-fit:contain;flex-shrink:0;">
             <?php elseif ($plugin['slug'] === 'shell_hook'): ?>
@@ -2375,6 +2848,10 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             </div>
                         <?php elseif ($plugin['slug'] === 's3_sync'): ?>
                             <?php $ev = $cfgData; $credSrc = $ev['credential_source'] ?? 'global'; ?>
+                            <?php if (\BBS\Core\Config::isHosted()): ?>
+                            <input type="hidden" name="plugin_config[credential_source]" value="global">
+                            <div class="alert alert-info py-2 small mb-2"><i class="bi bi-info-circle me-1"></i>S3 destination is managed by the platform.</div>
+                            <?php else: ?>
                             <div class="mb-2">
                                 <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="global" id="editS3Global<?= $cfg['id'] ?>" <?= $credSrc === 'global' ? 'checked' : '' ?> data-target="editS3Custom<?= $cfg['id'] ?>"><label class="form-check-label small" for="editS3Global<?= $cfg['id'] ?>">Use Global S3 Settings</label></div>
                                 <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="custom" id="editS3CustomRadio<?= $cfg['id'] ?>" <?= $credSrc === 'custom' ? 'checked' : '' ?> data-target="editS3Custom<?= $cfg['id'] ?>"><label class="form-check-label small" for="editS3CustomRadio<?= $cfg['id'] ?>">Custom Credentials</label></div>
@@ -2390,6 +2867,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                     <div class="col-6"><label class="form-label small fw-semibold mb-1">Secret Key</label><input type="text" class="form-control form-control-sm" name="plugin_config[secret_key]" placeholder="(unchanged if empty)"></div>
                                 </div>
                             </div>
+                            <?php endif; ?>
                             <div class="row g-2 mb-2">
                                 <div class="col-6"><label class="form-label small fw-semibold mb-1">Path Prefix</label><input type="text" class="form-control form-control-sm" name="plugin_config[path_prefix]" value="<?= htmlspecialchars($ev['path_prefix'] ?? '') ?>"><div class="form-text small">Optional subfolder in bucket</div></div>
                                 <div class="col-6"><label class="form-label small fw-semibold mb-1">Bandwidth Limit</label><input type="text" class="form-control form-control-sm" name="plugin_config[bandwidth_limit]" value="<?= htmlspecialchars($ev['bandwidth_limit'] ?? '') ?>"><div class="form-text small">e.g. 50M</div></div>
@@ -2403,6 +2881,10 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             <div class="row g-2 mb-2">
                                 <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[abort_on_failure]" value="1" id="editCfg<?= $cfg['id'] ?>_abort" <?= ($ev['abort_on_failure'] ?? true) ? 'checked' : '' ?>><label class="form-check-label small" for="editCfg<?= $cfg['id'] ?>_abort">Abort backup on failure</label></div></div>
                                 <div class="col"><label class="form-label small fw-semibold mb-1">Timeout (seconds)</label><input type="number" class="form-control form-control-sm" name="plugin_config[timeout]" value="<?= htmlspecialchars($ev['timeout'] ?? 300) ?>"></div>
+                            </div>
+                            <div class="mb-2">
+                                <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[expose_passphrase]" value="1" id="editCfg<?= $cfg['id'] ?>_expose" <?= !empty($ev['expose_passphrase']) ? 'checked' : '' ?>><label class="form-check-label small" for="editCfg<?= $cfg['id'] ?>_expose">Expose repository passphrase to script <span class="text-muted">(advanced)</span></label></div>
+                                <div class="form-text small">Exposes <code>BORG_PASSCOMMAND</code> and <code>BORG_REPO</code> so the script can run <code>borg create --content-from-command</code> directly. Credentials are passed via a mode-0600 temp file (not env vars), but only enable this for scripts you've reviewed — see the wiki for details.</div>
                             </div>
                         <?php else: ?>
                             <?php foreach ($schema as $field => $def):
@@ -2486,6 +2968,10 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                         <div class="col"><label class="form-label small fw-semibold mb-1">Extra Options</label><input type="text" class="form-control form-control-sm" name="plugin_config[extra_options]" value="<?= $plugin['slug'] === 'pg_dump' ? '--no-owner --no-privileges' : '--single-transaction --quick --routines --triggers --events' ?>"></div>
                                     </div>
                                 <?php elseif ($plugin['slug'] === 's3_sync'): ?>
+                                    <?php if (\BBS\Core\Config::isHosted()): ?>
+                                    <input type="hidden" name="plugin_config[credential_source]" value="global">
+                                    <div class="alert alert-info py-2 small mb-2"><i class="bi bi-info-circle me-1"></i>S3 destination is managed by the platform.</div>
+                                    <?php else: ?>
                                     <div class="mb-2">
                                         <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="global" id="newS3Global<?= $plugin['id'] ?>" checked data-target="newS3Custom<?= $plugin['id'] ?>"><label class="form-check-label small" for="newS3Global<?= $plugin['id'] ?>">Use Global S3 Settings</label></div>
                                         <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="custom" id="newS3CustomRadio<?= $plugin['id'] ?>" data-target="newS3Custom<?= $plugin['id'] ?>"><label class="form-check-label small" for="newS3CustomRadio<?= $plugin['id'] ?>">Custom Credentials</label></div>
@@ -2501,6 +2987,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                             <div class="col-6"><label class="form-label small fw-semibold mb-1">Secret Key</label><input type="text" class="form-control form-control-sm" name="plugin_config[secret_key]"></div>
                                         </div>
                                     </div>
+                                    <?php endif; ?>
                                     <div class="row g-2 mb-2">
                                         <div class="col-6"><label class="form-label small fw-semibold mb-1">Path Prefix</label><input type="text" class="form-control form-control-sm" name="plugin_config[path_prefix]"><div class="form-text small">Optional subfolder in bucket</div></div>
                                         <div class="col-6"><label class="form-label small fw-semibold mb-1">Bandwidth Limit</label><input type="text" class="form-control form-control-sm" name="plugin_config[bandwidth_limit]"><div class="form-text small">e.g. 50M</div></div>
@@ -2513,6 +3000,10 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                                     <div class="row g-2 mb-2">
                                         <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[abort_on_failure]" value="1" id="newCfg<?= $plugin['id'] ?>_abort" checked><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_abort">Abort backup on failure</label></div></div>
                                         <div class="col"><label class="form-label small fw-semibold mb-1">Timeout (seconds)</label><input type="number" class="form-control form-control-sm" name="plugin_config[timeout]" value="300"></div>
+                                    </div>
+                                    <div class="mb-2">
+                                        <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[expose_passphrase]" value="1" id="newCfg<?= $plugin['id'] ?>_expose"><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_expose">Expose repository passphrase to script <span class="text-muted">(advanced)</span></label></div>
+                                        <div class="form-text small">Exposes <code>BORG_PASSCOMMAND</code> and <code>BORG_REPO</code> so the script can run <code>borg create --content-from-command</code> directly. Credentials are passed via a mode-0600 temp file (not env vars), but only enable this for scripts you've reviewed — see the wiki for details.</div>
                                     </div>
                                 <?php else: ?>
                                     <?php foreach ($schema as $field => $def):
@@ -2550,7 +3041,7 @@ $sizeDisplay = $totalSize >= 1073741824 ? round($totalSize / 1073741824, 1) . ' 
                             <?php if ($plugin['slug'] === 'mysql_dump'): ?>
                             <div class="col-lg-6 mt-3 mt-lg-0">
                                 <div class="card border-0 bg-body shadow-sm h-100">
-                                    <div class="card-header bg-body fw-semibold small py-2"><i class="bi bi-terminal me-1"></i> MySQL Setup</div>
+                                    <div class="card-header fw-semibold small py-2"><i class="bi bi-terminal me-1"></i> MySQL Setup</div>
                                     <div class="card-body small">
                                         <p class="text-muted mb-2">Create a MySQL user on the client for backups:</p>
                                         <strong>Backup Only</strong> <span class="text-muted">(recommended)</span>
@@ -2569,7 +3060,7 @@ FLUSH PRIVILEGES;</pre>
                             <?php elseif ($plugin['slug'] === 'pg_dump'): ?>
                             <div class="col-lg-6 mt-3 mt-lg-0">
                                 <div class="card border-0 bg-body shadow-sm h-100">
-                                    <div class="card-header bg-body fw-semibold small py-2"><i class="bi bi-terminal me-1"></i> PostgreSQL Setup</div>
+                                    <div class="card-header fw-semibold small py-2"><i class="bi bi-terminal me-1"></i> PostgreSQL Setup</div>
                                     <div class="card-body small">
                                         <p class="text-muted mb-2">Create a PostgreSQL role on the client for backups:</p>
                                         <strong>Backup Only</strong> <span class="text-muted">(recommended)</span>
@@ -2612,7 +3103,11 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     function testPluginConfig(agentId, configId) {
         const resultDiv = document.getElementById('test-result-' + configId);
         resultDiv.innerHTML = '<div class="d-flex align-items-center text-muted small"><span class="spinner-border spinner-border-sm me-2"></span> Testing...</div>';
-        fetch('/clients/' + agentId + '/plugin-configs/' + configId + '/test', { method: 'POST', credentials: 'same-origin' })
+        fetch('/clients/' + agentId + '/plugin-configs/' + configId + '/test', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'X-CSRF-Token': csrfToken }
+        })
         .then(r => r.json())
         .then(data => {
             if (data.status === 'completed') { resultDiv.innerHTML = '<div class="alert alert-success small mb-0 mt-1"><i class="bi bi-check-circle me-1"></i> ' + (data.message || 'Test passed.') + '</div>'; }
@@ -3070,7 +3565,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
 
     <?php endif; ?>
 
-<?php elseif ($tab === 'install'): ?>
+<?php elseif ($tab === 'install' && $isOwnerOrAdmin): ?>
     <h5 class="mb-3">Install Agent</h5>
 
     <?php $appUrl = rtrim(\BBS\Core\Config::get('APP_URL', 'https://' . $serverHost), '/'); ?>
@@ -3096,7 +3591,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                     <div class="d-flex justify-content-between align-items-center mb-2">
                         <p class="mb-0">Run this command on the endpoint to install the BBS agent:</p>
                         <button class="btn btn-sm btn-outline-secondary" type="button"
-                                onclick="navigator.clipboard.writeText(document.getElementById('installCmdLinux').textContent.trim()); this.innerHTML='<i class=\'bi bi-check\'></i> Copied'; setTimeout(() => this.innerHTML='<i class=\'bi bi-clipboard\'></i> Copy', 2000)">
+                                onclick="BBS.copyText(document.getElementById('installCmdLinux').textContent.trim()); this.innerHTML='<i class=\'bi bi-check\'></i> Copied'; setTimeout(() => this.innerHTML='<i class=\'bi bi-clipboard\'></i> Copy', 2000)">
                             <i class="bi bi-clipboard"></i> Copy
                         </button>
                     </div>
@@ -3110,11 +3605,18 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
         <div class="tab-pane fade" id="install-windows" role="tabpanel">
             <div class="card border-0 shadow-sm">
                 <div class="card-body">
-                    <?php $winCmd = "powershell -ExecutionPolicy Bypass -Command \"& {iwr -UseBasicParsing '{$appUrl}/api/agent/download?file=install-windows.ps1' -OutFile \$env:TEMP\\bbs-install.ps1; & \$env:TEMP\\bbs-install.ps1 -Server '{$appUrl}' -Key '{$agent['api_key']}'}\""; ?>
+                    <?php
+                    // PowerShell on pre-2016 Windows defaults to TLS 1.0/1.1 — modern BBS
+                    // servers reject those, so `iwr` would fail before our script's OS gate
+                    // even runs. Forcing TLS 1.2 here lets the user reach the friendly
+                    // "unsupported OS" message inside the script (#274) rather than seeing
+                    // an opaque SSL/TLS handshake error from PowerShell.
+                    $winCmd = "powershell -ExecutionPolicy Bypass -Command \"& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iwr -UseBasicParsing '{$appUrl}/api/agent/download?file=install-windows.ps1' -OutFile \$env:TEMP\\bbs-install.ps1; & \$env:TEMP\\bbs-install.ps1 -Server '{$appUrl}' -Key '{$agent['api_key']}'}\"";
+                    ?>
                     <div class="d-flex justify-content-between align-items-center mb-2">
                         <p class="mb-0">Run this command in an <strong>Administrator</strong> Command Prompt or PowerShell:</p>
                         <button class="btn btn-sm btn-outline-secondary" type="button"
-                                onclick="navigator.clipboard.writeText(document.getElementById('installCmdWindows').textContent.trim()); this.innerHTML='<i class=\'bi bi-check\'></i> Copied'; setTimeout(() => this.innerHTML='<i class=\'bi bi-clipboard\'></i> Copy', 2000)">
+                                onclick="BBS.copyText(document.getElementById('installCmdWindows').textContent.trim()); this.innerHTML='<i class=\'bi bi-check\'></i> Copied'; setTimeout(() => this.innerHTML='<i class=\'bi bi-clipboard\'></i> Copy', 2000)">
                             <i class="bi bi-clipboard"></i> Copy
                         </button>
                     </div>
@@ -3147,7 +3649,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
         </div>
     </div>
 
-<?php elseif ($tab === 'delete'): ?>
+<?php elseif ($tab === 'delete' && $isOwnerOrAdmin): ?>
     <h5 class="mb-3">Delete Client : <?= htmlspecialchars($agent['name']) ?></h5>
 
     <p class="text-muted">You have selected to delete a client from Borg Backup Server. When you delete a client, all backup data will be deleted including schedules and repositories. The client machine will be un-affected.</p>
@@ -3179,6 +3681,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
 </div><!-- /client-tab-content -->
 
 <script>
+const csrfToken = '<?= $this->csrfToken() ?>';
 // Hide content below header when edit panel is open
 (function() {
     const editPanel = document.getElementById('edit-client');
@@ -3203,10 +3706,11 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     const statusMap = { online: 'success', offline: 'secondary', error: 'danger', setup: 'warning' };
 
     function fmtBytes(b) {
-        if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
-        if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
-        if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
-        return b > 0 ? b + ' B' : '0';
+        const s = '\u00A0';
+        if (b >= 1073741824) return (b / 1073741824).toFixed(1) + s + 'GB';
+        if (b >= 1048576) return (b / 1048576).toFixed(1) + s + 'MB';
+        if (b >= 1024) return (b / 1024).toFixed(1) + s + 'KB';
+        return b > 0 ? b + s + 'B' : '0';
     }
 
     function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
@@ -3349,3 +3853,454 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     });
 })();
 </script>
+
+<!-- ─── Live Filesystem Browser modal ─────────────────────────────── -->
+<div class="modal fade" id="dirBrowseModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title"><i class="bi bi-folder2-open me-1"></i>Browse Filesystem — <span id="dirBrowseAgentName"></span></h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="d-flex flex-wrap align-items-center gap-3 mb-2 small">
+                    <span class="text-muted">Path: <code id="dirBrowseRoot">/</code></span>
+                    <div class="form-check form-check-inline mb-0">
+                        <input class="form-check-input" type="checkbox" id="dirBrowseHidden">
+                        <label class="form-check-label" for="dirBrowseHidden">Show hidden</label>
+                    </div>
+                    <div class="form-check form-check-inline mb-0">
+                        <input class="form-check-input" type="checkbox" id="dirBrowseShowAll">
+                        <label class="form-check-label" for="dirBrowseShowAll">Show pseudo-fs (/proc, /sys, …)</label>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-secondary ms-auto" id="dirBrowseRefresh">
+                        <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+                    </button>
+                </div>
+                <div class="row g-2">
+                    <div class="col-md-7">
+                        <div class="border rounded p-2" style="height: 460px; overflow: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem;" id="dirBrowseTree">
+                            <div class="text-muted py-3 text-center"><span class="spinner-border spinner-border-sm me-2"></span>Loading…</div>
+                        </div>
+                    </div>
+                    <div class="col-md-1 d-flex flex-column align-items-center justify-content-center gap-2">
+                        <button type="button" class="btn btn-sm btn-primary w-100" id="dirBrowseAdd" title="Add selected directories">»</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary w-100" id="dirBrowseRemove" title="Remove from selected">«</button>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <span class="small fw-semibold">Selected</span>
+                            <span class="small text-muted" id="dirBrowseSelectedCount">0</span>
+                        </div>
+                        <div class="border rounded p-2 small" style="height: 460px; overflow: auto;" id="dirBrowseSelected"></div>
+                    </div>
+                </div>
+                <div class="alert alert-warning small mt-3 mb-0 d-none" id="dirBrowseTruncated">
+                    <i class="bi bi-exclamation-triangle me-1"></i>Listing truncated — directory contains more entries than the per-request cap. Expand specific subtrees to fetch them on demand.
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-sm btn-success" id="dirBrowseSave"><i class="bi bi-check2 me-1"></i>Use Selected</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function () {
+    const browseBtns = document.querySelectorAll('.dir-browse-btn');
+    if (browseBtns.length === 0) return;
+
+    // Multiple Browse buttons share one modal — the create-plan form has
+    // one, each edit-plan form has one. We track which textarea the
+    // currently-active button maps to, set at click time, used when
+    // Save populates the textarea.
+    let agentId = parseInt(browseBtns[0].dataset.agentId, 10);
+    let isWindows = browseBtns[0].dataset.isWindows === '1';
+    let dirInput = document.getElementById('directoriesInput');
+    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
+                   || document.querySelector('input[name="csrf_token"]')?.value || '';
+    const treeEl = document.getElementById('dirBrowseTree');
+    const selectedEl = document.getElementById('dirBrowseSelected');
+    const selectedCountEl = document.getElementById('dirBrowseSelectedCount');
+    const truncatedAlert = document.getElementById('dirBrowseTruncated');
+    const hiddenChk = document.getElementById('dirBrowseHidden');
+    const showAllChk = document.getElementById('dirBrowseShowAll');
+    const refreshBtn = document.getElementById('dirBrowseRefresh');
+    const saveBtn = document.getElementById('dirBrowseSave');
+    const addBtn = document.getElementById('dirBrowseAdd');
+    const removeBtn = document.getElementById('dirBrowseRemove');
+    const modalEl = document.getElementById('dirBrowseModal');
+    // Don't pre-instantiate bootstrap.Modal — if bootstrap.js hasn't
+    // finished loading at script-eval time the constructor throws and
+    // the rest of this IIFE never runs (no click handler, no fetch).
+    // We rely on data-bs-toggle/target to *open* the modal and only
+    // touch the bootstrap.Modal API for programmatic close.
+    function hideModal() {
+        // Bootstrap sets aria-hidden="true" on the modal as it closes, but
+        // if a button inside the modal still has focus the assistive-tech
+        // warning fires ("focused element under aria-hidden ancestor").
+        // Drop focus to the body before hiding to silence it.
+        if (document.activeElement && modalEl.contains(document.activeElement)) {
+            document.activeElement.blur();
+        }
+        if (window.bootstrap?.Modal) {
+            bootstrap.Modal.getOrCreateInstance(modalEl).hide();
+        } else {
+            modalEl.classList.remove('show');
+            modalEl.style.display = 'none';
+        }
+    }
+    // Same protection on Bootstrap's own dismiss path (× button, ESC,
+    // backdrop click) — hook into the modal's pre-hide event.
+    modalEl.addEventListener('hide.bs.modal', () => {
+        if (document.activeElement && modalEl.contains(document.activeElement)) {
+            document.activeElement.blur();
+        }
+    });
+
+    document.getElementById('dirBrowseAgentName').textContent = document.title.split(' · ')[0] || 'client';
+    // Computed lazily per-modal-open so the same JS works for any Browse
+    // button on the page (each may target a different agent OS).
+    // Always fetch "/" — on Windows the agent expands that to the list of
+    // drives (C:, D:, E:, …); fetching "C:\" instead only ever showed the
+    // system drive, including when editing a plan (#317). Display a friendly
+    // label since "/" reads oddly on Windows.
+    function rootForCurrentAgent() { return '/'; }
+    function rootLabelForCurrentAgent() { return isWindows ? 'This PC' : '/'; }
+    const rootPathEl = document.getElementById('dirBrowseRoot');
+
+    // ── State ─────────────────────────────────────────────────────
+    // `nodeIndex` maps full path → DOM <li>; children load lazily and
+    // patch into the tree by path. `selectedPaths` is a Set of full
+    // paths currently in the right pane.
+    const nodeIndex = new Map();
+    const selectedPaths = new Set();
+    const treeCheckHighlight = new Set(); // paths currently in textarea, shown as already-selected
+
+    function escapeHtml(s) {
+        const d = document.createElement('div');
+        d.textContent = s ?? '';
+        return d.innerHTML;
+    }
+    function fmtSize(b) {
+        if (b == null) return '';
+        if (b < 1024) return b + ' B';
+        if (b < 1024*1024) return (b/1024).toFixed(0) + ' KB';
+        if (b < 1024*1024*1024) return (b/1024/1024).toFixed(0) + ' MB';
+        return (b/1024/1024/1024).toFixed(1) + ' GB';
+    }
+
+    // ── Tree rendering ────────────────────────────────────────────
+    function renderNode(node, level) {
+        const indent = '  '.repeat(level);
+        const li = document.createElement('div');
+        li.className = 'dirbrowse-node';
+        li.dataset.path = node.path;
+        li.dataset.type = node.type;
+        li.dataset.loaded = (node.children && node.children.length) || node.type !== 'directory' ? '1' : '0';
+
+        const row = document.createElement('div');
+        row.className = 'dirbrowse-row d-flex align-items-center';
+        row.style.cursor = 'pointer';
+        row.style.padding = '1px 2px';
+        row.style.whiteSpace = 'nowrap';
+
+        const expand = document.createElement('span');
+        expand.className = 'dirbrowse-expand';
+        expand.style.display = 'inline-block';
+        expand.style.width = (level * 14 + 14) + 'px';
+        expand.style.textAlign = 'right';
+        expand.style.color = '#888';
+        expand.style.marginRight = '4px';
+        expand.textContent = node.type === 'directory' ? '▶' : ' ';
+        row.appendChild(expand);
+
+        const icon = document.createElement('i');
+        icon.className = node.type === 'directory' ? 'bi bi-folder-fill me-1 text-warning'
+                      : node.type === 'symlink'   ? 'bi bi-link-45deg me-1 text-info'
+                      :                              'bi bi-file-earmark me-1 text-muted';
+        row.appendChild(icon);
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = node.name;
+        if (treeCheckHighlight.has(node.path)) {
+            nameSpan.style.fontWeight = 'bold';
+            nameSpan.style.color = 'var(--bs-success, #198754)';
+        }
+        row.appendChild(nameSpan);
+
+        if (node.type === 'directory' && node.entry_count != null) {
+            const meta = document.createElement('span');
+            meta.className = 'ms-2 text-muted small';
+            meta.textContent = `(${node.entry_count})`;
+            row.appendChild(meta);
+        } else if (node.type === 'file' && node.size != null) {
+            const meta = document.createElement('span');
+            meta.className = 'ms-2 text-muted small';
+            meta.textContent = fmtSize(node.size);
+            row.appendChild(meta);
+        }
+
+        row.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            document.querySelectorAll('.dirbrowse-row.active').forEach(r => r.classList.remove('active'));
+            row.classList.add('active');
+            if (node.type === 'directory') {
+                toggleNode(li, node);
+            }
+        });
+
+        li.appendChild(row);
+
+        const childrenWrap = document.createElement('div');
+        childrenWrap.className = 'dirbrowse-children';
+        childrenWrap.style.display = 'none';
+        li.appendChild(childrenWrap);
+
+        if (node.children && node.children.length) {
+            node.children.forEach(c => {
+                childrenWrap.appendChild(renderNode(c, level + 1));
+            });
+        }
+
+        nodeIndex.set(node.path, li);
+        return li;
+    }
+
+    async function toggleNode(li, node) {
+        const wrap = li.querySelector(':scope > .dirbrowse-children');
+        const expand = li.querySelector(':scope > .dirbrowse-row > .dirbrowse-expand');
+        const open = wrap.style.display !== 'none';
+        if (open) {
+            wrap.style.display = 'none';
+            expand.textContent = '▶';
+            return;
+        }
+        if (li.dataset.loaded !== '1' || wrap.children.length === 0) {
+            // fetchTree handles its own delayed-spinner so cache hits feel
+            // instant; we just toggle the chevron so the click registers.
+            expand.textContent = '▽';
+            await fetchTree(node.path, 3, true, li);
+        }
+        wrap.style.display = '';
+        expand.textContent = '▼';
+    }
+
+    async function fetchTree(path, depth, replaceChildren = false, anchorLi = null) {
+        const body = {
+            path,
+            depth,
+            show_hidden: hiddenChk.checked,
+            show_all: showAllChk.checked,
+        };
+        // Delayed spinner: only show after 300ms so cache hits (which
+        // complete in well under that) don't flash a loading state.
+        const spinnerTarget = anchorLi
+            ? anchorLi.querySelector(':scope > .dirbrowse-children')
+            : treeEl;
+        const spinnerTimer = setTimeout(() => {
+            if (anchorLi) {
+                spinnerTarget.innerHTML = '<div class="text-muted small py-1 ps-4"><span class="spinner-border spinner-border-sm me-1"></span>Loading…</div>';
+                spinnerTarget.style.display = '';
+            } else {
+                spinnerTarget.innerHTML = '<div class="text-muted py-3 text-center"><span class="spinner-border spinner-border-sm me-2"></span>Loading directory listing from client…</div>';
+            }
+        }, 300);
+        let resp;
+        try {
+            resp = await fetch(`/clients/${agentId}/browse`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+                credentials: 'same-origin',
+                body: JSON.stringify(body),
+            });
+        } catch (e) {
+            clearTimeout(spinnerTimer);
+            renderError('Network error: ' + e.message, anchorLi);
+            return;
+        }
+        if (!resp.ok) {
+            clearTimeout(spinnerTimer);
+            const errBody = await resp.json().catch(() => ({}));
+            renderError(errBody.error || `Request failed (${resp.status})`, anchorLi);
+            return;
+        }
+        const j = await resp.json();
+        clearTimeout(spinnerTimer);
+        if (j.status === 'completed') {
+            applyTree(j.tree, replaceChildren, anchorLi);
+            return;
+        }
+        if (j.status === 'pending' && j.task_id) {
+            await pollTask(j.task_id, replaceChildren, anchorLi);
+            return;
+        }
+        renderError(j.error || 'Unexpected response', anchorLi);
+    }
+
+    async function pollTask(taskId, replaceChildren, anchorLi) {
+        const start = Date.now();
+        // Burst polling: 400ms for first 5s, then 1.5s up to 90s total
+        while (Date.now() - start < 90000) {
+            const elapsed = Date.now() - start;
+            await new Promise(r => setTimeout(r, elapsed < 5000 ? 400 : 1500));
+            let r;
+            try {
+                r = await fetch(`/clients/${agentId}/browse/${taskId}`, { credentials: 'same-origin' });
+            } catch (e) { continue; }
+            if (!r.ok) continue;
+            const j = await r.json();
+            if (j.status === 'completed') {
+                applyTree(j.tree, replaceChildren, anchorLi);
+                return;
+            }
+            if (j.status === 'failed') {
+                renderError(j.error || 'Browse failed', anchorLi);
+                return;
+            }
+        }
+        renderError('Timed out waiting for client response', anchorLi);
+    }
+
+    function applyTree(tree, replaceChildren, anchorLi) {
+        if (tree.truncated) {
+            truncatedAlert.classList.remove('d-none');
+        }
+        if (replaceChildren && anchorLi) {
+            // Replacing an in-tree directory's children — keep anchorLi's
+            // own row, swap its <dirbrowse-children> contents with the
+            // tree's children rendered at the next level.
+            const wrap = anchorLi.querySelector(':scope > .dirbrowse-children');
+            wrap.innerHTML = '';
+            const level = parseInt(anchorLi.dataset.level || '0', 10) + 1;
+            (tree.children || []).forEach(c => wrap.appendChild(renderNode(c, level)));
+            anchorLi.dataset.loaded = '1';
+        } else {
+            // Initial render
+            treeEl.innerHTML = '';
+            const root = renderNode(tree, 0);
+            root.dataset.level = '0';
+            treeEl.appendChild(root);
+            // Auto-expand the root so the user sees children immediately
+            const wrap = root.querySelector(':scope > .dirbrowse-children');
+            const expand = root.querySelector(':scope > .dirbrowse-row > .dirbrowse-expand');
+            if (wrap && tree.children && tree.children.length) {
+                wrap.style.display = '';
+                expand.textContent = '▼';
+            }
+        }
+    }
+
+    function renderError(msg, anchorLi) {
+        if (anchorLi) {
+            const wrap = anchorLi.querySelector(':scope > .dirbrowse-children');
+            wrap.innerHTML = `<div class="text-danger small px-2 py-1">${escapeHtml(msg)}</div>`;
+            wrap.style.display = '';
+        } else {
+            treeEl.innerHTML = `<div class="text-danger p-3">${escapeHtml(msg)}</div>`;
+        }
+    }
+
+    // ── Selected pane ─────────────────────────────────────────────
+    function renderSelected() {
+        selectedEl.innerHTML = '';
+        const arr = Array.from(selectedPaths).sort();
+        if (arr.length === 0) {
+            selectedEl.innerHTML = '<div class="text-muted small text-center py-3">No directories selected.<br>Click rows in the tree, then «»</div>';
+        } else {
+            arr.forEach(p => {
+                const row = document.createElement('div');
+                row.className = 'dirbrowse-selected-row d-flex align-items-center justify-content-between py-1 border-bottom';
+                row.dataset.path = p;
+                row.style.cursor = 'pointer';
+                row.innerHTML = `<code class="text-truncate me-2" title="${escapeHtml(p)}">${escapeHtml(p)}</code>`;
+                row.addEventListener('click', () => {
+                    document.querySelectorAll('.dirbrowse-selected-row.active').forEach(r => r.classList.remove('active'));
+                    row.classList.add('active');
+                });
+                selectedEl.appendChild(row);
+            });
+        }
+        selectedCountEl.textContent = arr.length;
+    }
+
+    addBtn.addEventListener('click', () => {
+        const active = document.querySelector('.dirbrowse-row.active');
+        if (!active) return;
+        const li = active.parentElement;
+        if (li.dataset.type !== 'directory') return; // only directories
+        const path = li.dataset.path;
+        selectedPaths.add(path);
+        renderSelected();
+    });
+
+    removeBtn.addEventListener('click', () => {
+        const active = document.querySelector('.dirbrowse-selected-row.active');
+        if (!active) return;
+        selectedPaths.delete(active.dataset.path);
+        renderSelected();
+    });
+
+    saveBtn.addEventListener('click', () => {
+        // Replace the textarea contents with the selected paths. dirInput
+        // was bound at click-time on the Browse button so it points at the
+        // form (create or edit) whose Browse button opened this modal.
+        if (dirInput) {
+            dirInput.value = Array.from(selectedPaths).sort().join('\n');
+        }
+        hideModal();
+    });
+
+    refreshBtn.addEventListener('click', () => {
+        truncatedAlert.classList.add('d-none');
+        nodeIndex.clear();
+        treeEl.innerHTML = '<div class="text-muted py-3 text-center"><span class="spinner-border spinner-border-sm me-2"></span>Refreshing…</div>';
+        const rp = rootForCurrentAgent();
+        rootPathEl.textContent = rootLabelForCurrentAgent();
+        fetchTree(rp, 2);
+    });
+    hiddenChk.addEventListener('change', () => refreshBtn.click());
+    showAllChk.addEventListener('change', () => refreshBtn.click());
+
+    // Bootstrap auto-opens the modal via data-bs-toggle on each button.
+    // We hook click to prime per-button state (which textarea to write
+    // back to, which agent's filesystem to browse, etc.) and
+    // 'shown.bs.modal' to kick off the fetch only after the modal is
+    // visible — this guarantees the user always sees the spinner even
+    // if the network request is slow.
+    browseBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            agentId = parseInt(btn.dataset.agentId, 10);
+            isWindows = btn.dataset.isWindows === '1';
+            const targetSel = btn.dataset.targetTextarea || '#directoriesInput';
+            dirInput = document.querySelector(targetSel) || document.getElementById('directoriesInput');
+
+            selectedPaths.clear();
+            treeCheckHighlight.clear();
+            const initial = (dirInput && dirInput.value) || '';
+            initial.split(/\r?\n/).forEach(p => {
+                const t = p.trim();
+                if (t) { selectedPaths.add(t); treeCheckHighlight.add(t); }
+            });
+            renderSelected();
+            truncatedAlert.classList.add('d-none');
+            // Don't show the spinner immediately — fetchTree will only
+            // surface it if the request takes >300ms. On a cache hit the
+            // tree appears with no visible loading state.
+            treeEl.innerHTML = '';
+        });
+    });
+    modalEl.addEventListener('shown.bs.modal', () => {
+        const rp = rootForCurrentAgent();
+        rootPathEl.textContent = rootLabelForCurrentAgent();
+        fetchTree(rp, 2);
+    });
+})();
+</script>
+<style>
+.dirbrowse-row:hover { background: var(--bs-tertiary-bg); }
+.dirbrowse-row.active { background: var(--bs-primary-bg-subtle, rgba(13,110,253,0.15)); }
+.dirbrowse-selected-row.active { background: var(--bs-primary-bg-subtle, rgba(13,110,253,0.15)); }
+</style>

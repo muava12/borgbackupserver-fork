@@ -29,10 +29,35 @@ class AgentApiController extends Controller
             $this->json(['error' => 'Missing authorization token'], 401);
         }
 
-        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE api_key = ?", [$token]);
+        $tokenHash = hash('sha256', $token);
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE api_key_hash = ?", [$tokenHash]);
+
+        // Legacy fallback + transparent upgrade for records that haven't been
+        // migrated yet. Once migrated, plaintext is cleared.
+        if (!$agent) {
+            $legacy = $this->db->fetchOne("SELECT * FROM agents WHERE api_key = ?", [$token]);
+            if ($legacy) {
+                try {
+                    $this->db->update('agents', [
+                        'api_key_hash' => $tokenHash,
+                        'api_key_encrypted' => \BBS\Services\Encryption::encrypt($token),
+                        'api_key' => null,
+                    ], 'id = ?', [$legacy['id']]);
+                    $this->db->insert('server_log', [
+                        'agent_id' => $legacy['id'],
+                        'level' => 'info',
+                        'message' => 'Agent credential storage upgraded (security hardening).',
+                    ]);
+                    $legacy['api_key_hash'] = $tokenHash;
+                    $legacy['api_key'] = null;
+                } catch (\Throwable $e) {
+                    // Non-fatal — continue with the legacy record this request.
+                }
+                $agent = $legacy;
+            }
+        }
 
         if (!$agent) {
-            // Rate limit failed API auth: 20 attempts per 5 minutes
             if (!$this->checkRateLimit('agent_api', 20, 300)) {
                 $this->json(['error' => 'Too many failed attempts'], 429);
             }
@@ -56,7 +81,11 @@ class AgentApiController extends Controller
 
         $notifService->resolve('agent_offline', $agent['id'], null);
 
-        // If agent was offline and is now back online, send agent_online notification
+        // If agent was offline and is now back online, send agent_online
+        // notification AND write a server_log row so the reconnect is
+        // visible in the log timeline alongside the original offline sweep
+        // (which writes its own log row from scheduler.php). Without this,
+        // the log shows only the offline event, not the recovery (#249).
         if ($wasOffline) {
             $notifService->notify(
                 'agent_online',
@@ -65,6 +94,11 @@ class AgentApiController extends Controller
                 "Client \"{$agent['name']}\" is back online",
                 'info'
             );
+            $this->db->insert('server_log', [
+                'agent_id' => $agent['id'],
+                'level' => 'info',
+                'message' => "Client \"{$agent['name']}\" is back online",
+            ]);
         }
 
         return $agent;
@@ -158,7 +192,7 @@ class AgentApiController extends Controller
             SELECT bj.id FROM backup_jobs bj
             WHERE bj.agent_id = ?
               AND bj.status IN ('running', 'sent')
-              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full')
+              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
               {$excludeClause}
               AND (
                   (bj.last_progress_at IS NOT NULL AND bj.last_progress_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE))
@@ -355,7 +389,14 @@ class AgentApiController extends Controller
         } elseif (!$isCataloging) {
             $data['completed_at'] = $now;
             $data['duration_seconds'] = max(0, $duration);
-            $data['status_message'] = null;
+            // list_dir stashes its request params (including cache_key) in
+            // status_message at queue time; the browsePoll endpoint needs
+            // those after completion to populate the per-params cache.
+            // For every other task type the field is a transient progress
+            // line and gets cleared on completion as usual.
+            if (($job['task_type'] ?? '') !== 'list_dir') {
+                $data['status_message'] = null;
+            }
         }
 
         // If the agent never reported "running", backfill started_at
@@ -368,6 +409,7 @@ class AgentApiController extends Controller
         if (isset($input['bytes_total']))     $data['bytes_total'] = (int) $input['bytes_total'];
         if (isset($input['bytes_processed'])) $data['bytes_processed'] = (int) $input['bytes_processed'];
         if (!empty($input['error_log']))      $data['error_log'] = $input['error_log'];
+        if (!empty($input['had_warnings']))   $data['had_warnings'] = 1;
 
         $this->db->update('backup_jobs', $data, 'id = ?', [$jobId]);
 
@@ -400,26 +442,21 @@ class AgentApiController extends Controller
                 'message' => "Archive created: \"{$input['archive_name']}\" — {$origSize} original, {$dedupSize} deduplicated",
             ]);
 
-            // Update repo stats + borg version.
-            // size_bytes is only set from SUM(deduplicated_size) for remote SSH
-            // repos (where we can't du) OR when currently 0 (fresh repo). For
-            // local repos the scheduler's du scan is the source of truth — it
-            // includes repo metadata and uncompacted chunks that SUM misses.
+            // Update archive count + borg version. Size is refreshed below
+            // via RepositorySizeService (du locally; du-then-borg-info over
+            // SSH) — runs once per backup instead of a periodic scan, so
+            // idle disks stay idle.
             $borgVer = !empty($agent['borg_version']) ? preg_replace('/^borg\s+/', '', $agent['borg_version']) : null;
             $this->db->query("
                 UPDATE repositories SET
-                    archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
-                    size_bytes = CASE
-                        WHEN storage_type = 'remote_ssh' OR size_bytes = 0
-                        THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
-                        ELSE size_bytes
-                    END
+                    archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?)
                     " . ($borgVer ? ", borg_version_last = ?" : "") . "
                 WHERE id = ?
             ", $borgVer
-                ? [$job['repository_id'], $job['repository_id'], $borgVer, $job['repository_id']]
-                : [$job['repository_id'], $job['repository_id'], $job['repository_id']]
+                ? [$job['repository_id'], $borgVer, $job['repository_id']]
+                : [$job['repository_id'], $job['repository_id']]
             );
+            \BBS\Services\RepositorySizeService::refresh((int) $job['repository_id']);
 
             $this->db->insert('server_log', [
                 'agent_id' => $agent['id'],
@@ -448,7 +485,7 @@ class AgentApiController extends Controller
         // Log the result
         $level = $result === 'completed' ? 'info' : 'error';
         $message = $result === 'completed'
-            ? "{$taskLabel} completed: job #{$jobId}" . (($data['files_total'] ?? 0) > 0 ? ", {$data['files_total']} files" : '') . ", {$duration}s"
+            ? "{$taskLabel} completed: job #{$jobId}" . (($data['files_total'] ?? 0) > 0 ? ", {$data['files_total']} files" : '') . ", " . \BBS\Core\TimeHelper::duration($duration, '0s')
             : "{$taskLabel} failed: job #{$jobId} — " . ($input['error_log'] ?? 'unknown error');
 
         $this->db->insert('server_log', [
@@ -458,14 +495,29 @@ class AgentApiController extends Controller
             'message' => $message,
         ]);
 
-        // Log output from tasks like update_borg
+        // Log output from tasks like update_borg. Exception: list_dir
+        // reports its tree as a JSON-encoded output_log; persist it on
+        // the job row (task_result column) so the browse modal's poll
+        // endpoint can read it back. We also push to the Cache layer
+        // as a fast-path, but DB is the source of truth — Cache returns
+        // unavailable on systems where memcached isn't running.
         if (!empty($input['output_log'])) {
-            $this->db->insert('server_log', [
-                'agent_id' => $agent['id'],
-                'backup_job_id' => $jobId,
-                'level' => 'info',
-                'message' => "{$taskLabel} output: " . substr($input['output_log'], 0, 2000),
-            ]);
+            if (($job['task_type'] ?? '') === 'list_dir' && $result === 'completed') {
+                $this->db->update('backup_jobs', [
+                    'task_result' => $input['output_log'],
+                ], 'id = ?', [$jobId]);
+                $tree = json_decode($input['output_log'], true);
+                if (is_array($tree)) {
+                    \BBS\Services\Cache::getInstance()->set("browse_result:{$jobId}", $tree, 900);
+                }
+            } else {
+                $this->db->insert('server_log', [
+                    'agent_id' => $agent['id'],
+                    'backup_job_id' => $jobId,
+                    'level' => 'info',
+                    'message' => "{$taskLabel} output: " . substr($input['output_log'], 0, 2000),
+                ]);
+            }
         }
 
         // Notification system: task-based notifications
@@ -487,14 +539,33 @@ class AgentApiController extends Controller
                         "Backup failed for plan \"{$planName}\" on client \"{$agent['name']}\" — " . ($input['error_log'] ?? 'unknown error'),
                         'critical'
                     );
+                } elseif ($result === 'completed' && !empty($input['had_warnings'])) {
+                    // borg returned a warning — most commonly a configured
+                    // source path that didn't exist (#203). Resolve any
+                    // prior backup_failed and fire a warning-level event so
+                    // the user actually sees this instead of a silent green.
+                    if ($job['backup_plan_id']) {
+                        $notificationService->resolve('backup_failed', $agent['id'], (int)$job['backup_plan_id']);
+                    }
+                    $warningTail = !empty($input['error_log'])
+                        ? ' — ' . trim(substr($input['error_log'], 0, 300))
+                        : '';
+                    $notificationService->notify(
+                        'backup_warning',
+                        $agent['id'],
+                        $job['backup_plan_id'] ? (int)$job['backup_plan_id'] : null,
+                        "Backup completed with warnings for plan \"{$planName}\" on client \"{$agent['name']}\"{$warningTail}",
+                        'warning'
+                    );
                 } elseif ($result === 'completed' && $job['backup_plan_id']) {
                     $notificationService->resolve('backup_failed', $agent['id'], (int)$job['backup_plan_id']);
+                    $notificationService->resolve('backup_warning', $agent['id'], (int)$job['backup_plan_id']);
                     $notificationService->notify(
                         'backup_completed',
                         $agent['id'],
                         (int)$job['backup_plan_id'],
                         "Backup completed for plan \"{$planName}\" on client \"{$agent['name']}\"" .
-                            (($data['files_total'] ?? 0) > 0 ? " — {$data['files_total']} files in {$duration}s" : ''),
+                            (($data['files_total'] ?? 0) > 0 ? " — {$data['files_total']} files in " . \BBS\Core\TimeHelper::duration($duration, '0s') : ''),
                         'info'
                     );
                 }
@@ -551,7 +622,7 @@ class AgentApiController extends Controller
         if ($result === 'failed') {
             try {
                 $mailer = new Mailer();
-                $mailer->notifyFailure($agent['name'], $jobId, $input['error_log'] ?? 'Unknown error');
+                $mailer->notifyFailure($agent['name'], $jobId, $input['error_log'] ?? 'Unknown error', $job['task_type']);
             } catch (\Exception $e) {
                 // Don't fail the status report if email fails
             }
@@ -590,22 +661,18 @@ class AgentApiController extends Controller
                     'message' => "Archive created: \"{$input['archive_name']}\" — {$origSize} original, {$dedupSize} deduplicated",
                 ]);
 
-                // Update repo stats + borg version (see comment above on size_bytes)
+                // Update archive count + borg version; size refreshed after (see above).
                 $borgVer2 = !empty($agent['borg_version']) ? preg_replace('/^borg\s+/', '', $agent['borg_version']) : null;
                 $this->db->query("
                     UPDATE repositories SET
-                        archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?),
-                        size_bytes = CASE
-                            WHEN storage_type = 'remote_ssh' OR size_bytes = 0
-                            THEN COALESCE((SELECT SUM(deduplicated_size) FROM archives WHERE repository_id = ?), 0)
-                            ELSE size_bytes
-                        END
+                        archive_count = (SELECT COUNT(*) FROM archives WHERE repository_id = ?)
                         " . ($borgVer2 ? ", borg_version_last = ?" : "") . "
                     WHERE id = ?
                 ", $borgVer2
-                    ? [$job['repository_id'], $job['repository_id'], $borgVer2, $job['repository_id']]
-                    : [$job['repository_id'], $job['repository_id'], $job['repository_id']]
+                    ? [$job['repository_id'], $borgVer2, $job['repository_id']]
+                    : [$job['repository_id'], $job['repository_id']]
                 );
+                \BBS\Services\RepositorySizeService::refresh((int) $job['repository_id']);
 
                 $this->db->insert('server_log', [
                     'agent_id' => $agent['id'],
@@ -775,8 +842,15 @@ class AgentApiController extends Controller
             $this->json(['error' => 'archive_id and files[] required'], 400);
         }
 
-        // Verify archive exists
-        $archive = $this->db->fetchOne("SELECT id FROM archives WHERE id = ?", [$archiveId]);
+        // Verify archive exists AND belongs to the calling agent. Without the
+        // ownership check, a compromised agent token could upload catalog rows
+        // against another tenant's archive (cross-tenant pollution).
+        $archive = $this->db->fetchOne(
+            "SELECT ar.id FROM archives ar
+             JOIN repositories r ON r.id = ar.repository_id
+             WHERE ar.id = ? AND r.agent_id = ?",
+            [$archiveId, (int) $agent['id']]
+        );
         if (!$archive) {
             $this->json(['error' => 'Archive not found'], 404);
         }
@@ -1105,11 +1179,12 @@ class AgentApiController extends Controller
 
     private function formatBytesLog(int $bytes): string
     {
-        if ($bytes == 0) return '0 B';
+        $nbsp = "\u{00A0}";
+        if ($bytes == 0) return "0{$nbsp}B";
         $units = ['B', 'KB', 'MB', 'GB', 'TB'];
         $i = 0;
         while ($bytes >= 1024 && $i < count($units) - 1) { $bytes /= 1024; $i++; }
-        return round($bytes, $i > 0 ? 1 : 0) . ' ' . $units[$i];
+        return round($bytes, $i > 0 ? 1 : 0) . $nbsp . $units[$i];
     }
 
     /**
@@ -1147,6 +1222,15 @@ class AgentApiController extends Controller
         $best = $borgService->getBestVersionForAgent($agent);
         if (!$best) {
             return; // No compatible binary available
+        }
+
+        // If no versioned binary exists for this agent's arch, the fallback
+        // is pip 'latest' — we can't tell whether an update is actually
+        // needed, and on arches without a working pip (armv7l, some BSD
+        // variants) it just fails daily forever. Skip auto-queue; the user
+        // can still click "Update Borg" manually. #187
+        if (($best['source'] ?? '') === 'pip' && ($best['version'] ?? '') === 'latest') {
+            return;
         }
 
         // Check if agent already has this version or newer (but < 2.0)

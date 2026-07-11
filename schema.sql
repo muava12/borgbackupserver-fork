@@ -24,6 +24,8 @@ CREATE TABLE users (
     daily_report_hour TINYINT NOT NULL DEFAULT 6,
     report_frequency ENUM('daily', 'weekly') NOT NULL DEFAULT 'daily',
     report_day TINYINT NOT NULL DEFAULT 1,
+    storage_alert_mode ENUM('percent','gb_free','disabled') NOT NULL DEFAULT 'percent',
+    storage_alert_value INT NOT NULL DEFAULT 90,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
@@ -96,7 +98,10 @@ CREATE TABLE agents (
     name VARCHAR(100) NOT NULL,
     hostname VARCHAR(255) DEFAULT NULL,
     ip_address VARCHAR(45) DEFAULT NULL,
-    api_key VARCHAR(64) NOT NULL UNIQUE,
+    api_key VARCHAR(64) DEFAULT NULL,
+    api_key_hash CHAR(64) DEFAULT NULL,
+    api_key_encrypted TEXT DEFAULT NULL,
+    INDEX idx_api_key_hash (api_key_hash),
     os_info VARCHAR(255) DEFAULT NULL,
     borg_version VARCHAR(20) DEFAULT NULL,
     borg_install_method ENUM('package','binary','pip','unknown') DEFAULT 'unknown',
@@ -146,6 +151,10 @@ CREATE TABLE remote_ssh_configs (
     disk_used_bytes BIGINT DEFAULT NULL,
     disk_free_bytes BIGINT DEFAULT NULL,
     disk_checked_at DATETIME DEFAULT NULL,
+    borgbase_api_key_encrypted TEXT DEFAULT NULL,
+    borgbase_repo_name VARCHAR(255) DEFAULT NULL,
+    borgbase_manual_quota_gb DECIMAL(12,3) DEFAULT NULL,
+    borgbase_usage_source VARCHAR(20) DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
@@ -214,7 +223,7 @@ CREATE TABLE backup_jobs (
     agent_id INT NOT NULL,
     repository_id INT DEFAULT NULL,
     source_repository_id INT DEFAULT NULL,
-    task_type ENUM('backup', 'prune', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'check', 'compact', 'update_borg', 'update_agent', 'plugin_test', 's3_sync', 'repo_check', 'repo_repair', 'break_lock', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete') NOT NULL DEFAULT 'backup',
+    task_type ENUM('backup', 'prune', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'check', 'compact', 'update_borg', 'update_agent', 'plugin_test', 's3_sync', 'repo_check', 'repo_repair', 'break_lock', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'list_dir') NOT NULL DEFAULT 'backup',
     plugin_config_id INT DEFAULT NULL,
     status ENUM('queued', 'sent', 'running', 'completed', 'failed', 'cancelled') NOT NULL DEFAULT 'queued',
     files_total INT DEFAULT NULL,
@@ -223,6 +232,10 @@ CREATE TABLE backup_jobs (
     bytes_processed BIGINT DEFAULT NULL,
     duration_seconds INT DEFAULT NULL,
     error_log TEXT DEFAULT NULL,
+    task_result MEDIUMTEXT DEFAULT NULL,
+    had_warnings TINYINT(1) NOT NULL DEFAULT 0,
+    retry_count INT NOT NULL DEFAULT 0,
+    parent_job_id INT DEFAULT NULL,
     status_message VARCHAR(255) DEFAULT NULL,
     restore_archive_id INT DEFAULT NULL,
     restore_paths JSON DEFAULT NULL,
@@ -275,7 +288,7 @@ CREATE TABLE server_log (
 
 CREATE TABLE settings (
     `key` VARCHAR(100) PRIMARY KEY,
-    `value` TEXT DEFAULT NULL
+    `value` MEDIUMTEXT DEFAULT NULL
 );
 
 INSERT INTO settings (`key`, `value`) VALUES
@@ -323,15 +336,19 @@ CREATE TABLE notifications (
     type VARCHAR(50) NOT NULL,
     agent_id INT DEFAULT NULL,
     reference_id INT DEFAULT NULL,
+    user_id INT DEFAULT NULL,
     severity VARCHAR(20) NOT NULL DEFAULT 'warning',
     message TEXT NOT NULL,
     occurrence_count INT NOT NULL DEFAULT 1,
+    last_emailed_at DATETIME DEFAULT NULL,
     first_occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     read_at DATETIME DEFAULT NULL,
     resolved_at DATETIME DEFAULT NULL,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
-    INDEX idx_unresolved (resolved_at, read_at)
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_unresolved (resolved_at, read_at),
+    INDEX idx_user_unresolved (user_id, resolved_at, read_at)
 );
 
 CREATE TABLE notification_services (
@@ -417,7 +434,7 @@ CREATE TABLE repository_s3_configs (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
     FOREIGN KEY (plugin_config_id) REFERENCES plugin_configs(id) ON DELETE RESTRICT,
-    UNIQUE KEY unique_repo_s3 (repository_id)
+    UNIQUE KEY unique_repo_s3_dest (repository_id, plugin_config_id)
 ) ENGINE=InnoDB;
 
 INSERT INTO plugins (slug, name, description, plugin_type) VALUES
@@ -435,6 +452,8 @@ INSERT INTO plugins (slug, name, description, plugin_type) VALUES
 CREATE TABLE api_tokens (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
+    kind VARCHAR(16) NOT NULL DEFAULT 'user',
+    can_read_secrets TINYINT(1) NOT NULL DEFAULT 0,
     token_hash VARCHAR(64) NOT NULL UNIQUE,
     user_id INT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,

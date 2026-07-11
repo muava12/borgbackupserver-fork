@@ -10,6 +10,19 @@ class SettingsController extends Controller
     {
         $this->requireAdmin();
 
+        // Backwards-compat: old tab names ('remote', 'offsite', 'storage')
+        // pointed at the storage-management UI. That lives at
+        // /storage-locations now — redirect before any output starts. (The
+        // redirect used to live inside the view, but by the time the view
+        // runs the layout has already flushed headers, so header() errors.)
+        $activeTab = $_GET['tab'] ?? 'general';
+        if (in_array($activeTab, ['remote', 'offsite', 'storage'], true)
+            && !\BBS\Core\Config::isHosted()) {
+            $section = $_GET['section'] ?? '';
+            if ($activeTab === 'offsite') $section = 's3';
+            $this->redirect('/storage-locations' . ($section === 's3' ? '?section=s3' : ''));
+        }
+
         $settings = [];
         $rows = $this->db->fetchAll("SELECT `key`, `value` FROM settings");
         foreach ($rows as $row) {
@@ -20,12 +33,28 @@ class SettingsController extends Controller
 
         $oidcUsers = $this->db->fetchAll("SELECT id, username, email, role FROM users ORDER BY username");
 
+        // Exclude platform-kind tokens — those belong to the hosted platform,
+        // not the customer, and must not appear on the user-facing list.
         $apiTokens = $this->db->fetchAll("
-            SELECT t.id, t.name, t.created_at, t.last_used_at, u.username
+            SELECT t.id, t.name, t.created_at, t.last_used_at, t.can_read_secrets, u.username
             FROM api_tokens t
             JOIN users u ON u.id = t.user_id
+            WHERE t.kind = 'user'
             ORDER BY t.created_at
         ");
+
+        // SMTP-not-configured warning (#249): if any email_on_* toggle is on
+        // but Mailer can't actually send, the user thinks emails are firing
+        // when they're being silently skipped at NotificationService.php:134.
+        $emailToggleEnabled = false;
+        foreach ($settings as $key => $value) {
+            if (str_starts_with($key, 'email_on_') && $value === '1') {
+                $emailToggleEnabled = true;
+                break;
+            }
+        }
+        $smtpReady = (new \BBS\Services\Mailer())->isEnabled();
+        $smtpWarning = $emailToggleEnabled && !$smtpReady;
 
         $this->view('settings/index', [
             'pageTitle' => 'Settings',
@@ -33,6 +62,7 @@ class SettingsController extends Controller
             'templates' => $templates,
             'apiTokens' => $apiTokens,
             'oidcUsers' => $oidcUsers,
+            'smtpWarning' => $smtpWarning,
         ]);
     }
 
@@ -90,7 +120,7 @@ class SettingsController extends Controller
         $this->requireAdmin();
         $this->verifyCsrf();
 
-        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'stall_timeout_minutes', 'session_timeout_hours', 'default_theme', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention'];
+        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'stall_timeout_minutes', 'session_timeout_hours', 'default_theme', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_secure', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention', 'auto_retry_max_attempts', 'agent_offline_notify_minutes', 'auto_compact_day', 'auto_compact_hour'];
 
         foreach ($allowed as $key) {
             if (isset($_POST[$key])) {
@@ -103,8 +133,14 @@ class SettingsController extends Controller
             }
         }
 
+        // SMTP password: only update when non-empty (so leaving the field blank
+        // doesn't wipe it). Stored encrypted via APP_KEY.
+        if (!empty($_POST['smtp_pass'])) {
+            $this->saveSetting('smtp_pass', \BBS\Services\Encryption::encrypt($_POST['smtp_pass']));
+        }
+
         // Checkbox toggles: unchecked = not posted, so explicitly save '0'
-        $checkboxKeys = ['maintenance_mode', 'email_on_backup_failed', 'email_on_agent_offline', 'email_on_storage_low', 'email_on_missed_schedule', 'apprise_on_backup_failed', 'apprise_on_agent_offline', 'apprise_on_storage_low', 'apprise_on_missed_schedule', 'force_2fa', 'debug_mode', 'self_backup_enabled', 'self_backup_catalogs', 'telemetry_opt_out'];
+        $checkboxKeys = ['maintenance_mode', 'email_on_backup_failed', 'email_on_backup_warning', 'email_on_agent_offline', 'email_on_storage_low', 'email_on_missed_schedule', 'apprise_on_backup_failed', 'apprise_on_backup_warning', 'apprise_on_agent_offline', 'apprise_on_storage_low', 'apprise_on_missed_schedule', 'force_2fa', 'debug_mode', 'self_backup_enabled', 'self_backup_catalogs', 'telemetry_opt_out', 'inapp_notify_success_events', 'auto_retry_failed_backups', 'auto_update_agents'];
         foreach ($checkboxKeys as $key) {
             $value = isset($_POST[$key]) ? '1' : '0';
             $existing = $this->db->fetchOne("SELECT `key` FROM settings WHERE `key` = ?", [$key]);
@@ -260,6 +296,20 @@ class SettingsController extends Controller
             }
         }
 
+        // Handle app icon (browser tab + apple touch + PWA — single source,
+        // dynamically resized at request time via /branding/icon/{size}).
+        if (!empty($_POST['remove_branding_app_icon'])) {
+            $this->db->query("DELETE FROM settings WHERE `key` = 'branding_app_icon'");
+            $saved[] = 'App icon removed';
+        } elseif (!empty($_POST['branding_app_icon_data'])) {
+            $data = $_POST['branding_app_icon_data'];
+            $decoded = base64_decode($data, true);
+            if ($decoded && substr($decoded, 0, 4) === "\x89PNG") {
+                $this->saveSetting('branding_app_icon', $data);
+                $saved[] = 'App icon updated';
+            }
+        }
+
         // Login page theme override
         $loginTheme = $_POST['branding_login_theme'] ?? 'default';
         if (in_array($loginTheme, ['default', 'dark', 'light'])) {
@@ -291,11 +341,13 @@ class SettingsController extends Controller
 
         $token = 'bbs_tok_' . bin2hex(random_bytes(24));
         $hash = hash('sha256', $token);
+        $canReadSecrets = !empty($_POST['can_read_secrets']) ? 1 : 0;
 
         $this->db->insert('api_tokens', [
             'name' => $name,
             'token_hash' => $hash,
             'user_id' => $_SESSION['user_id'],
+            'can_read_secrets' => $canReadSecrets,
         ]);
 
         $_SESSION['new_api_token'] = $token;
@@ -307,6 +359,17 @@ class SettingsController extends Controller
     {
         $this->requireAdmin();
         $this->verifyCsrf();
+
+        // Defense in depth: the platform token must not be deletable from
+        // the customer-facing tokens UI. The list view hides it, but a
+        // crafted POST against /settings/api/tokens/{id}/revoke could still
+        // target the row by guessed id.
+        $row = $this->db->fetchOne("SELECT kind FROM api_tokens WHERE id = ?", [$id]);
+        if ($row && ($row['kind'] ?? 'user') === 'platform') {
+            $this->flash('danger', 'This token is managed by the hosted platform and cannot be revoked here.');
+            $this->redirect('/settings?tab=api');
+            return;
+        }
 
         $this->db->delete('api_tokens', 'id = ?', [$id]);
         $this->flash('success', 'API token revoked.');
@@ -370,8 +433,19 @@ class SettingsController extends Controller
 
         $host = $settings['smtp_host'] ?? '';
         $port = (int) ($settings['smtp_port'] ?? 587);
+        $secure = $settings['smtp_secure'] ?? \BBS\Services\Mailer::inferSecure($port);
         $user = $settings['smtp_user'] ?? '';
-        $pass = $settings['smtp_pass'] ?? '';
+        $rawPass = $settings['smtp_pass'] ?? '';
+        // Password is stored encrypted — decrypt before sending to AUTH LOGIN.
+        // Legacy plaintext values may still exist, so fall back on decrypt failure.
+        $pass = '';
+        if ($rawPass !== '') {
+            try {
+                $pass = \BBS\Services\Encryption::decrypt($rawPass);
+            } catch (\Throwable $e) {
+                $pass = $rawPass;
+            }
+        }
         $from = $settings['smtp_from'] ?? '';
 
         if (empty($host)) {
@@ -380,7 +454,8 @@ class SettingsController extends Controller
         }
 
         try {
-            $socket = @fsockopen($host, $port, $errno, $errstr, 10);
+            $connHost = $secure === 'ssl' ? "ssl://{$host}" : $host;
+            $socket = @fsockopen($connHost, $port, $errno, $errstr, 10);
             if (!$socket) {
                 $this->json(['success' => false, 'error' => "Connection failed: {$errstr}"]);
                 return;
@@ -389,7 +464,7 @@ class SettingsController extends Controller
             $this->smtpRead($socket);
             $this->smtpCmd($socket, "EHLO " . gethostname());
 
-            if ($port === 587) {
+            if ($secure === 'starttls') {
                 $this->smtpCmd($socket, "STARTTLS");
                 if (!stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT)) {
                     fclose($socket);
@@ -410,10 +485,69 @@ class SettingsController extends Controller
                 }
             }
 
+            // Actually deliver a test message — previously the Test button
+            // only validated connection+auth and never issued MAIL FROM /
+            // RCPT TO / DATA, so a successful "Success" response could be
+            // returned even though end-to-end delivery (DNS, recipient
+            // routing, spam-filter acceptance) was untested (#249 follow-up).
+            $fromAddress = $from ?: $user;
+            $recipient = $this->db->fetchOne(
+                "SELECT email FROM users WHERE id = ? AND email != ''",
+                [$_SESSION['user_id'] ?? 0]
+            );
+            $recipientEmail = $recipient['email'] ?? '';
+            if ($recipientEmail === '' || $fromAddress === '') {
+                $this->smtpCmd($socket, "QUIT");
+                fclose($socket);
+                $this->json(['success' => false, 'error' => 'Cannot send test message — your user account has no email address, or smtp_from / smtp_user is empty.']);
+                return;
+            }
+
+            $resp = $this->smtpCmd($socket, "MAIL FROM:<{$fromAddress}>");
+            if (strpos($resp, '250') !== 0) {
+                fclose($socket);
+                $this->json(['success' => false, 'error' => 'MAIL FROM rejected: ' . trim($resp)]);
+                return;
+            }
+            $resp = $this->smtpCmd($socket, "RCPT TO:<{$recipientEmail}>");
+            if (strpos($resp, '250') !== 0 && strpos($resp, '251') !== 0) {
+                fclose($socket);
+                $this->json(['success' => false, 'error' => 'RCPT TO rejected: ' . trim($resp)]);
+                return;
+            }
+            $resp = $this->smtpCmd($socket, "DATA");
+            if (strpos($resp, '354') !== 0) {
+                fclose($socket);
+                $this->json(['success' => false, 'error' => 'DATA rejected: ' . trim($resp)]);
+                return;
+            }
+            $messageId = bin2hex(random_bytes(8)) . '@' . (gethostname() ?: 'bbs');
+            $dateHeader = date('r');
+            $body = "From: Borg Backup Server <{$fromAddress}>\r\n"
+                  . "To: <{$recipientEmail}>\r\n"
+                  . "Subject: [BBS] SMTP Test\r\n"
+                  . "Date: {$dateHeader}\r\n"
+                  . "Message-ID: <{$messageId}>\r\n"
+                  . "MIME-Version: 1.0\r\n"
+                  . "Content-Type: text/plain; charset=UTF-8\r\n"
+                  . "\r\n"
+                  . "This is a test message from your Borg Backup Server.\r\n\r\n"
+                  . "If you're seeing this in your inbox, SMTP delivery is working end-to-end:\r\n"
+                  . "  - Connection authenticated\r\n"
+                  . "  - DNS routing succeeded\r\n"
+                  . "  - Spam filter accepted the message\r\n\r\n"
+                  . "-- Borg Backup Server\r\n";
+            $resp = $this->smtpCmd($socket, $body . ".");
+            if (strpos($resp, '250') !== 0) {
+                fclose($socket);
+                $this->json(['success' => false, 'error' => 'Server rejected message: ' . trim($resp)]);
+                return;
+            }
+
             $this->smtpCmd($socket, "QUIT");
             fclose($socket);
 
-            $this->json(['success' => true]);
+            $this->json(['success' => true, 'message' => "Test email sent to {$recipientEmail}"]);
         } catch (\Exception $e) {
             $this->json(['success' => false, 'error' => $e->getMessage()]);
         }

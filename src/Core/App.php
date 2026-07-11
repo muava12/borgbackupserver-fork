@@ -10,14 +10,16 @@ class App
     {
         Config::load();
 
-        // Skip session_start() for API endpoints — agents authenticate with a
-        // Bearer token (no cookie), so starting a session would just create
-        // an empty sess_* file per request. With agents polling every 30s,
-        // that adds up to hundreds of thousands of orphan files per month.
+        // Skip session_start() for agent API endpoints — agents authenticate
+        // with a Bearer token (no cookie), so starting a session would just
+        // create an empty sess_* file per request. With agents polling every
+        // 30s, that adds up to hundreds of thousands of orphan files per
+        // month. Browser-initiated API routes (e.g. /api/templates/{id}) still
+        // need their session for requireAuth().
         $reqPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
-        $isApiRequest = str_starts_with($reqPath, '/api/');
+        $isAgentApi = str_starts_with($reqPath, '/api/agent/');
 
-        if (!$isApiRequest) {
+        if (!$isAgentApi) {
             // Set gc_maxlifetime to 30 days so Ubuntu's sessionclean cron
             // doesn't delete session files before our app-level timeout
             ini_set('session.gc_maxlifetime', 30 * 86400);
@@ -88,6 +90,8 @@ class App
         $this->router->map('GET', '/dashboard', 'DashboardController@index');
         $this->router->map('GET', '/dashboard/json', 'DashboardController@apiJson');
         $this->router->map('GET', '/dashboard/stats-json', 'DashboardController@apiStatsJson');
+        $this->router->map('GET', '/dashboard/health-json', 'DashboardController@apiHealthJson');
+        $this->router->map('GET', '/dashboard/active-json', 'DashboardController@apiActiveJson');
 
         // Clients (Agents)
         $this->router->map('GET', '/clients', 'ClientController@index');
@@ -102,6 +106,8 @@ class App
         $this->router->map('POST', '/clients/[i:id]/delete', 'ClientController@delete');
         $this->router->map('POST', '/clients/[i:id]/update-borg', 'ClientController@updateBorg');
         $this->router->map('POST', '/clients/[i:id]/update-agent', 'ClientController@updateAgent');
+        $this->router->map('POST', '/clients/[i:id]/browse', 'ClientController@browse');
+        $this->router->map('GET', '/clients/[i:id]/browse/[i:taskId]', 'ClientController@browsePoll');
 
         // Plugins
         $this->router->map('POST', '/clients/[i:id]/plugins', 'PluginController@updateAgentPlugins');
@@ -121,6 +127,7 @@ class App
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]', 'RepositoryController@detail');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]', 'RepositoryController@archiveDetail');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/files', 'RepositoryController@archiveFiles');
+        $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/deleted-summary', 'RepositoryController@archiveDeletedSummary');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/delete', 'RepositoryController@deleteArchive');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-restore', 'RepositoryController@s3Restore');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-config', 'RepositoryController@s3Config');
@@ -128,6 +135,9 @@ class App
         $this->router->map('POST', '/clients/[i:id]/restore-orphan', 'RepositoryController@restoreOrphan');
         $this->router->map('POST', '/repositories/import/verify', 'RepositoryController@verifyImport');
         $this->router->map('POST', '/repositories/import', 'RepositoryController@import');
+        $this->router->map('POST', '/repositories/scan', 'RepositoryController@scanRepos');
+        $this->router->map('POST', '/repositories/adopt/verify', 'RepositoryController@verifyAdopt');
+        $this->router->map('POST', '/repositories/adopt', 'RepositoryController@adopt');
 
         // Backup Plans
         $this->router->map('POST', '/plans/create', 'BackupPlanController@store');
@@ -137,8 +147,10 @@ class App
         $this->router->map('POST', '/plans/[i:id]/duplicate', 'BackupPlanController@duplicate');
 
         // Schedules
+        $this->router->map('GET',  '/schedules', 'ScheduleController@week');
         $this->router->map('POST', '/schedules/[i:id]/toggle', 'ScheduleController@toggle');
         $this->router->map('POST', '/schedules/[i:id]/delete', 'ScheduleController@delete');
+        $this->router->map('POST', '/schedules/[i:id]/time',   'ScheduleController@updateTime');
 
         // Queue
         $this->router->map('GET', '/queue', 'QueueController@index');
@@ -163,6 +175,10 @@ class App
         $this->router->map('POST', '/settings/templates/[i:id]/edit', 'SettingsController@editTemplate');
         $this->router->map('POST', '/settings/templates/[i:id]/delete', 'SettingsController@deleteTemplate');
         $this->router->map('POST', '/settings/branding', 'SettingsController@saveBranding');
+
+        // Branding icon dispenser — single-source app icon resized on demand
+        // (favicons, apple-touch-icon, PWA tiles all served from one upload).
+        $this->router->map('GET', '/branding/icon/[i:size]', 'BrandingController@icon');
         $this->router->map('POST', '/settings/oidc', 'SettingsController@saveOidc');
         $this->router->map('POST', '/settings/api/tokens/create', 'SettingsController@createApiToken');
         $this->router->map('POST', '/settings/api/tokens/[i:id]/revoke', 'SettingsController@revokeApiToken');
@@ -185,6 +201,7 @@ class App
         $this->router->map('POST', '/remote-ssh-configs/[i:id]/delete', 'RemoteSshConfigController@delete');
         $this->router->map('POST', '/remote-ssh-configs/[i:id]/test', 'RemoteSshConfigController@test');
         $this->router->map('POST', '/remote-ssh-configs/test-new', 'RemoteSshConfigController@testNew');
+        $this->router->map('POST', '/remote-ssh-configs/borgbase-api-test', 'RemoteSshConfigController@testBorgBaseApi');
 
         // Notification Services
         $this->router->map('GET', '/notification-services', 'NotificationServiceController@index');
@@ -251,6 +268,7 @@ class App
         $this->router->map('GET', '/get-agent-windows', 'Api\\AgentApiController@getAgentWindows');
 
         // Admin API (token-authenticated)
+        $this->router->map('GET', '/api/v1/summary', 'Api\\AdminApiController@summary');
         $this->router->map('GET', '/api/v1/clients', 'Api\\AdminApiController@listClients');
         $this->router->map('POST', '/api/v1/clients', 'Api\\AdminApiController@createClient');
         $this->router->map('GET', '/api/v1/clients/[i:id]', 'Api\\AdminApiController@getClient');
@@ -275,6 +293,23 @@ class App
         $this->router->map('GET', '/api/v1/clients/[i:id]/plugin-configs', 'Api\\AdminApiController@listPluginConfigs');
         $this->router->map('POST', '/api/v1/clients/[i:id]/plugin-configs', 'Api\\AdminApiController@createPluginConfig');
         $this->router->map('GET', '/api/v1/storage', 'Api\\AdminApiController@listStorageLocations');
+        $this->router->map('POST', '/api/v1/storage', 'Api\\AdminApiController@createStorageLocation');
+        $this->router->map('GET', '/api/v1/storage/capacity', 'Api\\AdminApiController@getStorageCapacity');
+        $this->router->map('GET', '/api/v1/s3-credentials', 'Api\\AdminApiController@getS3Credentials');
+        $this->router->map('POST', '/api/v1/s3-credentials', 'Api\\AdminApiController@setS3Credentials');
+        $this->router->map('DELETE', '/api/v1/s3-credentials', 'Api\\AdminApiController@clearS3Credentials');
+        $this->router->map('GET', '/api/v1/maintenance', 'Api\\AdminApiController@getMaintenance');
+        $this->router->map('POST', '/api/v1/maintenance', 'Api\\AdminApiController@setMaintenance');
+        $this->router->map('POST', '/api/v1/platform/rotate-token', 'Api\\AdminApiController@rotatePlatformToken');
+        $this->router->map('PUT', '/api/v1/repositories/[i:repoId]/s3-sync', 'Api\\AdminApiController@setRepositoryS3Sync');
+        $this->router->map('GET', '/api/v1/repositories', 'Api\\AdminApiController@listAllRepositories');
+        $this->router->map('GET', '/api/v1/users', 'Api\\AdminApiController@listUsers');
+        $this->router->map('POST', '/api/v1/users', 'Api\\AdminApiController@createUser');
+        $this->router->map('GET', '/api/v1/users/[i:id]', 'Api\\AdminApiController@getUser');
+        $this->router->map('PUT', '/api/v1/users/[i:id]', 'Api\\AdminApiController@updateUser');
+        $this->router->map('DELETE', '/api/v1/users/[i:id]', 'Api\\AdminApiController@deleteUser');
+        $this->router->map('GET', '/api/v1/log', 'Api\\AdminApiController@listLog');
+        $this->router->map('GET', '/api/v1/schedules', 'Api\\AdminApiController@listSchedules');
 
         // Catalog & Restore (client-facing)
         $this->router->map('GET', '/clients/[i:id]/catalog/[i:archive_id]', 'ClientController@catalog');

@@ -9,6 +9,7 @@ class StorageLocationController extends Controller
 {
     public function index(): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
 
         $locations = $this->db->fetchAll("SELECT * FROM storage_locations ORDER BY is_default DESC, label");
@@ -57,6 +58,19 @@ class StorageLocationController extends Controller
         // Local repo count
         $localRepoCount = (int) ($this->db->fetchOne("SELECT COUNT(*) as cnt FROM repositories WHERE storage_type = 'local' OR storage_type IS NULL")['cnt'] ?? 0);
 
+        // Named S3 destination configs across all clients — repos can
+        // replicate to several of these (#263). Listed on the S3 Offsite
+        // Sync card so multi-destination setups are visible in one place.
+        $s3Destinations = $this->db->fetchAll("
+            SELECT pc.id, pc.name, pc.config, pc.agent_id, a.name AS agent_name,
+                   (SELECT COUNT(*) FROM repository_s3_configs rsc WHERE rsc.plugin_config_id = pc.id) AS repo_count
+            FROM plugin_configs pc
+            JOIN plugins p ON p.id = pc.plugin_id
+            JOIN agents a ON a.id = pc.agent_id
+            WHERE p.slug = 's3_sync'
+            ORDER BY a.name, pc.name
+        ");
+
         $this->view('storage-locations/index', [
             'pageTitle' => 'Storage',
             'locations' => $locations,
@@ -64,11 +78,13 @@ class StorageLocationController extends Controller
             'remoteRepoCount' => $remoteRepoCount,
             'localRepoCount' => $localRepoCount,
             'settings' => $settings,
+            's3Destinations' => $s3Destinations,
         ]);
     }
 
     public function store(): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
@@ -106,6 +122,7 @@ class StorageLocationController extends Controller
 
     public function update(int $id): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
@@ -153,6 +170,7 @@ class StorageLocationController extends Controller
 
     public function destroy(int $id): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
@@ -189,6 +207,7 @@ class StorageLocationController extends Controller
      */
     public function saveS3(): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
@@ -242,6 +261,7 @@ class StorageLocationController extends Controller
      */
     public function testS3(): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
@@ -257,6 +277,7 @@ class StorageLocationController extends Controller
      */
     public function listS3Backups(): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
@@ -311,6 +332,7 @@ class StorageLocationController extends Controller
      */
     public function restoreS3Backup(): void
     {
+        $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
@@ -407,8 +429,10 @@ class StorageLocationController extends Controller
     /**
      * Write all storage location paths to /etc/bbs/allowed-storage-paths
      * so bbs-ssh-helper can validate repo directory creation on those paths.
+     * Public because the admin API also creates storage locations and needs
+     * to refresh the allow-list.
      */
-    private function updateAllowedPaths(): void
+    public function updateAllowedPaths(): void
     {
         $locations = $this->db->fetchAll("SELECT path FROM storage_locations");
         $paths = array_column($locations, 'path');

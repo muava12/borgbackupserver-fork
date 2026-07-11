@@ -19,8 +19,9 @@
 - `scheduler.php` — cron-driven task runner
 
 ## Version Numbers
-- **Server version:** `VERSION` file in project root (currently `1.2.0`)
-- **Agent version:** `AGENT_VERSION` constant in `agent/bbs-agent.py` (currently `1.9.0`) — only bump when agent code changes
+- **Server version:** `VERSION` file in project root.
+- **Agent version:** `AGENT_VERSION` constant in `agent/bbs-agent.py`.
+- **Agent version bumps only when agent code changes.** Point releases bump `VERSION` alone; leave `AGENT_VERSION` at its last value so agents don't self-update for nothing. On major feature releases (or whenever the agent actually changed), bring both to the same number to re-sync.
 
 ## Server Installation Path
 Software is installed at `/var/www/bbs/` on all servers. Config lives at `/var/www/bbs/config/.env`.
@@ -94,3 +95,10 @@ If you need a new privileged operation, ADD IT TO `bin/bbs-ssh-helper` first.
 - `backup_plan_plugins` — links plans to plugin configs via `plugin_config_id`
 - Plugin UI lives on the **Plugins tab** of client detail page
 - Schema-driven forms via `PluginManager::getPluginSchema()`
+
+## ClickHouse (catalog engine, Docker)
+- ClickHouse stores the file catalog (tables in the `bbs` database; port 8123). It runs inside the Docker image.
+- **⚠️ ClickHouse is version-PINNED in the `Dockerfile`** via `ARG CLICKHOUSE_VERSION` (+ `apt-mark hold`). **Never** revert to an unpinned `stable` install and never remove the hold.
+  - Why: unpinned, every image rebuild silently pulled the latest `stable`. The v2.60.9 rebuild pulled ClickHouse `26.6.1.1193`, which raised its CPU-instruction baseline → `Illegal instruction (core dumped)` on hosts that ran 26.5 fine → ClickHouse never bound port 8123 → catalog import / file-level restore failed and **every backup job errored** (`ClickHouse TSV upload failed: Failed to connect to localhost port 8123`). Root cause was version drift, not app code. Fixed in v2.60.10 by pinning to `26.5.2.39` (#327).
+  - To change the version: edit the `CLICKHOUSE_VERSION` ARG only, and **test the new version on an older/baseline CPU** before shipping.
+  - Inspect what an image actually shipped: `docker run --rm --entrypoint dpkg-query marcpope/borgbackupserver:<tag> -W clickhouse-server`.

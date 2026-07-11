@@ -57,13 +57,18 @@ stop_spinner() {
     fi
 }
 
+# Never leave a frozen spinner behind. `set -e` plus suppressed output means a
+# failed package step used to kill the script mid-spin with no message (#304);
+# this clears the spinner on any exit so at least the prompt is usable.
+trap stop_spinner EXIT
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Output helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 print_header() {
     echo ""
     echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${BLUE}║${NC}          ${BOLD}Borg Backup Server — Agent Installer${NC}                ${BOLD}${BLUE}║${NC}"
+    echo -e "${BOLD}${BLUE}║${NC}             ${BOLD}Borg Backup Server — Agent Installer${NC}             ${BOLD}${BLUE}║${NC}"
     echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -116,25 +121,57 @@ fi
 detect_os() {
     print_step "Detecting operating system..."
 
-    if [ -f /etc/os-release ]; then
+    local os_version=''
+    local os_pretty=''
+
+    # First check for Enigma2-based set-top boxes (e.g. Dreambox) which have a unique environment
+    # and are not detected properly by standard methods
+    if [ -f /proc/stb/info/model ] || [ -d /proc/stb/video ]; then  # Hardware indicators of Enigma2
+        local distro=''
+        OS="enigma2"
+        # /etc/image-version (OE-Alliance Standard)
+        if [ -f /etc/image-version ]; then
+            distro=$(grep "^creator=" /etc/image-version 2>/dev/null | cut -d= -f2 | tr -d '\r')
+            os_version=$(grep "^version=" /etc/image-version 2>/dev/null | cut -d= -f2 | tr -d '\r')
+            os_pretty="$distro $os_version"
+        fi
+        # /usr/lib/enigma.info (OpenATV-specific)
+        if [ -z "$distro" ] && [ -f /usr/lib/enigma.info ]; then
+            distro=$(grep "^displaydistro=" /usr/lib/enigma.info 2>/dev/null | cut -d= -f2 | tr -d "'\r")
+            os_version=$(grep "^imgversion=" /usr/lib/enigma.info 2>/dev/null | cut -d= -f2 | tr -d "'\r")
+            os_pretty="$distro $os_version"
+        fi
+        # If still unknown, try Python boxbranding which is more robust and works across more images
+        if [ -z "$distro" ] && [ -f /usr/lib/enigma2/python/boxbranding.py ]; then
+            os_pretty=$(python3 -c "
+import sys
+sys.path.append('/usr/lib/enigma2/python')
+try:
+    from boxbranding import getImageDistro, getImageVersion
+    print('%s %s' % (getImageDistro(), getImageVersion()))
+except:
+    pass
+" 2>/dev/null)
+        fi
+    elif [ -f /etc/os-release ]; then
         . /etc/os-release
         OS=$ID
-        OS_VERSION=$VERSION_ID
-        OS_PRETTY=$PRETTY_NAME
+        os_version=$VERSION_ID
+        os_pretty=$PRETTY_NAME
     elif [ "$(uname)" = "Darwin" ]; then
         OS="macos"
-        OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
-        OS_PRETTY="macOS $OS_VERSION"
+        os_version=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+        os_pretty="macOS $os_version"
     elif [ "$(uname)" = "FreeBSD" ]; then
         OS="freebsd"
-        OS_VERSION=$(freebsd-version 2>/dev/null || uname -r)
-        OS_PRETTY="FreeBSD $OS_VERSION"
+        os_version=$(freebsd-version 2>/dev/null || uname -r)
+        os_pretty="FreeBSD $os_version"
     else
         OS="unknown"
-        OS_PRETTY="Unknown OS"
+        os_pretty="Unknown OS"
     fi
 
-    print_success "Detected: ${BOLD}$OS_PRETTY${NC}"
+    print_success "Detected: ${BOLD}$os_pretty${NC}"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -188,7 +225,7 @@ install_borg() {
         fedora)
             dnf install -y borgbackup python3 >/dev/null 2>&1
             ;;
-        arch|manjaro|endeavouros)
+        arch|manjaro|endeavouros|cachyos)
             pacman -Sy --noconfirm borg python >/dev/null 2>&1
             ;;
         opensuse*|sles)
@@ -203,12 +240,68 @@ install_borg() {
             }
             ;;
         macos)
-            if command -v brew &>/dev/null; then
-                brew install borgbackup python3 >/dev/null 2>&1
+            # On macOS, Borg has to come from Homebrew. The agent's own
+            # first-run fallbacks don't work here — the pip path dies with
+            # "no such option: --break-system-packages" — so without brew the
+            # agent ends up with "borg command not found" (#311). So require
+            # Homebrew up front, offering to install it if it's missing.
+            #
+            # brew refuses to run as root and this installer runs under sudo, so
+            # everything brew-related runs as the invoking user ($SUDO_USER).
+            # Resolve brew including Apple Silicon's /opt/homebrew (not in root's
+            # PATH).
+            brew_bin="$(command -v brew 2>/dev/null || true)"
+            [ -z "$brew_bin" ] && [ -x /opt/homebrew/bin/brew ] && brew_bin="/opt/homebrew/bin/brew"
+            [ -z "$brew_bin" ] && [ -x /usr/local/bin/brew ] && brew_bin="/usr/local/bin/brew"
+
+            if [ -z "$brew_bin" ]; then
+                stop_spinner   # pause the progress spinner so we can prompt
+                print_warning "Homebrew is required to install Borg on macOS, and it isn't installed."
+
+                # The installer is normally run as `curl ... | sudo bash`, so
+                # stdin is the script itself — read the user's answer from the
+                # controlling terminal instead. No terminal (headless/piped with
+                # no tty) means we can't ask, so we stop with instructions.
+                reply=""
+                if [ -r /dev/tty ]; then
+                    printf "  Install Homebrew now? [y/N] " > /dev/tty
+                    read -r reply < /dev/tty || reply=""
+                fi
+
+                case "$reply" in
+                    [Yy]*)
+                        if [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = "root" ]; then
+                            print_error "Homebrew can't be installed as root. Install it as your normal user:"
+                            print_error '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+                            print_error "then re-run this installer."
+                            exit 1
+                        fi
+                        print_step "Installing Homebrew (this can take a few minutes)..."
+                        sudo -u "$SUDO_USER" env NONINTERACTIVE=1 /bin/bash -c \
+                            "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < /dev/tty || true
+
+                        brew_bin="$(command -v brew 2>/dev/null || true)"
+                        [ -z "$brew_bin" ] && [ -x /opt/homebrew/bin/brew ] && brew_bin="/opt/homebrew/bin/brew"
+                        [ -z "$brew_bin" ] && [ -x /usr/local/bin/brew ] && brew_bin="/usr/local/bin/brew"
+                        if [ -z "$brew_bin" ]; then
+                            print_error "Homebrew installation didn't complete. Install it from https://brew.sh and re-run this installer."
+                            exit 1
+                        fi
+                        print_success "Homebrew installed"
+                        ;;
+                    *)
+                        print_error "Borg requires Homebrew on macOS. Install it from https://brew.sh, then re-run this installer."
+                        exit 1
+                        ;;
+                esac
+                # Resume the progress spinner for the borg install below.
+                start_spinner "Installing borgbackup and python3..."
+            fi
+
+            if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+                sudo -u "$SUDO_USER" "$brew_bin" install borgbackup python3 >/dev/null 2>&1 || true
             else
-                stop_spinner
-                print_error "Homebrew required on macOS. Install from https://brew.sh"
-                exit 1
+                "$brew_bin" install borgbackup python3 >/dev/null 2>&1 || true
             fi
             ;;
         *)
@@ -220,8 +313,15 @@ install_borg() {
 
     stop_spinner
 
-    if command -v borg &>/dev/null; then
-        local borg_ver=$(borg --version 2>/dev/null | head -1)
+    # Resolve borg even when it landed outside root's PATH — notably Apple
+    # Silicon Homebrew installs to /opt/homebrew/bin, which sudo's PATH omits.
+    local borg_path
+    borg_path="$(command -v borg 2>/dev/null || true)"
+    [ -z "$borg_path" ] && [ -x /opt/homebrew/bin/borg ] && borg_path="/opt/homebrew/bin/borg"
+    [ -z "$borg_path" ] && [ -x /usr/local/bin/borg ] && borg_path="/usr/local/bin/borg"
+
+    if [ -n "$borg_path" ]; then
+        local borg_ver=$("$borg_path" --version 2>/dev/null | head -1)
         print_success "Installed: ${BOLD}$borg_ver${NC}"
         BORG_INSTALLED="new"
         BORG_VERSION="$borg_ver"
@@ -424,6 +524,22 @@ install_ssh_key() {
 
     if [ -n "$ssh_key" ] && [ "$ssh_key" != "" ]; then
         echo "$ssh_key" > "$CONFIG_DIR/ssh_key"
+        # Check if we have Dropbear ssh (common on embedded devices) and convert if needed
+        if ssh -V 2>&1 | grep -q "Dropbear"; then
+            if command -v dropbearconvert >/dev/null 2>&1; then 
+                print_info "Converting SSH key to Dropbear format"
+                if dropbearconvert openssh dropbear "$CONFIG_DIR/ssh_key" "$CONFIG_DIR/ssh_key.dropbear" 2>/dev/null; then
+                    mv -f "$CONFIG_DIR/ssh_key.dropbear" "$CONFIG_DIR/ssh_key"
+                else
+                    print_warning "dropbearconvert failed; leaving key in OpenSSH format"
+                    rm -f "$CONFIG_DIR/ssh_key.dropbear"
+                fi
+            else
+                print_warning "dropbearconvert not found; leaving key in OpenSSH format"
+                print_info "Install dropbearconvert and re-run installer to convert key if using Dropbear SSH"
+            fi
+        fi
+
         chmod 600 "$CONFIG_DIR/ssh_key"
         print_success "SSH key installed to ${DIM}$CONFIG_DIR/ssh_key${NC}"
         SSH_STATUS="installed"
@@ -717,7 +833,7 @@ print_summary() {
 
     echo ""
     echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${GREEN}║${NC}                  ${BOLD}${GREEN}Installation Complete!${NC}                     ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}                    ${BOLD}${GREEN}Installation Complete!${NC}                    ${BOLD}${GREEN}║${NC}"
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 

@@ -1,9 +1,12 @@
 FROM php:8.4-apache
 
-# Install system dependencies and apply security patches
-RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+# Install system dependencies, apply security patches, and clean up in one layer.
+# dist-upgrade pulls kernel-abi and other fixes that plain upgrade skips — helps
+# reduce Docker Hub CVE scan counts.
+RUN apt-get update && apt-get upgrade -y && apt-get dist-upgrade -y && apt-get install -y --no-install-recommends \
     git \
     curl \
+    ca-certificates \
     libpng-dev \
     libonig-dev \
     libxml2-dev \
@@ -20,7 +23,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     openssh-server \
     python3-pip \
     gnupg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Install rclone from official binary (Debian package ships with outdated Go runtime)
 RUN ARCH=$(dpkg --print-architecture) && \
@@ -28,23 +31,35 @@ RUN ARCH=$(dpkg --print-architecture) && \
     unzip -q /tmp/rclone.zip -d /tmp && \
     cp /tmp/rclone-*/rclone /usr/bin/rclone && \
     chmod 755 /usr/bin/rclone && \
-    rm -rf /tmp/rclone*
+    rm -rf /tmp/*
 
 # Install ClickHouse (catalog engine) — amd64 only
-# No ClickHouse build works reliably on ARM64 boards with older CPUs
-# (Cortex-A53/ARMv8.0). Both official and Altinity binaries use CPU
-# instructions unavailable on these devices. On ARM64, catalog features
-# are gracefully disabled; all core features (backup/restore) still work.
-RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+#
+# PINNED on purpose. 26.5.2.39 is the last known-good build that works on older
+# CPUs (fixes "Illegal instruction" on Cortex-A53 etc. — #327). Bump deliberately
+# and test on baseline ARM64/AMD64 CPU before shipping.
+#
+# ARM64: No ClickHouse build works reliably on older ARM CPUs (Cortex-A53/
+# ARMv8.0). Official and Altinity binaries may use CPU instructions unavailable
+# on these devices. On ARM64, catalog features fall back to SQLite transparently;
+# all core features (backup/restore) still work.
+ARG CLICKHOUSE_VERSION=26.5.2.39
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ] || [ "$ARCH" = "x86_64" ]; then \
     curl -fsSL -A 'Mozilla/5.0' 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | \
     gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=amd64] https://packages.clickhouse.com/deb stable main" \
     > /etc/apt/sources.list.d/clickhouse.list && \
     apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-server clickhouse-client && \
-    rm -rf /var/lib/apt/lists/*; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        clickhouse-common-static=${CLICKHOUSE_VERSION} \
+        clickhouse-server=${CLICKHOUSE_VERSION} \
+        clickhouse-client=${CLICKHOUSE_VERSION} && \
+    apt-mark hold clickhouse-common-static clickhouse-server clickhouse-client && \
+    apt-get upgrade -y && apt-get dist-upgrade -y && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*; \
     else \
-    echo ">>> Skipping ClickHouse (not supported on $(dpkg --print-architecture))"; \
+    echo ">>> Skipping ClickHouse (not supported on $(ARCH))"; \
     fi
 
 # Disable ClickHouse system log tables (heavy idle disk I/O)
@@ -55,29 +70,29 @@ RUN if command -v clickhouse-server >/dev/null 2>&1; then \
     fi && \
     rm -f /tmp/clickhouse-bbs-override.xml
 
-# Install Apprise (notification tool supporting 100+ services)
-RUN pip3 install --break-system-packages --no-cache-dir apprise && \
-    rm -rf /usr/lib/python3/dist-packages/wheel* && \
-    pip3 install --break-system-packages --no-cache-dir wheel>=0.46.2
+# Install Apprise and wheel in a single pip call to avoid cache between calls
+RUN pip3 install --break-system-packages --no-cache-dir apprise wheel>=0.46.2 && \
+    rm -rf /root/.cache /usr/lib/python3/dist-packages/wheel*
 
 # Install PHP extensions
 RUN docker-php-ext-install pdo pdo_mysql mbstring
 
 # PHP configuration: increase max_execution_time (default 30s is too short for
-# large backup operations, catalog imports, and API calls under load)
-RUN echo "max_execution_time = 300" > /usr/local/etc/php/conf.d/bbs.ini
+# large backup operations, catalog imports, and API calls under load).
+# The base image ships no php.ini, so display_errors defaults to On — turn it
+# off so warnings/deprecations are logged instead of rendered into pages (#332).
+RUN { echo "max_execution_time = 300"; \
+      echo "display_errors = Off"; \
+      echo "display_startup_errors = Off"; \
+      echo "log_errors = On"; } > /usr/local/etc/php/conf.d/bbs.ini
 
 # Install Composer
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-# Enable Apache modules
-RUN a2enmod rewrite
-
-# Configure Apache
-RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf
-
-# Apache vhost configuration
-RUN echo '<VirtualHost *:80>\n\
+# Enable Apache modules and configure in one layer
+RUN a2enmod rewrite && \
+    echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
+    echo '<VirtualHost *:80>\n\
     DocumentRoot /var/www/bbs/public\n\
     <Directory /var/www/bbs/public>\n\
     AllowOverride All\n\
@@ -97,10 +112,11 @@ RUN mkdir -p /var/www/bbs /var/bbs/home /var/bbs/backups /var/bbs/cache /run/mys
     && chown -R www-data:www-data /var/www/bbs /var/bbs \
     && chown mysql:mysql /run/mysqld
 
-# Copy application code and install dependencies
+# Copy application code, install dependencies, and clean up in one layer
 COPY . /var/www/bbs/
-RUN cd /var/www/bbs && composer install --no-dev --optimize-autoloader --no-interaction --quiet
-RUN chown -R www-data:www-data /var/www/bbs
+RUN cd /var/www/bbs && composer install --no-dev --optimize-autoloader --no-interaction --quiet \
+    && rm -rf /root/.composer/cache \
+    && chown -R www-data:www-data /var/www/bbs
 
 # Install SSH helper and gate
 RUN cp /var/www/bbs/bin/bbs-ssh-helper /usr/local/bin/bbs-ssh-helper \
@@ -115,6 +131,10 @@ RUN echo "www-data ALL=(root) NOPASSWD: /usr/local/bin/bbs-ssh-helper, /var/www/
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Support custom UID/GID mapping for bind mounts
+ENV PUID=33
+ENV PGID=33
 
 EXPOSE 80 22
 

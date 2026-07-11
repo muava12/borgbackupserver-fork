@@ -21,7 +21,7 @@ $columnLabels = [
 
     <!-- Basic Info -->
     <div class="card border-0 shadow-sm mb-4">
-        <div class="card-header bg-body border-0">
+        <div class="card-header border-0">
             <h6 class="mb-0"><i class="bi bi-person me-2"></i>Account Information</h6>
         </div>
         <div class="card-body">
@@ -45,7 +45,7 @@ $columnLabels = [
                 <div class="col-md-6">
                     <?php if (($user['auth_provider'] ?? 'local') === 'oidc'): ?>
                     <label class="form-label fw-semibold">Authentication</label>
-                    <div><span class="badge bg-info"><i class="bi bi-box-arrow-in-right me-1"></i>SSO (OIDC)</span></div>
+                    <div><span class="badge text-bg-info"><i class="bi bi-box-arrow-in-right me-1"></i>SSO (OIDC)</span></div>
                     <div class="form-text">This user authenticates via Single Sign-On. No password required.</div>
                     <?php else: ?>
                     <label class="form-label fw-semibold">New Password</label>
@@ -72,7 +72,7 @@ $columnLabels = [
 
     <!-- Client Access & Permissions (hidden for admins) -->
     <div class="card border-0 shadow-sm mb-4" id="clientAccessCard" style="<?= $user['role'] === 'admin' ? 'display:none' : '' ?>">
-        <div class="card-header bg-body border-0">
+        <div class="card-header border-0">
             <h6 class="mb-0"><i class="bi bi-pc-display me-2"></i>Client Access & Permissions</h6>
         </div>
         <div class="card-body">

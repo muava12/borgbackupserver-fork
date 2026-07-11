@@ -3,6 +3,7 @@
 $eventGroups = [
     'Backups' => [
         'backup_completed' => 'Backup Completed',
+        'backup_warning' => 'Backup Completed with Warnings',
         'backup_failed' => 'Backup Failed',
     ],
     'Restores' => [
@@ -45,6 +46,7 @@ $eventColors = [
     'repo_check_failed' => 'danger',
     's3_sync_failed' => 'danger',
     // Warning events - orange/warning
+    'backup_warning' => 'warning',
     'agent_offline' => 'warning',
     'storage_low' => 'warning',
     'missed_schedule' => 'warning',
@@ -75,7 +77,7 @@ $eventColors = [
                     <div class="row">
                         <div class="col-md-6">
                             <strong>Discord:</strong> discord://webhook_id/webhook_token<br>
-                            <strong>Telegram:</strong> tgram://bot_token/chat_id<br>
+                            <strong>Telegram:</strong> tgram://bot_token/chat_id[:thread]<br>
                             <strong>Slack:</strong> slack://tokenA/tokenB/tokenC<br>
                             <strong>Pushover:</strong> pover://user@token
                         </div>
@@ -100,7 +102,7 @@ $eventColors = [
 <!-- Add Service Form (Collapse) -->
 <div class="collapse mb-4" id="addServiceForm">
     <div class="card border-0 shadow-sm">
-        <div class="card-header bg-body fw-semibold">
+        <div class="card-header fw-semibold">
             <i class="bi bi-plus-circle me-1"></i> Add Notification Service
         </div>
         <div class="card-body">
@@ -540,12 +542,23 @@ const serviceSchemas = {
             const port = f.smtp_port || '587';
             const to = encodeURIComponent(f.smtp_to || '');
             const from = encodeURIComponent(f.smtp_from || f.smtp_user || f.smtp_to || '');
-            let mode = '';
-            if (f.smtp_secure === 'ssl') mode = 'mailtos';
-            else if (f.smtp_secure === 'none') mode = 'mailto';
-            else mode = 'mailto';
+            // Apprise only honours its STARTTLS default for `mailtos://` —
+            // for plain `mailto://` it falls through to INSECURE and sends
+            // AUTH without STARTTLS, which SES (and any RFC-compliant SMTP
+            // submission server on 587) rejects. Always emit an explicit
+            // ?mode= so the encryption mode is unambiguous regardless of
+            // scheme. Use `mailtos://` for ssl/starttls (semantically
+            // accurate) and `mailto://` for insecure.
+            let scheme = 'mailtos';
+            let urlMode = 'starttls';
+            if (f.smtp_secure === 'ssl') {
+                urlMode = 'ssl';
+            } else if (f.smtp_secure === 'none') {
+                scheme = 'mailto';
+                urlMode = 'insecure';
+            }
             const auth = (f.smtp_user || f.smtp_pass) ? `${user}:${pass}@` : '';
-            return `${mode}://${auth}${host}:${port}?to=${to}&from=${from}`;
+            return `${scheme}://${auth}${host}:${port}?to=${to}&from=${from}&mode=${urlMode}`;
         }
     },
     discord: {
@@ -578,11 +591,15 @@ const serviceSchemas = {
         label: 'Telegram',
         fields: [
             { name: 'bot_token', label: 'Bot Token', type: 'text', required: true, placeholder: '123456789:ABCdefGHI...', width: 'col-md-6' },
-            { name: 'chat_id', label: 'Chat ID', type: 'text', required: true, placeholder: '-1001234567890', width: 'col-md-6' }
+            { name: 'chat_id', label: 'Chat ID', type: 'text', required: true, placeholder: '-1001234567890', width: 'col-md-4' },
+            { name: 'thread', label: 'Thread (optional)', type: 'text', placeholder: '1234567', width: 'col-md-2' }
         ],
-        help: 'Create a bot via @BotFather, then get chat ID by messaging @userinfobot or from group info',
+        help: 'Create a bot via @BotFather, then get chat ID by messaging @userinfobot or from group info. Use Thread for a Telegram topic ID.',
         build: function(f) {
-            return `tgram://${f.bot_token || ''}/${f.chat_id || ''}`;
+            const chatId = f.chat_id || '';
+            const thread = (f.thread || '').trim();
+            const target = thread ? `${chatId}:${encodeURIComponent(thread)}` : chatId;
+            return `tgram://${f.bot_token || ''}/${target}`;
         }
     },
     pover: {

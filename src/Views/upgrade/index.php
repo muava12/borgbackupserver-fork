@@ -89,8 +89,53 @@ $stepIcon = function(string $status): string {
 };
 ?>
 
-<div class="card border-0 shadow-sm mb-4">
-    <div class="card-header bg-primary bg-opacity-10 fw-semibold d-flex justify-content-between align-items-center">
+<style>
+/* The upgrade page lives in the auth layout without the art pane. On short
+   phone viewports the inherited framed layout can clip the long step summary,
+   so keep this page's frame allowed to grow and make the summary itself
+   scrollable. */
+body.auth-no-art .auth-frame {
+    overflow: visible;
+}
+
+#upgrade-steps {
+    max-height: min(520px, calc(100dvh - 260px));
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+#upgrade-step,
+.upgrade-step-title {
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 575.98px) {
+    body.auth-no-art .auth-form-pane {
+        padding: 16px 12px 16px;
+    }
+
+    #upgrade-steps {
+        max-height: calc(100dvh - 230px);
+    }
+
+    .upgrade-card .card-header,
+    .upgrade-card .card-body {
+        padding-left: 12px;
+        padding-right: 12px;
+    }
+
+    .upgrade-step-link {
+        align-items: flex-start !important;
+    }
+}
+</style>
+
+<!-- Cap width on wide displays so the step list and release-notes paragraphs
+     don't stretch into one-line-of-2560px walls of text (#226). -->
+<div class="mx-auto" style="max-width: 1100px;">
+
+<div class="card border-0 shadow-sm mb-4 upgrade-card">
+    <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
         <span><i class="bi bi-cloud-arrow-down me-1"></i> System Upgrade</span>
         <?php if ($target): ?>
         <span class="badge bg-primary"><?= htmlspecialchars($target) ?></span>
@@ -141,10 +186,10 @@ $stepIcon = function(string $status): string {
             <?php foreach ($steps as $i => $step): ?>
             <div class="border-bottom">
                 <?php $hasDetail = !empty(array_filter($step['lines'], fn($l) => trim($l) !== '')); ?>
-                <a class="d-flex align-items-center px-3 py-2 text-decoration-none text-body <?= $hasDetail ? '' : 'pe-none' ?>" data-bs-toggle="<?= $hasDetail ? 'collapse' : '' ?>" href="#step-detail-<?= $i ?>" role="button" aria-expanded="false">
+                <a class="d-flex align-items-center px-3 py-2 text-decoration-none text-body upgrade-step-link <?= $hasDetail ? '' : 'pe-none' ?>" data-bs-toggle="<?= $hasDetail ? 'collapse' : '' ?>" href="#step-detail-<?= $i ?>" role="button" aria-expanded="false">
                     <span class="me-2" style="width:20px;"><?= $stepIcon($step['status']) ?></span>
                     <span class="text-muted me-2 small" style="min-width:52px;">[<?= $step['num'] ?>/<?= $step['total'] ?>]</span>
-                    <span class="flex-grow-1"><?= htmlspecialchars($step['title']) ?></span>
+                    <span class="flex-grow-1 upgrade-step-title"><?= htmlspecialchars($step['title']) ?></span>
                     <?php if ($hasDetail): ?>
                     <i class="bi bi-chevron-down small text-muted"></i>
                     <?php endif; ?>
@@ -176,7 +221,7 @@ $stepIcon = function(string $status): string {
 
 <?php if (!empty($release['notes'])): ?>
 <div class="card border-0 shadow-sm">
-    <div class="card-header bg-primary bg-opacity-10 fw-semibold">
+    <div class="card-header fw-semibold">
         <i class="bi bi-journal-text me-1"></i> Release Notes
         <?php if (!empty($release['url'])): ?>
         <a href="<?= htmlspecialchars($release['url']) ?>" target="_blank" class="float-end small">
@@ -189,6 +234,8 @@ $stepIcon = function(string $status): string {
     </div>
 </div>
 <?php endif; ?>
+
+</div><!-- /max-width wrapper (#226) -->
 
 <?php if ($inProgress): ?>
 <script>
