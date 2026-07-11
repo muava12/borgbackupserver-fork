@@ -27,7 +27,7 @@ function formatBytes($bytes) {
 }
 
 $isActive = in_array($job['status'], ['queued', 'sent', 'running']);
-$isServerSide = in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full']);
+$isServerSide = in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'local_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full']);
 $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 ?>
 
@@ -599,7 +599,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
         const container = document.getElementById('progress-section');
         if (!container) return;
 
-        const isServerSide = ['prune','compact','s3_sync','s3_restore','repo_check','repo_repair','break_lock','catalog_sync','catalog_rebuild','catalog_rebuild_full'].includes(job.task_type);
+        const isServerSide = ['prune','compact','s3_sync','s3_restore', 'local_restore','repo_check','repo_repair','break_lock','catalog_sync','catalog_rebuild','catalog_rebuild_full'].includes(job.task_type);
         const pct = (job.files_total > 0 && job.files_processed > 0) ? Math.round((job.files_processed / job.files_total) * 100) : 0;
         const isJobActive = ['queued','sent','running'].includes(job.status);
 

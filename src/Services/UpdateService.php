@@ -183,7 +183,7 @@ class UpdateService
             "SELECT COUNT(*) as cnt FROM backup_jobs
              WHERE status IN ('sent', 'running')
                AND task_type NOT IN ('update_borg', 'update_agent',
-                   'prune', 'compact', 's3_sync', 's3_restore',
+                   'prune', 'compact', 's3_sync', 's3_restore', 'local_restore',
                    'repo_check', 'repo_repair', 'break_lock',
                    'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full',
                    'archive_delete')

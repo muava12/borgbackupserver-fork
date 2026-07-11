@@ -1352,6 +1352,85 @@ class RepositoryController extends Controller
     }
 
     /**
+     * Queue a local export (server-side restore) job.
+     * Extracts selected files from an archive to a local directory.
+     */
+    public function localExport(int $agentId, int $archiveId): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        // Validate archive exists
+        $archive = $this->db->fetchOne("SELECT * FROM archives WHERE id = ?", [$archiveId]);
+        if (!$archive) {
+            $this->flash('danger', 'Archive not found.');
+            $this->redirect("/clients/{$agentId}");
+            return;
+        }
+
+        // Validate repo exists and belongs to this agent
+        $repo = $this->db->fetchOne("SELECT * FROM repositories WHERE id = ?", [$archive['repository_id']]);
+        if (!$repo) {
+            $this->flash('danger', 'Repository not found.');
+            $this->redirect("/clients/{$agentId}");
+            return;
+        }
+        if ((int)$repo['agent_id'] !== (int)$agentId) {
+            $this->flash('danger', 'Archive does not belong to this client.');
+            $this->redirect("/clients/{$agentId}");
+            return;
+        }
+
+        // Validate agent exists
+        $agent = $this->db->fetchOne("SELECT id FROM agents WHERE id = ?", [$agentId]);
+        if (!$agent) {
+            $this->flash('danger', 'Client not found.');
+            $this->redirect('/clients');
+            return;
+        }
+
+        // Read input (JSON body for paths, POST for destination)
+        $input = json_decode(file_get_contents('php://input'), true) ?: [];
+        $paths = isset($input['paths']) && is_array($input['paths']) ? $input['paths'] : [];
+        $destDir = isset($_POST['destination']) ? trim($_POST['destination']) : '';
+
+        // Default destination if not provided
+        if (empty($destDir)) {
+            $safeName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $repo['name']);
+            $destDir = '/var/bbs/exports/' . $safeName . '/' . date('Ymd');
+        }
+
+        // Sanitize and validate destination (prevent path traversal)
+        $destDir = preg_replace('/\.\.[\/\\]/', '', $destDir);
+        if (strlen($destDir) > 500) {
+            $destDir = substr($destDir, 0, 500);
+        }
+
+        // Sanitize each path (remove leading slash, prevent traversal)
+        $cleanPaths = [];
+        foreach ($paths as $p) {
+            if (!is_string($p) || trim($p) === '') continue;
+            $clean = preg_replace('/\.\.[\/\\]/', '', ltrim(trim($p), '/'));
+            if ($clean !== '') $cleanPaths[] = $clean;
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $agentId,
+            'repository_id' => $repo['id'],
+            'task_type' => 'local_restore',
+            'status' => 'queued',
+            'status_message' => $archive['name'],
+            'restore_destination' => $destDir,
+            'restore_paths' => json_encode($cleanPaths),
+            'files_total' => count($cleanPaths),
+            'queued_at' => date('Y-m-d H:i:s'),
+        ]);
+
+        $this->flash('success', "Local export job #{$jobId} queued. Files will be extracted to {$destDir}.");
+        $this->redirect("/queue/{$jobId}");
+    }
+
+    /**
      * Restore an orphaned repository from S3 (exists in S3 but not locally).
      */
     public function restoreOrphan(int $id): void

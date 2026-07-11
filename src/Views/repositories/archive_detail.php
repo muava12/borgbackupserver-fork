@@ -105,13 +105,16 @@ if ($savings >= 100 && $archive['deduplicated_size'] > 0) {
             </div>
             <div class="d-flex gap-2 flex-wrap">
                 <a href="/clients/<?= $agentId ?>?tab=restore&archive=<?= $archive['id'] ?>&mode=files" class="btn btn-sm btn-primary">
-                    <i class="bi bi-cloud-download me-1"></i>Restore Files
+                    <i class="bi bi-cloud-download me-1"></i>Restore to Client
                 </a>
                 <?php if ($hasDatabases): ?>
                 <a href="/clients/<?= $agentId ?>?tab=restore&archive=<?= $archive['id'] ?>&mode=database" class="btn btn-sm btn-info">
                     <i class="bi bi-database me-1"></i>Restore Databases
                 </a>
                 <?php endif; ?>
+                <button type="button" class="btn btn-sm btn-success" data-bs-toggle="modal" data-bs-target="#exportLocalModal">
+                    <i class="bi bi-folder2-open me-1"></i>Export to Local
+                </button>
             </div>
         </div>
 
@@ -558,3 +561,84 @@ if ($savings >= 100 && $archive['deduplicated_size'] > 0) {
     </div>
 </div>
 <?php endif; ?>
+
+<!-- Export to Local Modal -->
+<div class="modal fade" id="exportLocalModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-folder2-open me-2"></i>Export to Local Folder</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" action="/clients/<?= $agentId ?>/archive/<?= $archive['id'] ?>/export-local">
+                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Destination Folder <small class="text-muted">(on server)</small></label>
+                        <input type="text" name="destination" class="form-control form-control-sm"
+                               value="/var/bbs/exports/<?= preg_replace('/[^a-zA-Z0-9_-]/', '_', $repo['name']) ?>/<?= date('Ymd') ?>"
+                               placeholder="/var/bbs/exports/...">
+                        <div class="form-text">Files will be extracted to this directory on the backup server.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Files &amp; Folders to Export</label>
+                        <div id="export-path-list" class="border rounded p-2 mb-2" style="min-height:50px;max-height:150px;overflow-y:auto;">
+                            <div class="text-muted small fst-italic" id="export-no-paths">Click <strong>Browse Archive</strong> to pick files/folders, or type paths below.</div>
+                        </div>
+                        <div class="input-group input-group-sm mb-2">
+                            <input type="text" id="export-manual-path" class="form-control" placeholder="/home/user/docs/" onkeydown="if(event.key==='Enter'){event.preventDefault();addExportPath(this.value);this.value='';}">
+                            <button type="button" class="btn btn-outline-secondary" onclick="addExportPath(document.getElementById('export-manual-path').value);document.getElementById('export-manual-path').value='';">Add Path</button>
+                        </div>
+                        <small class="text-muted">Tip: Leave empty to export the entire archive.</small>
+                    </div>
+                    <input type="hidden" name="paths" id="export-paths-json" value="[]">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-sm btn-success" id="export-submit-btn">
+                        <i class="bi bi-folder2-open me-1"></i>Start Export
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+// Export path list state
+let exportPaths = [];
+
+function addExportPath(path) {
+    path = path.trim();
+    if (!path) return;
+    if (exportPaths.includes(path)) return;
+    exportPaths.push(path);
+    renderExportPaths();
+}
+
+function removeExportPath(path) {
+    exportPaths = exportPaths.filter(p => p !== path);
+    renderExportPaths();
+}
+
+function renderExportPaths() {
+    const list = document.getElementById('export-path-list');
+    const noPaths = document.getElementById('export-no-paths');
+    const hidden = document.getElementById('export-paths-json');
+
+    const pathsHtml = exportPaths.map(p =>
+        '<div class="d-flex justify-content-between align-items-center py-1 border-bottom export-path-item">' +
+        '<code class="small mb-0">' + escHtml(p) + '</code>' +
+        '<button type="button" class="btn btn-sm py-0 px-1 text-danger" onclick="removeExportPath(\'' + escHtml(p) + '\')" title="Remove">&times;</button>' +
+        '</div>'
+    ).join('');
+
+    list.innerHTML = pathsHtml;
+    noPaths.style.display = exportPaths.length > 0 ? 'none' : '';
+    hidden.value = JSON.stringify(exportPaths);
+}
+
+function escHtml(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>

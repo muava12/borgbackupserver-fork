@@ -105,7 +105,7 @@ $staleJobs = $db->fetchAll("
     JOIN agents a ON a.id = bj.agent_id
     WHERE bj.status IN ('sent', 'running')
       AND a.status = 'offline'
-      AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'update_borg', 'update_agent')
+      AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'local_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'update_borg', 'update_agent')
 ");
 
 // Auto-retry settings (#249). Only kicks in for offline-induced backup
@@ -195,7 +195,7 @@ $zombieJobs = $db->fetchAll("
     JOIN agents a ON a.id = bj.agent_id
     WHERE bj.status IN ('running', 'sent')
       AND a.status = 'online'
-      AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+      AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'local_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
       AND bj.queued_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
       AND (bj.last_progress_at IS NULL OR bj.last_progress_at < DATE_SUB(NOW(), INTERVAL 60 MINUTE))
 ");
@@ -646,6 +646,145 @@ foreach ($serverJobs as $sj) {
                 echo date('Y-m-d H:i:s') . " Queued catalog_sync for repo #{$sj['repository_id']} after S3 restore\n";
             }
         }
+        continue;
+    }
+
+    // Local restore — run borg extract on the server to export files to a local directory
+    if ($sj['task_type'] === 'local_restore') {
+        $now = date('Y-m-d H:i:s');
+
+        // Validate repo
+        $exportRepo = $db->fetchOne("SELECT * FROM repositories WHERE id = ?", [\$sj['repository_id']]);
+        if (!$exportRepo) {
+            $db->update('backup_jobs', [
+                'status' => 'failed', 'completed_at' => $now,
+                'error_log' => 'Repository not found for local restore',
+            ], 'id = ?', [\$sj['id']]);
+            echo date('Y-m-d H:i:s') . " Local restore job #{\$sj['id']} failed: repo not found\n";
+            continue;
+        }
+
+        // Read archive name and paths
+        $archiveName = \$sj['status_message'] ?? '';
+        $destDir = \$sj['restore_destination'] ?? '';
+        $paths = [];
+        if (!empty(\$sj['restore_paths'])) {
+            $paths = json_decode(\$sj['restore_paths'], true) ?: [];
+        }
+
+        if (empty($archiveName)) {
+            $db->update('backup_jobs', [
+                'status' => 'failed', 'completed_at' => $now,
+                'error_log' => 'No archive specified for local restore',
+            ], 'id = ?', [\$sj['id']]);
+            echo date('Y-m-d H:i:s') . " Local restore job #{\$sj['id']} failed: no archive\n";
+            continue;
+        }
+
+        // If no destination, use default
+        if (empty($destDir)) {
+            $safeName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $exportRepo['name']);
+            $destDir = '/var/bbs/exports/' . $safeName . '/' . date('Ymd');
+        }
+
+        // Borg 1.x has no --destination flag: set cwd to destination instead
+        if (!is_dir($destDir)) {
+            @mkdir($destDir, 0755, true);
+        }
+        if (!is_dir($destDir) || !is_writable($destDir)) {
+            $db->update('backup_jobs', [
+                'status' => 'failed', 'completed_at' => $now,
+                'error_log' => "Destination not writable: {$destDir}",
+            ], 'id = ?', [\$sj['id']]);
+            echo date('Y-m-d H:i:s') . " Local restore job #{\$sj['id']} failed: dest not writable\n";
+            continue;
+        }
+
+        // Check borg is available
+        exec('command -v borg 2>/dev/null', $borgCheck, $borgRet);
+        if ($borgRet !== 0) {
+            $db->update('backup_jobs', [
+                'status' => 'failed', 'completed_at' => $now,
+                'error_log' => 'borg binary not found on server',
+            ], 'id = ?', [\$sj['id']]);
+            echo date('Y-m-d H:i:s') . " Local restore job #{\$sj['id']} failed: borg not found\n";
+            continue;
+        }
+
+        // Build env
+        $env = \BBS\Services\BorgCommandBuilder::buildEnv($exportRepo, false);
+        $env['BORG_BASE_DIR'] = '/tmp/bbs-borg-local-restore';
+        $env['HOME'] = '/tmp/bbs-borg-local-restore';
+
+        // Build CLI command (proc_open array cwd works)
+        $cli = ['borg', 'extract', '--log-json', '--progress', '--lock-wait=600'];
+        $cli[] = $exportRepo['path'] . '::' . $archiveName;
+        foreach ($paths as $p) {
+            if (is_string($p) && trim($p) !== '') {
+                $cli[] = ltrim($p, '/');
+            }
+        }
+
+        // Log the command
+        $logPath = implode(' ', array_map('escapeshellarg', $cli)) . " (cwd: {$destDir})";
+        $db->insert('server_log', [
+            'agent_id' => \$sj['agent_id'],
+            'backup_job_id' => \$sj['id'],
+            'level' => 'info',
+            'message' => "Local restore: {$logPath}",
+        ]);
+
+        // Execute borg extract with cwd set to destination
+        $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        // Use shell string for broader compatibility
+        $cmdStr = implode(' ', array_map('escapeshellarg', $cli));
+        putenv('BORG_PASSPHRASE=' . ($env['BORG_PASSPHRASE'] ?? ''));
+        putenv('BORG_BASE_DIR=' . $env['BORG_BASE_DIR']);
+        putenv('HOME=' . $env['HOME']);
+        $proc = proc_open($cmdStr, $desc, $pipes, $destDir);
+
+        $result = 'failed';
+        $errorOutput = '';
+        $stdout = '';
+
+        if (is_resource($proc)) {
+            fclose($pipes[0]);
+            $stdout = stream_get_contents($pipes[1]);
+            $stderr = stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $exitCode = proc_close($proc);
+
+            if ($exitCode <= 1) {
+                $result = 'completed';
+            } else {
+                $errorOutput = trim($stderr) ?: "Exit code {$exitCode}";
+            }
+        }
+
+        // Clear env
+        putenv('BORG_PASSPHRASE');
+        putenv('BORG_BASE_DIR');
+        putenv('HOME');
+
+        $db->update('backup_jobs', [
+            'status' => $result,
+            'completed_at' => $now,
+            'duration_seconds' => max(0, strtotime($now) - strtotime($startedAt)),
+            'error_log' => $result === 'failed' ? $errorOutput : null,
+        ], 'id = ?', [\$sj['id']]);
+
+        $msg = $result === 'completed'
+            ? "Local restore to {$destDir} completed"
+            : "Local restore failed: {$errorOutput}";
+        $db->insert('server_log', [
+            'agent_id' => \$sj['agent_id'],
+            'backup_job_id' => \$sj['id'],
+            'level' => $result === 'completed' ? 'info' : 'error',
+            'message' => $msg,
+        ]);
+
+        echo date('Y-m-d H:i:s') . " Local restore job #{\$sj['id']} {$result}\n";
         continue;
     }
 
