@@ -229,4 +229,35 @@ class ClickHouse
         }
         return $response;
     }
+
+    // --- Fork: try-catch static helpers for SQLite fallback ---
+    // ponytail: catches CH connection errors and routes to SQLite transparently.
+    // Remove when CH 26.5.2.39 confirmed working on all ARM64 hardware.
+
+    public static function tryExec(string $sql): string
+    {
+        try {
+            return self::getInstance()->exec($sql);
+        } catch (\Exception $e) {
+            return SQLiteCatalog::getInstance()->exec($sql);
+        }
+    }
+
+    public static function tryFetchAll(string $sql, array $params = []): array
+    {
+        try {
+            return self::getInstance()->fetchAll($sql, $params);
+        } catch (\Exception $e) {
+            return SQLiteCatalog::getInstance()->fetchAll($sql, $params);
+        }
+    }
+
+    public static function tryFetchOne(string $sql, array $params = []): ?array
+    {
+        try {
+            return self::getInstance()->fetchOne($sql, $params);
+        } catch (\Exception $e) {
+            return SQLiteCatalog::getInstance()->fetchOne($sql, $params);
+        }
+    }
 }
